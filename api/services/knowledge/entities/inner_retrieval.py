@@ -214,5 +214,16 @@ class InnerKnowledgeRetrieveUsage(BaseModel):
 class InnerKnowledgeRetrieveResult(BaseModel):
     """Workflow-style retrieval results plus accumulated usage."""
 
+    # The inner boundary may validate detached result objects as well as plain
+    # mappings. Keep output aliases stable for the controller serializer while
+    # rejecting accidental fields at this trust boundary.
+    model_config = ConfigDict(
+        from_attributes=True,
+        extra="forbid",
+        populate_by_name=True,
+        serialize_by_alias=True,
+        protected_namespaces=(),
+    )
+
     results: list[dict[str, RetrievalJsonValue]]
     usage: InnerKnowledgeRetrieveUsage

@@ -142,6 +142,31 @@ def test_serializes_hit_testing_records(hit_testing):
     assert serialized["summary"] is None
 
 
+def test_normalizes_nullable_record_collections(hit_testing):
+    record = hit_testing_record()
+    segment = record["segment"]
+    assert isinstance(segment, dict)
+    segment.pop("sign_content")
+    segment["keywords"] = None
+    record["child_chunks"] = None
+    record["files"] = None
+    record.pop("tsne_position")
+    record.pop("summary")
+    hit_testing.hit_testing.return_value = {"query": {"content": "query"}, "records": [record]}
+
+    result = unwrap(controller.HitTestingApi.post)(
+        controller.HitTestingApi(), HitTestingPayload(query="query"), CONTEXT, ID
+    )
+
+    serialized = result["records"][0]
+    assert serialized["segment"]["sign_content"] is None
+    assert serialized["segment"]["keywords"] == []
+    assert serialized["child_chunks"] == []
+    assert serialized["files"] == []
+    assert serialized["tsne_position"] is None
+    assert serialized["summary"] is None
+
+
 def test_hit_testing_response_schema_marks_file_mime_type_nullable() -> None:
     schema = HitTestingResponse.model_json_schema(mode="serialization")
     mime_type = schema["$defs"]["HitTestingFile"]["properties"]["mime_type"]

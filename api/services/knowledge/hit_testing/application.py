@@ -6,7 +6,7 @@ from typing import Protocol
 
 from core.rag.index_processor.constant.query_type import QueryType
 from machinery.context import RequestContext
-from services.errors.dataset import DatasetNotFoundError
+from services.errors.dataset import DatasetAccessError
 from services.errors.knowledge_retrieval import HitTestingFailedError, HitTestingInvocationError
 from services.knowledge.dataset_access import DatasetAccess
 from services.knowledge.entities.hit_testing import (
@@ -49,7 +49,7 @@ class HitTestingApplicationService:
                     queries.append({"content_type": QueryType.IMAGE_QUERY, "content": attachment_id})
                 self._queries.record_hit_testing_query(context, ref, json.dumps(queries))
             return result.response
-        except (ValueError, DatasetNotFoundError, HitTestingInvocationError):
+        except (ValueError, DatasetAccessError, HitTestingInvocationError):
             raise
         except Exception as error:
             logger.exception("Hit testing failed.")

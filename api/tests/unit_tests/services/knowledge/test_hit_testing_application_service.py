@@ -97,6 +97,7 @@ def test_empty_metadata_match_skips_history(
     "error",
     [
         DatasetNotFoundError(),
+        DatasetAccessDeniedError(),
         ValueError("invalid"),
         HitTestingInvocationError("unavailable"),
     ],
