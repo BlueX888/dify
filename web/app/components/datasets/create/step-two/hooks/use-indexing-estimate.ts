@@ -29,6 +29,7 @@ type UseIndexingEstimateOptions = {
   crawlOptions?: CrawlOptions
   websiteCrawlProvider?: DataSourceProvider
   websiteCrawlJobId?: string
+  websiteCrawlSourceHandle?: string
   // Processing
   indexingTechnique: IndexingType
   processRule: ProcessRule
@@ -48,6 +49,7 @@ export const useIndexingEstimate = (options: UseIndexingEstimateOptions) => {
     crawlOptions,
     websiteCrawlProvider,
     websiteCrawlJobId,
+    websiteCrawlSourceHandle,
     indexingTechnique,
     processRule,
   } = options
@@ -90,6 +92,7 @@ export const useIndexingEstimate = (options: UseIndexingEstimateOptions) => {
         crawlOptions,
         websiteCrawlProvider: websiteCrawlProvider ?? DataSourceProvider.jinaReader,
         websiteCrawlJobId: websiteCrawlJobId ?? '',
+        websiteCrawlSourceHandle,
         indexingTechnique,
         processRule,
         dataset_id: datasetId || '',
@@ -106,6 +109,7 @@ export const useIndexingEstimate = (options: UseIndexingEstimateOptions) => {
       crawlOptions,
       websiteCrawlProvider,
       websiteCrawlJobId,
+      websiteCrawlSourceHandle,
       indexingTechnique,
       processRule,
       datasetId,

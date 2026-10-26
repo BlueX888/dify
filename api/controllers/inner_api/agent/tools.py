@@ -8,6 +8,7 @@ from controllers.common.schema import register_response_schema_models, register_
 from controllers.console.app.wraps import with_session
 from controllers.inner_api import inner_api_ns
 from controllers.inner_api.wraps import agent_inner_api_only
+from extensions.ext_application_services import application_services
 from libs.exception import BaseHTTPException
 from services.agent_tool_inner_service import AgentToolInnerService
 from services.entities.agent_tool_inner import AgentToolInvokeRequest, AgentToolInvokeResponse
@@ -59,7 +60,9 @@ class AgentToolInvokeApi(Resource):
             ) from exc
 
         try:
-            response = AgentToolInnerService().invoke(session=session, request=payload)
+            response = AgentToolInnerService(
+                external_retrieval=application_services().knowledge.external_retrieval
+            ).invoke(session=session, request=payload)
         except AgentToolInnerServiceError as exc:
             raise AgentToolInvokeHttpError(
                 error_code=exc.error_code,

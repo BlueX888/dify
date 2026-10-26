@@ -2,7 +2,7 @@ import json
 from collections.abc import Generator, Mapping
 from datetime import UTC, datetime, timedelta
 from time import perf_counter
-from unittest.mock import MagicMock, PropertyMock
+from unittest.mock import MagicMock, PropertyMock, create_autospec
 from urllib.parse import parse_qs, urlparse
 
 import pytest
@@ -26,6 +26,7 @@ from core.app.entities.queue_entities import (
     QueueWorkflowSucceededEvent,
 )
 from core.db.session_factory import session_factory
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.repositories.human_input_repository import HumanInputFormRepositoryImpl, HumanInputFormSubmissionRepository
 from core.repositories.sqlalchemy_workflow_execution_repository import SQLAlchemyWorkflowExecutionRepository
 from core.repositories.sqlalchemy_workflow_node_execution_repository import SQLAlchemyWorkflowNodeExecutionRepository
@@ -213,6 +214,14 @@ def _resume_events(runner: WorkflowBasedAppRunner, entry: WorkflowEntry) -> Gene
     ).iter_events()
 
 
+def _make_runner(queue_manager: WorkflowAppQueueManager) -> WorkflowBasedAppRunner:
+    return WorkflowBasedAppRunner(
+        queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        app_id="app",
+    )
+
+
 @pytest.mark.parametrize("status", [HumanInputFormStatus.SUBMITTED, HumanInputFormStatus.TIMEOUT])
 @pytest.mark.parametrize("runs_human_input_node", [False, True], ids=["hidden-form", "direct-completion"])
 def test_resume_publishes_only_the_completed_form_among_repeated_node_invocations(
@@ -226,7 +235,7 @@ def test_resume_publishes_only_the_completed_form_among_repeated_node_invocation
     expired = _save_form(sqlite_session, status=HumanInputFormStatus.EXPIRED)
     _save_form(sqlite_session, status=HumanInputFormStatus.SUBMITTED)
     queue, publish_spy = workflow_queue
-    runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+    runner = _make_runner(queue)
     entry = _make_paused_workflow(
         runner, [selected, waiting, selected, expired], human_input_form=selected if runs_human_input_node else None
     )
@@ -268,7 +277,7 @@ def test_resume_rejects_form_outside_the_trusted_execution_owner(
     setattr(form, owner_field, "another-owner")
     sqlite_session.commit()
     queue, publish_spy = workflow_queue
-    runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+    runner = _make_runner(queue)
     entry = _make_paused_workflow(runner, [form])
 
     events = list(_resume_events(runner, entry))
@@ -341,7 +350,7 @@ def test_resume_refreshes_expired_file_and_file_list_urls_before_form_completion
     )
     assert not any(url_is_valid(file) for file in saved_files)
     queue, publish_spy = workflow_queue
-    runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+    runner = _make_runner(queue)
     entry = _make_paused_workflow(runner, [form])
     for event in _resume_events(runner, entry):
         runner.handle_event(entry, event)
@@ -374,7 +383,7 @@ def test_form_completed_during_resume_is_published_once_before_the_terminal_even
     first = _save_form(sqlite_session, status=HumanInputFormStatus.SUBMITTED)
     second = _save_form(sqlite_session, status=HumanInputFormStatus.WAITING)
     queue, publish_spy = workflow_queue
-    runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+    runner = _make_runner(queue)
     entry = _make_paused_workflow(runner, [first, second])
 
     def complete_second_form_during_execution(event: AppQueueEvent, publish_from: PublishFrom) -> None:
@@ -419,7 +428,7 @@ def test_waiting_form_expiring_during_resume_publishes_timeout_before_success(
     form.expiration_time = datetime.now(UTC) - timedelta(seconds=1)
     sqlite_session.commit()
     queue, publish_spy = workflow_queue
-    runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+    runner = _make_runner(queue)
     entry = _make_paused_workflow(runner, [form], human_input_form=form)
 
     for event in _resume_events(runner, entry):

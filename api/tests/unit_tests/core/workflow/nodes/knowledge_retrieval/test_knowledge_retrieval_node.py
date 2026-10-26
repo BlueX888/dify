@@ -23,10 +23,12 @@ from core.workflow.nodes.knowledge_retrieval.knowledge_retrieval_node import (
 )
 from core.workflow.nodes.knowledge_retrieval.retrieval import Source, SourceMetadata
 from core.workflow.system_variables import build_system_variables
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from graphon.enums import WorkflowNodeExecutionStatus
 from graphon.model_runtime.entities.llm_entities import LLMUsage
 from graphon.runtime import RuntimeState, VariablePool
 from graphon.variables import ArrayObjectSegment, StringSegment
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.workflow_test_utils import build_test_graph_init_params
 
 
@@ -74,7 +76,10 @@ def mock_graph_runtime_state():
 @pytest.fixture
 def mock_rag_retrieval(mocker: MockerFixture):
     """Keep real usage and request metadata while isolating retrieval I/O."""
-    mock_retrieval = DatasetRetrieval()
+    mock_retrieval = DatasetRetrieval(
+        external_retrieval=make_external_dataset_retriever(),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
     mocker.patch.object(mock_retrieval, "knowledge_retrieval", return_value=[])
     mocker.patch(
         "core.workflow.nodes.knowledge_retrieval.knowledge_retrieval_node.DatasetRetrieval",
@@ -138,6 +143,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -195,6 +202,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -237,6 +246,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -273,6 +284,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -308,6 +321,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -348,6 +363,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -386,6 +403,8 @@ class TestKnowledgeRetrievalNode:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -466,6 +485,8 @@ class TestFetchDatasetRetriever:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -502,6 +523,8 @@ class TestFetchDatasetRetriever:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -556,6 +579,8 @@ class TestFetchDatasetRetriever:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         # Act
@@ -596,6 +621,8 @@ class TestFetchDatasetRetriever:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         conditions = MetadataFilteringCondition(
@@ -657,6 +684,8 @@ class TestFetchDatasetRetriever:
             data=KnowledgeRetrievalNodeData.model_validate(config["data"]),
             init_params=mock_graph_init_params,
             runtime_state=mock_graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            retrieval_finalizer=build_retrieval_finalizer(),
         )
 
         mock_rag_retrieval.knowledge_retrieval.return_value = []

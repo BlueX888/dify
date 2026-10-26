@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from dataclasses import dataclass
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from flask import Flask
 
+from controllers.web import workflow as workflow_module
 from controllers.web.error import (
     NotWorkflowAppError,
     ProviderNotInitializeError,
@@ -15,11 +17,30 @@ from controllers.web.error import (
 )
 from controllers.web.workflow import WorkflowRunApi, WorkflowTaskStopApi
 from core.errors.error import ProviderTokenNotInitError, QuotaExceededError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models.model import App, AppMode, EndUser
 from services.errors.app import (
     TriggerWorkflowServiceModeUnavailableError as TriggerWorkflowServiceModeUnavailableServiceError,
 )
 from tests.unit_tests.model_factories import make_end_user
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeServicesStub:
+    external_retrieval: ExternalDatasetRetriever
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationServicesStub:
+    knowledge: _KnowledgeServicesStub
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> ExternalDatasetRetriever:
+    port = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = _ApplicationServicesStub(knowledge=_KnowledgeServicesStub(external_retrieval=port))
+    monkeypatch.setattr(workflow_module, "application_services", lambda: services)
+    return port
 
 
 def _workflow_app() -> App:
@@ -46,7 +67,14 @@ class TestWorkflowRunApi:
     @patch("controllers.web.workflow.helper.compact_generate_response", return_value={"result": "ok"})
     @patch("controllers.web.workflow.AppGenerateService.generate")
     @patch("controllers.web.workflow.web_ns")
-    def test_happy_path(self, mock_ns: MagicMock, mock_gen: MagicMock, mock_compact: MagicMock, app: Flask) -> None:
+    def test_happy_path(
+        self,
+        mock_ns: MagicMock,
+        mock_gen: MagicMock,
+        mock_compact: MagicMock,
+        app: Flask,
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         mock_ns.payload = {"inputs": {"key": "val"}}
         mock_gen.return_value = "response"
 
@@ -54,6 +82,7 @@ class TestWorkflowRunApi:
             result = WorkflowRunApi().post(_workflow_app(), _end_user())
 
         assert result == {"result": "ok"}
+        assert mock_gen.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch(
         "controllers.web.workflow.AppGenerateService.generate",

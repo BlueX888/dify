@@ -1,5 +1,6 @@
 from datetime import datetime
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -14,9 +15,11 @@ from models.human_input import (
     RecipientType,
     StandaloneWebAppRecipientPayload,
 )
-from models.model import App, AppMode, EndUser, IconType
+from models.model import App, AppMode, EndUser, IconType, UploadFile, UploadFileCleanupOutbox
 from repositories.human_input_file_upload_repository import SQLAlchemyHumanInputFileUploadRepository
-from services.human_input_file_upload_service import HumanInputUploadFormRecord
+from repositories.upload_file_repository import UploadFilePublicationLostError, UploadFileReferenceNotFoundError
+from services.human_input_file_upload_service import HumanInputUploadFormRecord, InvalidUploadTokenError
+from tests.unit_tests.model_factories import make_upload_file
 
 _TENANT_ID = "11111111-1111-1111-1111-111111111111"
 _OTHER_TENANT_ID = "22222222-2222-2222-2222-222222222222"
@@ -97,10 +100,30 @@ def _persist_app_owner(session: Session) -> Account:
     return account
 
 
+def _persist_finished_upload(session: Session) -> UploadFile:
+    upload = make_upload_file(file_id=_FILE_ID, tenant_id=_TENANT_ID)
+    session.add_all(
+        [
+            upload,
+            UploadFileCleanupOutbox(
+                tenant_id=_TENANT_ID,
+                upload_file_id=upload.id,
+                key=upload.key,
+                writer_id="cccccccc-cccc-cccc-cccc-cccccccccccc",
+                writer_finished_at=_CREATED_AT,
+                writer_expires_at=_EXPIRATION_TIME,
+            ),
+        ]
+    )
+    session.commit()
+    return upload
+
+
 def test_form_token_upload_token_grant_and_file_link_round_trip(
     sqlite_session: Session,
     sqlite_session_factory: sessionmaker[Session],
 ) -> None:
+    _persist_app_owner(sqlite_session)
     _persist_form_and_recipient(sqlite_session)
     repository = _repository(sqlite_session_factory)
 
@@ -127,6 +150,7 @@ def test_form_token_upload_token_grant_and_file_link_round_trip(
     assert grant is not None
     assert grant.form == form
     assert repository.get_upload_grant("missing-token") is None
+    _persist_finished_upload(sqlite_session)
 
     repository.add_file(
         tenant_id=_TENANT_ID,
@@ -143,6 +167,9 @@ def test_form_token_upload_token_grant_and_file_link_round_trip(
         link = session.scalar(
             select(HumanInputFormUploadFile).where(HumanInputFormUploadFile.upload_file_id == _FILE_ID)
         )
+        cleanup_marker = session.scalar(
+            select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == _FILE_ID)
+        )
 
     assert token is not None
     assert token.tenant_id == _TENANT_ID
@@ -155,6 +182,122 @@ def test_form_token_upload_token_grant_and_file_link_round_trip(
     assert link.form_id == _FORM_ID
     assert link.upload_token_id == grant.upload_token_id
     assert link.upload_file_id == _FILE_ID
+    assert cleanup_marker is None
+
+
+@pytest.mark.parametrize("deleted_owner", ["app", "form", "recipient", "token"])
+def test_add_file_rejects_deleted_owner_and_preserves_cleanup_marker(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    deleted_owner: str,
+) -> None:
+    _persist_app_owner(sqlite_session)
+    _persist_form_and_recipient(sqlite_session)
+    repository = _repository(sqlite_session_factory)
+    form = repository.get_form_by_recipient_token(_FORM_TOKEN)
+    assert form is not None
+    repository.create_upload_token(form=form, upload_token=_UPLOAD_TOKEN)
+    grant = repository.get_upload_grant(_UPLOAD_TOKEN)
+    assert grant is not None
+    _persist_finished_upload(sqlite_session)
+
+    owner_types = {
+        "app": (App, _APP_ID),
+        "form": (HumanInputForm, _FORM_ID),
+        "recipient": (HumanInputFormRecipient, _RECIPIENT_ID),
+        "token": (HumanInputFormUploadToken, grant.upload_token_id),
+    }
+    owner_type, owner_id = owner_types[deleted_owner]
+    with sqlite_session_factory.begin() as session:
+        session.delete(session.get_one(owner_type, owner_id))
+
+    with pytest.raises(InvalidUploadTokenError):
+        repository.add_file(
+            tenant_id=_TENANT_ID,
+            app_id=_APP_ID,
+            form_id=_FORM_ID,
+            upload_token_id=grant.upload_token_id,
+            file_id=_FILE_ID,
+        )
+
+    with sqlite_session_factory() as session:
+        assert session.scalar(select(HumanInputFormUploadFile)) is None
+        assert session.get(UploadFile, _FILE_ID) is not None
+        assert (
+            session.scalar(select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == _FILE_ID))
+            is not None
+        )
+
+
+def test_add_file_rejects_missing_writer_marker_without_persisting_metadata(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    _persist_app_owner(sqlite_session)
+    _persist_form_and_recipient(sqlite_session)
+    repository = _repository(sqlite_session_factory)
+    form = repository.get_form_by_recipient_token(_FORM_TOKEN)
+    assert form is not None
+    repository.create_upload_token(form=form, upload_token=_UPLOAD_TOKEN)
+    grant = repository.get_upload_grant(_UPLOAD_TOKEN)
+    assert grant is not None
+    sqlite_session.add(make_upload_file(file_id=_FILE_ID, tenant_id=_TENANT_ID))
+    sqlite_session.commit()
+
+    with pytest.raises(UploadFilePublicationLostError):
+        repository.add_file(
+            tenant_id=_TENANT_ID,
+            app_id=_APP_ID,
+            form_id=_FORM_ID,
+            upload_token_id=grant.upload_token_id,
+            file_id=_FILE_ID,
+        )
+
+    with sqlite_session_factory() as session:
+        assert session.scalar(select(HumanInputFormUploadFile)) is None
+
+
+def test_add_file_rejects_foreign_tenant_upload_without_persisting_metadata(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    with sqlite_session_factory.begin() as session:
+        session.add(make_upload_file(file_id=_FILE_ID, tenant_id=_OTHER_TENANT_ID))
+    repository = _repository(sqlite_session_factory)
+
+    with pytest.raises(UploadFileReferenceNotFoundError):
+        repository.add_file(
+            tenant_id=_TENANT_ID,
+            app_id=_APP_ID,
+            form_id=_FORM_ID,
+            upload_token_id="upload-token-id",
+            file_id=_FILE_ID,
+        )
+
+    with sqlite_session_factory() as session:
+        assert session.scalar(select(HumanInputFormUploadFile)) is None
+
+
+def test_add_file_rejects_deleted_upload_without_persisting_metadata(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    with sqlite_session_factory.begin() as session:
+        upload = make_upload_file(file_id=_FILE_ID, tenant_id=_TENANT_ID)
+        session.add(upload)
+    with sqlite_session_factory.begin() as session:
+        session.delete(session.get_one(UploadFile, _FILE_ID))
+    repository = _repository(sqlite_session_factory)
+
+    with pytest.raises(UploadFileReferenceNotFoundError):
+        repository.add_file(
+            tenant_id=_TENANT_ID,
+            app_id=_APP_ID,
+            form_id=_FORM_ID,
+            upload_token_id="upload-token-id",
+            file_id=_FILE_ID,
+        )
+
+    with sqlite_session_factory() as session:
+        assert session.scalar(select(HumanInputFormUploadFile)) is None
 
 
 def test_get_upload_owner_hydrates_account_for_tenant(

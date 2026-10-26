@@ -148,6 +148,7 @@ _STREAM_RESULT: Final = (200, EventStreamResponse, "Run result (SSE stream)")
 
 def _generate(app: App, caller: Any, args: dict[str, Any], session: Session, invoke_from: InvokeFrom):
     return AppGenerateService.generate(
+        external_retrieval=application_services().knowledge.external_retrieval,
         session=session,
         app_model=app,
         user=caller,

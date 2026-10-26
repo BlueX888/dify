@@ -9,6 +9,7 @@ import {
   zCompletionRequestError,
   zDatasetAccessDeniedError,
   zDatasetNameDuplicateError,
+  zDatasetNotInitializedError,
   zDocumentAlreadyFinishedError,
   zDocumentIndexingError,
   zIndexingEstimateError,
@@ -114,8 +115,6 @@ import {
   zGetDatasetsRetrievalSettingByVectorTypeResponse,
   zGetDatasetsRetrievalSettingResponse,
   zPatchDatasetsByDatasetIdBody,
-  zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionPath,
-  zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponse,
   zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingPausePath,
   zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingPauseResponse,
   zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumePath,
@@ -931,30 +930,9 @@ export const resume = {
   patch: patch4,
 }
 
-/**
- * Update document processing status (pause/resume)
- */
-export const patch5 = oc
-  .route({
-    description: 'Update document processing status (pause/resume)',
-    inputStructure: 'detailed',
-    method: 'PATCH',
-    operationId: 'patchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByAction',
-    path: '/datasets/{dataset_id}/documents/{document_id}/processing/{action}',
-    tags: ['console'],
-  })
-  .input(z.object({ params: zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionPath }))
-  .output(zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponse)
-  .errors({ invalid_action: { status: 400, data: zInvalidActionError } })
-
-export const byAction2 = {
-  patch: patch5,
-}
-
 export const processing = {
   pause,
   resume,
-  byAction: byAction2,
 }
 
 export const post11 = oc
@@ -977,7 +955,7 @@ export const rename = {
   post: post11,
 }
 
-export const patch6 = oc
+export const patch5 = oc
   .route({
     inputStructure: 'detailed',
     method: 'PATCH',
@@ -997,8 +975,8 @@ export const patch6 = oc
     provider_not_initialize: { status: 400, data: zProviderNotInitializeError },
   })
 
-export const byAction3 = {
-  patch: patch6,
+export const byAction2 = {
+  patch: patch5,
 }
 
 export const post12 = oc
@@ -1020,7 +998,7 @@ export const post12 = oc
 
 export const segment = {
   post: post12,
-  byAction: byAction3,
+  byAction: byAction2,
 }
 
 export const post13 = oc
@@ -1064,7 +1042,7 @@ export const delete3 = oc
   )
   .errors({ child_chunk_delete_index_error: { status: 500, data: zChildChunkDeleteIndexError } })
 
-export const patch7 = oc
+export const patch6 = oc
   .route({
     inputStructure: 'detailed',
     method: 'PATCH',
@@ -1087,7 +1065,7 @@ export const patch7 = oc
 
 export const byChildChunkId = {
   delete: delete3,
-  patch: patch7,
+  patch: patch6,
 }
 
 export const get19 = oc
@@ -1107,7 +1085,7 @@ export const get19 = oc
   )
   .output(zGetDatasetsByDatasetIdDocumentsByDocumentIdSegmentsBySegmentIdChildChunksResponse)
 
-export const patch8 = oc
+export const patch7 = oc
   .route({
     inputStructure: 'detailed',
     method: 'PATCH',
@@ -1146,7 +1124,7 @@ export const post14 = oc
 
 export const childChunks = {
   get: get19,
-  patch: patch8,
+  patch: patch7,
   post: post14,
   byChildChunkId,
 }
@@ -1165,7 +1143,7 @@ export const delete4 = oc
   )
   .output(zDeleteDatasetsByDatasetIdDocumentsByDocumentIdSegmentsBySegmentIdResponse)
 
-export const patch9 = oc
+export const patch8 = oc
   .route({
     inputStructure: 'detailed',
     method: 'PATCH',
@@ -1184,7 +1162,7 @@ export const patch9 = oc
 
 export const bySegmentId = {
   delete: delete4,
-  patch: patch9,
+  patch: patch8,
   childChunks,
 }
 
@@ -1437,7 +1415,7 @@ export const post16 = oc
     }),
   )
   .output(zPostDatasetsByDatasetIdExternalHitTestingResponse)
-  .errors({ dataset_name_duplicate: { status: 409, data: zDatasetNameDuplicateError } })
+  .errors({ dataset_access_denied: { status: 403, data: zDatasetAccessDeniedError } })
 
 export const externalHitTesting = {
   post: post16,
@@ -1464,6 +1442,8 @@ export const post17 = oc
   .output(zPostDatasetsByDatasetIdHitTestingResponse)
   .errors({
     completion_request_error: { status: 400, data: zCompletionRequestError },
+    dataset_access_denied: { status: 403, data: zDatasetAccessDeniedError },
+    dataset_not_initialized: { status: 400, data: zDatasetNotInitializedError },
     model_currently_not_support: { status: 400, data: zModelCurrentlyNotSupportError },
     provider_not_initialize: { status: 400, data: zProviderNotInitializeError },
     provider_quota_exceeded: { status: 400, data: zProviderQuotaExceededError },
@@ -1504,12 +1484,12 @@ export const post18 = oc
   .input(z.object({ params: zPostDatasetsByDatasetIdMetadataBuiltInByActionPath }))
   .output(zPostDatasetsByDatasetIdMetadataBuiltInByActionResponse)
 
-export const byAction4 = {
+export const byAction3 = {
   post: post18,
 }
 
 export const builtIn2 = {
-  byAction: byAction4,
+  byAction: byAction3,
 }
 
 export const delete8 = oc
@@ -1524,7 +1504,7 @@ export const delete8 = oc
   .input(z.object({ params: zDeleteDatasetsByDatasetIdMetadataByMetadataIdPath }))
   .output(zDeleteDatasetsByDatasetIdMetadataByMetadataIdResponse)
 
-export const patch10 = oc
+export const patch9 = oc
   .route({
     inputStructure: 'detailed',
     method: 'PATCH',
@@ -1542,7 +1522,7 @@ export const patch10 = oc
 
 export const byMetadataId = {
   delete: delete8,
-  patch: patch10,
+  patch: patch9,
 }
 
 export const get27 = oc
@@ -1736,7 +1716,7 @@ export const get33 = oc
 /**
  * Update dataset details
  */
-export const patch11 = oc
+export const patch10 = oc
   .route({
     description: 'Update dataset details',
     inputStructure: 'detailed',
@@ -1751,7 +1731,7 @@ export const patch11 = oc
 export const byDatasetId = {
   delete: delete9,
   get: get33,
-  patch: patch11,
+  patch: patch10,
   apiKeys: apiKeys2,
   autoDisableLogs,
   batch,

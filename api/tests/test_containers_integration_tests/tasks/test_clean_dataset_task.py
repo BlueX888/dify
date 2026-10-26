@@ -31,6 +31,7 @@ from models.dataset import (
     DatasetQuery,
     Document,
     DocumentSegment,
+    SegmentAttachmentBinding,
 )
 from models.enums import (
     CreatorUserRole,
@@ -59,6 +60,7 @@ class TestCleanDatasetTask:
         db_session_with_containers.execute(delete(AppDatasetJoin))
         db_session_with_containers.execute(delete(DatasetQuery))
         db_session_with_containers.execute(delete(DatasetProcessRule))
+        db_session_with_containers.execute(delete(SegmentAttachmentBinding))
         db_session_with_containers.execute(delete(DocumentSegment))
         db_session_with_containers.execute(delete(Document))
         db_session_with_containers.execute(delete(Dataset))
@@ -93,6 +95,21 @@ class TestCleanDatasetTask:
                 "index_processor_factory": mock_index_processor_factory,
                 "index_processor": mock_index_processor,
             }
+
+    @staticmethod
+    def _delete_dataset_before_cleanup(session: Session, dataset: Dataset) -> dict[str, str | None]:
+        """Capture the cleanup owner scope, then commit the source deletion."""
+        cleanup_args = {
+            "dataset_id": dataset.id,
+            "tenant_id": dataset.tenant_id,
+            "indexing_technique": dataset.indexing_technique,
+            "index_struct": dataset.index_struct,
+            "collection_binding_id": dataset.collection_binding_id,
+            "doc_form": get_dataset_doc_form(dataset, session=session) or IndexStructureType.PARAGRAPH_INDEX,
+        }
+        session.execute(delete(Dataset).where(Dataset.id == dataset.id, Dataset.tenant_id == dataset.tenant_id))
+        session.commit()
+        return cleanup_args
 
     def _create_test_account_and_tenant(self, db_session_with_containers: Session):
         """
@@ -289,15 +306,10 @@ class TestCleanDatasetTask:
         account, tenant = self._create_test_account_and_tenant(db_session_with_containers)
         dataset = self._create_test_dataset(db_session_with_containers, account, tenant)
 
-        # Execute the task
-        clean_dataset_task(
-            dataset_id=dataset.id,
-            tenant_id=tenant.id,
-            indexing_technique=dataset.indexing_technique,
-            index_struct=dataset.index_struct,
-            collection_binding_id=dataset.collection_binding_id,
-            doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-        )
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+
+        # Execute the cleanup only after the dataset deletion commits.
+        clean_dataset_task(**cleanup_args)
 
         # Verify results
         # Check that dataset-related data was cleaned up
@@ -413,15 +425,10 @@ class TestCleanDatasetTask:
         db_session_with_containers.add(binding)
         db_session_with_containers.commit()
 
-        # Execute the task
-        clean_dataset_task(
-            dataset_id=dataset.id,
-            tenant_id=tenant.id,
-            indexing_technique=dataset.indexing_technique,
-            index_struct=dataset.index_struct,
-            collection_binding_id=dataset.collection_binding_id,
-            doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-        )
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+
+        # Execute the cleanup only after the dataset deletion commits.
+        clean_dataset_task(**cleanup_args)
 
         # Verify results
         # Check that all documents were deleted
@@ -461,68 +468,6 @@ class TestCleanDatasetTask:
         mock_storage = mock_external_service_dependencies["storage"]
         assert mock_storage.delete.call_count == 3
 
-    def test_clean_dataset_task_success_with_invalid_doc_form(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
-    ):
-        """
-        Test successful dataset cleanup with invalid doc_form handling.
-
-        This test verifies that the task can successfully:
-        1. Handle None, empty, or whitespace-only doc_form values
-        2. Use default paragraph index type for cleanup
-        3. Continue with vector database cleanup using default type
-        4. Complete all cleanup operations successfully
-        5. Log appropriate warnings for invalid doc_form values
-        """
-        # Create test data
-        account, tenant = self._create_test_account_and_tenant(db_session_with_containers)
-        dataset = self._create_test_dataset(db_session_with_containers, account, tenant)
-
-        # Create a document and segment
-        document = self._create_test_document(db_session_with_containers, account, tenant, dataset)
-        self._create_test_segment(db_session_with_containers, account, tenant, dataset, document)
-
-        # Execute the task with invalid doc_form values
-        test_cases = [None, "", "   ", "\t\n"]
-
-        for invalid_doc_form in test_cases:
-            # Reset mock to clear previous calls
-            mock_index_processor = mock_external_service_dependencies["index_processor"]
-            mock_index_processor.clean.reset_mock()
-
-            clean_dataset_task(
-                dataset_id=dataset.id,
-                tenant_id=tenant.id,
-                indexing_technique=dataset.indexing_technique,
-                index_struct=dataset.index_struct,
-                collection_binding_id=dataset.collection_binding_id,
-                doc_form=invalid_doc_form,
-            )
-
-            # Verify that index processor was called with default type
-            mock_index_processor.clean.assert_called_once()
-
-            # Check that all data was cleaned up
-
-            remaining_documents = db_session_with_containers.scalars(
-                select(Document).where(Document.dataset_id == dataset.id)
-            ).all()
-            assert len(remaining_documents) == 0
-
-            remaining_segments = db_session_with_containers.scalars(
-                select(DocumentSegment).where(DocumentSegment.dataset_id == dataset.id)
-            ).all()
-            assert len(remaining_segments) == 0
-
-            # Recreate data for next test case
-            document = self._create_test_document(db_session_with_containers, account, tenant, dataset)
-            self._create_test_segment(db_session_with_containers, account, tenant, dataset, document)
-
-        # Verify that IndexProcessorFactory was called with default type
-        mock_factory = mock_external_service_dependencies["index_processor_factory"]
-        # Should be called 4 times (once for each test case)
-        assert mock_factory.call_count == 4
-
     def test_index_cleanup_failure_preserves_documents_and_segments(
         self, db_session_with_containers: Session, mock_external_service_dependencies
     ) -> None:
@@ -537,16 +482,11 @@ class TestCleanDatasetTask:
         mock_index_processor = mock_external_service_dependencies["index_processor"]
         mock_index_processor.clean.side_effect = RuntimeError("Vector database cleanup failed")
 
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+
         # A direct call propagates the original exception instead of publishing a retry.
         with pytest.raises(RuntimeError, match="Vector database cleanup failed"):
-            clean_dataset_task(
-                dataset_id=dataset.id,
-                tenant_id=tenant.id,
-                indexing_technique=dataset.indexing_technique,
-                index_struct=dataset.index_struct,
-                collection_binding_id=dataset.collection_binding_id,
-                doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-            )
+            clean_dataset_task(**cleanup_args)
 
         remaining_documents = db_session_with_containers.scalars(
             select(Document).where(Document.dataset_id == dataset.id)
@@ -588,13 +528,8 @@ class TestCleanDatasetTask:
             image_file.name = f"test_image_{i}.jpg"
             image_files.append(image_file)
 
-        # Create segment with image references in content
-        segment_content = f"""
-        This is a test segment with image references.
-        <img src="file://{image_files[0].id}" alt="Image 1">
-        <img src="file://{image_files[1].id}" alt="Image 2">
-        <img src="file://{image_files[2].id}" alt="Image 3">
-        """
+        # Create a segment and persist the attachment ownership records used by cleanup.
+        segment_content = "This is a test segment with image attachments."
 
         segment = DocumentSegment(
             tenant_id=tenant.id,
@@ -611,21 +546,27 @@ class TestCleanDatasetTask:
         )
 
         db_session_with_containers.add(segment)
+        db_session_with_containers.flush()
+        bindings = [
+            SegmentAttachmentBinding(
+                tenant_id=tenant.id,
+                dataset_id=dataset.id,
+                document_id=document.id,
+                segment_id=segment.id,
+                attachment_id=image_file.id,
+            )
+            for image_file in image_files
+        ]
+        db_session_with_containers.add_all(bindings)
         db_session_with_containers.commit()
 
-        # Mock the get_image_upload_file_ids function to return our image file IDs
-        with patch("tasks.clean_dataset_task.get_image_upload_file_ids", autospec=True) as mock_get_image_ids:
-            mock_get_image_ids.return_value = [f.id for f in image_files]
+        image_file_ids = [image_file.id for image_file in image_files]
+        binding_ids = [binding.id for binding in bindings]
 
-            # Execute the task
-            clean_dataset_task(
-                dataset_id=dataset.id,
-                tenant_id=tenant.id,
-                indexing_technique=dataset.indexing_technique,
-                index_struct=dataset.index_struct,
-                collection_binding_id=dataset.collection_binding_id,
-                doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-            )
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+
+        # Execute the cleanup only after the dataset deletion commits.
+        clean_dataset_task(**cleanup_args)
 
         # Verify results
         # Check that all documents were deleted
@@ -641,18 +582,18 @@ class TestCleanDatasetTask:
         assert len(remaining_segments) == 0
 
         # Check that all image files were deleted from database
-        image_file_ids = [f.id for f in image_files]
         remaining_image_files = db_session_with_containers.scalars(
             select(UploadFile).where(UploadFile.id.in_(image_file_ids))
         ).all()
         assert len(remaining_image_files) == 0
+        remaining_bindings = db_session_with_containers.scalars(
+            select(SegmentAttachmentBinding).where(SegmentAttachmentBinding.id.in_(binding_ids))
+        ).all()
+        assert len(remaining_bindings) == 0
 
         # Verify that storage.delete was called for each image file
         mock_storage = mock_external_service_dependencies["storage"]
         assert mock_storage.delete.call_count == 3
-
-        # Verify that get_image_upload_file_ids was called
-        mock_get_image_ids.assert_called_once()
 
     def test_clean_dataset_task_performance_with_large_dataset(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -730,15 +671,10 @@ class TestCleanDatasetTask:
 
         start_time = time.time()
 
-        # Execute the task
-        clean_dataset_task(
-            dataset_id=dataset.id,
-            tenant_id=tenant.id,
-            indexing_technique=dataset.indexing_technique,
-            index_struct=dataset.index_struct,
-            collection_binding_id=dataset.collection_binding_id,
-            doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-        )
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+
+        # Execute the cleanup only after the dataset deletion commits.
+        clean_dataset_task(**cleanup_args)
 
         end_time = time.time()
         cleanup_duration = end_time - start_time
@@ -794,10 +730,10 @@ class TestCleanDatasetTask:
         print(f"Total cleanup time: {cleanup_duration:.3f} seconds")
         print(f"Average time per document: {cleanup_duration / len(documents):.3f} seconds")
 
-    def test_source_storage_failure_preserves_upload_file_and_document(
+    def test_source_storage_failure_does_not_rollback_claimed_cleanup(
         self, db_session_with_containers: Session, mock_external_service_dependencies
     ) -> None:
-        """Keep source storage keys and documents available for a cleanup retry."""
+        """A blob deletion failure does not restore the claimed upload or document rows."""
         # Create test data
         account, tenant = self._create_test_account_and_tenant(db_session_with_containers)
         dataset = self._create_test_dataset(db_session_with_containers, account, tenant)
@@ -818,23 +754,14 @@ class TestCleanDatasetTask:
         mock_storage = mock_external_service_dependencies["storage"]
         mock_storage.delete.side_effect = RuntimeError("Storage service unavailable")
 
-        with pytest.raises(RuntimeError, match="Storage service unavailable"):
-            clean_dataset_task(
-                dataset_id=dataset.id,
-                tenant_id=tenant.id,
-                indexing_technique=dataset.indexing_technique,
-                index_struct=dataset.index_struct,
-                collection_binding_id=dataset.collection_binding_id,
-                doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-            )
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+        clean_dataset_task(**cleanup_args)
 
         db_session_with_containers.expire_all()
         remaining_file = db_session_with_containers.get(UploadFile, upload_file_id)
-        assert remaining_file is not None
-        assert remaining_file.key == upload_file_key
+        assert remaining_file is None
         remaining_document = db_session_with_containers.get(Document, document_id)
-        assert remaining_document is not None
-        assert remaining_document.data_source_info_dict == {"upload_file_id": upload_file_id}
+        assert remaining_document is None
 
         mock_storage.delete.assert_called_once_with(upload_file_key)
 
@@ -958,15 +885,10 @@ class TestCleanDatasetTask:
         db_session_with_containers.add(special_metadata)
         db_session_with_containers.commit()
 
-        # Execute the task
-        clean_dataset_task(
-            dataset_id=dataset.id,
-            tenant_id=tenant.id,
-            indexing_technique=dataset.indexing_technique,
-            index_struct=dataset.index_struct,
-            collection_binding_id=dataset.collection_binding_id,
-            doc_form=get_dataset_doc_form(dataset, session=db_session_with_containers),
-        )
+        cleanup_args = self._delete_dataset_before_cleanup(db_session_with_containers, dataset)
+
+        # Execute the cleanup only after the dataset deletion commits.
+        clean_dataset_task(**cleanup_args)
 
         # Verify results
         # Check that all documents were deleted

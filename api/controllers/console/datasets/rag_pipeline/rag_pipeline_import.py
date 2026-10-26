@@ -108,6 +108,7 @@ class RagPipelineImportApi(Resource):
                 session.rollback()
             else:
                 session.commit()
+                import_service.finalize_committed_import()
 
         if (
             result.status in {ImportStatus.COMPLETED, ImportStatus.COMPLETED_WITH_WARNINGS}
@@ -152,6 +153,7 @@ class RagPipelineImportConfirmApi(Resource):
                 session.rollback()
             else:
                 session.commit()
+                import_service.finalize_committed_import()
 
         if (
             result.status in {ImportStatus.COMPLETED, ImportStatus.COMPLETED_WITH_WARNINGS}

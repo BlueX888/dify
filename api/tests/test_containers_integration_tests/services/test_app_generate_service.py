@@ -1,7 +1,7 @@
 import json
 import uuid
 from typing import Literal
-from unittest.mock import ANY, MagicMock, patch
+from unittest.mock import ANY, MagicMock, create_autospec, patch
 
 import pytest
 import sqlalchemy as sa
@@ -9,6 +9,7 @@ from faker import Faker
 from sqlalchemy.orm import Session
 
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from enums import DeploymentEdition
 from models import App
 from models.enums import EndUserType
@@ -19,11 +20,16 @@ from services.errors.app import WorkflowIdFormatError, WorkflowNotFoundError
 from tests.test_containers_integration_tests.helpers import generate_valid_password
 
 
+@pytest.fixture
+def external_retrieval() -> ExternalDatasetRetriever:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+
+
 class TestAppGenerateService:
     """Integration tests for AppGenerateService using testcontainers."""
 
     @pytest.fixture
-    def mock_external_service_dependencies(self):
+    def mock_external_service_dependencies(self, external_retrieval: ExternalDatasetRetriever):
         """Mock setup for external service dependencies."""
         with (
             patch("services.billing_service.BillingService", autospec=True) as mock_billing_service,
@@ -143,6 +149,7 @@ class TestAppGenerateService:
                 "dify_config": mock_dify_config,
                 "quota_dify_config": mock_quota_dify_config,
                 "global_dify_config": mock_global_dify_config,
+                "external_retrieval": external_retrieval,
             }
 
     def _create_test_app_and_account(
@@ -243,6 +250,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -261,6 +269,10 @@ class TestAppGenerateService:
         # Verify completion generator was called
         mock_external_service_dependencies["completion_generator"].return_value.generate.assert_called_once()
         mock_external_service_dependencies["completion_generator"].convert_to_event_stream.assert_called_once()
+        assert (
+            mock_external_service_dependencies["completion_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_chat_mode_success(self, db_session_with_containers: Session, mock_external_service_dependencies):
         """
@@ -276,6 +288,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -290,6 +303,10 @@ class TestAppGenerateService:
         # Verify chat generator was called
         mock_external_service_dependencies["chat_generator"].return_value.generate.assert_called_once()
         mock_external_service_dependencies["chat_generator"].convert_to_event_stream.assert_called_once()
+        assert (
+            mock_external_service_dependencies["chat_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_agent_chat_mode_success(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -307,6 +324,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -321,6 +339,10 @@ class TestAppGenerateService:
         # Verify agent chat generator was called
         mock_external_service_dependencies["agent_chat_generator"].return_value.generate.assert_called_once()
         mock_external_service_dependencies["agent_chat_generator"].convert_to_event_stream.assert_called_once()
+        assert (
+            mock_external_service_dependencies["agent_chat_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_advanced_chat_mode_success(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -338,6 +360,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -369,6 +392,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -406,6 +430,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -438,6 +463,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -468,6 +494,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -510,6 +537,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=end_user,
             args=args,
@@ -542,6 +570,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -581,6 +610,7 @@ class TestAppGenerateService:
         # StatementError (from EnumText validation during autoflush)
         with pytest.raises((ValueError, sa.exc.StatementError)):
             AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -610,6 +640,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect WorkflowIdFormatError
         with pytest.raises(WorkflowIdFormatError) as exc_info:
             AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -649,6 +680,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect WorkflowNotFoundError
         with pytest.raises(WorkflowNotFoundError) as exc_info:
             AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -680,6 +712,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect ValueError
         with pytest.raises(ValueError, match="Workflow not initialized") as exc_info:
             AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -711,6 +744,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect ValueError
         with pytest.raises(ValueError, match="Workflow not published") as exc_info:
             AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -738,6 +772,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate_single_iteration(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             node_id=node_id,
@@ -753,6 +788,10 @@ class TestAppGenerateService:
         mock_external_service_dependencies[
             "advanced_chat_generator"
         ].return_value.single_iteration_generate.assert_called_once()
+        assert (
+            mock_external_service_dependencies["advanced_chat_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_single_iteration_workflow_success(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -770,6 +809,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate_single_iteration(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             node_id=node_id,
@@ -785,6 +825,10 @@ class TestAppGenerateService:
         mock_external_service_dependencies[
             "workflow_generator"
         ].return_value.single_iteration_generate.assert_called_once()
+        assert (
+            mock_external_service_dependencies["workflow_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_single_iteration_invalid_mode(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -803,6 +847,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect ValueError
         with pytest.raises(ValueError, match="Invalid app mode") as exc_info:
             AppGenerateService.generate_single_iteration(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 node_id=node_id,
@@ -830,6 +875,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate_single_loop(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             node_id=node_id,
@@ -845,6 +891,10 @@ class TestAppGenerateService:
         mock_external_service_dependencies[
             "advanced_chat_generator"
         ].return_value.single_loop_generate.assert_called_once()
+        assert (
+            mock_external_service_dependencies["advanced_chat_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_single_loop_workflow_success(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -862,6 +912,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate_single_loop(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             node_id=node_id,
@@ -875,6 +926,10 @@ class TestAppGenerateService:
 
         # Verify workflow generator was called
         mock_external_service_dependencies["workflow_generator"].return_value.single_loop_generate.assert_called_once()
+        assert (
+            mock_external_service_dependencies["workflow_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_single_loop_invalid_mode(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -893,6 +948,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect ValueError
         with pytest.raises(ValueError, match="Invalid app mode") as exc_info:
             AppGenerateService.generate_single_loop(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 node_id=node_id,
@@ -919,6 +975,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate_more_like_this(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             session=db_session_with_containers,
             app_model=app,
             user=account,
@@ -934,6 +991,10 @@ class TestAppGenerateService:
         mock_external_service_dependencies[
             "completion_generator"
         ].return_value.generate_more_like_this.assert_called_once()
+        assert (
+            mock_external_service_dependencies["completion_generator"].call_args.kwargs["external_retrieval"]
+            is mock_external_service_dependencies["external_retrieval"]
+        )
 
     def test_generate_more_like_this_with_end_user(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -964,6 +1025,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate_more_like_this(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             session=db_session_with_containers,
             app_model=app,
             user=end_user,
@@ -1058,6 +1120,7 @@ class TestAppGenerateService:
         # Execute the method under test and expect exception
         with pytest.raises(Exception, match="Test exception") as exc_info:
             AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -1091,6 +1154,7 @@ class TestAppGenerateService:
 
         # Execute the method under test
         result = AppGenerateService.generate(
+            external_retrieval=mock_external_service_dependencies["external_retrieval"],
             app_model=app,
             user=account,
             args=args,
@@ -1131,6 +1195,7 @@ class TestAppGenerateService:
 
             # Execute the method under test
             result = AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,
@@ -1174,6 +1239,7 @@ class TestAppGenerateService:
             mock_exec_params.new.return_value = mock_payload
 
             result = AppGenerateService.generate(
+                external_retrieval=mock_external_service_dependencies["external_retrieval"],
                 app_model=app,
                 user=account,
                 args=args,

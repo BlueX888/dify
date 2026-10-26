@@ -8,7 +8,7 @@ import uuid
 from dataclasses import replace
 from io import BytesIO
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 from flask import Flask
@@ -31,6 +31,7 @@ from controllers.openapi._models import (
 from controllers.openapi.app_run import AdvancedChatRunApi, AppRunTaskStopApi, ChatRunApi, CompletionRunApi
 from controllers.openapi.auth.subjects import Subject, subject_from_auth
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from extensions.ext_application_services import ApplicationServices
 from graphon.enums import WorkflowExecutionStatus, WorkflowType
 from graphon.file import FileType
@@ -46,6 +47,20 @@ from tests.unit_tests.services.test_app_task_service import _StopRedis
 _TEST_APP_ID = str(uuid.uuid4())
 _TEST_TENANT_ID = str(uuid.uuid4())
 _TEST_ACCOUNT_ID = str(uuid.uuid4())
+
+
+@pytest.fixture
+def external_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    account_application_services: ApplicationServices,
+) -> ExternalDatasetRetriever:
+    port = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = replace(
+        account_application_services,
+        knowledge=replace(account_application_services.knowledge, external_retrieval=port),
+    )
+    monkeypatch.setattr(app_run, "application_services", lambda: services)
+    return port
 
 
 def _make_app() -> App:
@@ -206,7 +221,11 @@ def _ctx(mode: AppMode, session: Session | Mock | None = None) -> _SealableConte
     )
 
 
-def test_run_reads_everything_off_the_context_before_streaming(app: Flask, monkeypatch: pytest.MonkeyPatch):
+def test_run_reads_everything_off_the_context_before_streaming(
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    external_retrieval: ExternalDatasetRetriever,
+):
     generate_mock = _generate_stub(monkeypatch, ["event: a\n\n", "event: b\n\n"])
     session = Mock()
     ctx = _ctx(AppMode.ADVANCED_CHAT, session)
@@ -219,6 +238,7 @@ def test_run_reads_everything_off_the_context_before_streaming(app: Flask, monke
 
     assert body == "event: a\n\nevent: b\n\n"
     assert generate_mock.call_args.kwargs["streaming"] is True
+    assert generate_mock.call_args.kwargs["external_retrieval"] is external_retrieval
     session.commit.assert_not_called()
 
 
@@ -233,7 +253,10 @@ def test_per_mode_route_refuses_an_app_of_another_mode(app: Flask, monkeypatch: 
 
 
 def test_run_hands_the_generator_file_mappings_for_inputs_and_attachments(
-    app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_session: Session
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_session: Session,
+    external_retrieval: ExternalDatasetRetriever,
 ):
     generate_mock = _generate_stub(monkeypatch, [])
     upload_service = Mock()
@@ -274,13 +297,18 @@ def test_run_hands_the_generator_file_mappings_for_inputs_and_attachments(
     assert args["files"] == [{"transfer_method": "local_file", "upload_file_id": "uf-p.jpg", "type": FileType.IMAGE}]
     assert args["query"] == ""
     assert {"attachments", "auto_generate_name"}.isdisjoint(args)
+    assert generate_mock.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
-def test_chat_route_hints_the_reply_on_message_end(app: Flask, monkeypatch: pytest.MonkeyPatch):
+def test_chat_route_hints_the_reply_on_message_end(
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    external_retrieval: ExternalDatasetRetriever,
+):
     message = 'data: {"event": "message", "answer": "hi"}\n\n'
     end = {"event": "message_end", "conversation_id": "c1", "message_id": "m1", "created_at": 1, "id": "m1"}
     end["task_id"] = "t1"
-    _generate_stub(monkeypatch, [message, f"data: {json.dumps(end)}\n\n"])
+    generate_mock = _generate_stub(monkeypatch, [message, f"data: {json.dumps(end)}\n\n"])
     api = ChatRunApi()
     body = ChatRunPayload(inputs={}, query="hi")
     with app.test_request_context(f"/openapi/v1/apps/{_TEST_APP_ID}/chat:run", method="POST"):
@@ -294,16 +322,22 @@ def test_chat_route_hints_the_reply_on_message_end(app: Flask, monkeypatch: pyte
             "input": {"app_id": _TEST_APP_ID, "conversation_id": "c1", "query": None, "inputs": {}},
         }
     ]
+    assert generate_mock.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
-def test_chat_route_passes_a_message_end_without_conversation_through(app: Flask, monkeypatch: pytest.MonkeyPatch):
+def test_chat_route_passes_a_message_end_without_conversation_through(
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    external_retrieval: ExternalDatasetRetriever,
+):
     end = 'data: {"event": "message_end", "message_id": "m1", "created_at": 1, "id": "m1", "task_id": "t1"}\n\n'
-    _generate_stub(monkeypatch, [end])
+    generate_mock = _generate_stub(monkeypatch, [end])
     api = ChatRunApi()
     body = ChatRunPayload(inputs={}, query="hi")
     with app.test_request_context(f"/openapi/v1/apps/{_TEST_APP_ID}/chat:run", method="POST"):
         response = api.post.__handler__(api, _ctx(AppMode.CHAT), app_id=_TEST_APP_ID, body=body)
         assert list(response.response) == [end]
+    assert generate_mock.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
 def test_draft_runs_do_not_hint_the_form_submit_op() -> None:

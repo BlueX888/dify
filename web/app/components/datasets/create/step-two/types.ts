@@ -32,6 +32,7 @@ export type StepTwoProps = {
   crawlOptions?: CrawlOptions
   websiteCrawlProvider?: DataSourceProvider
   websiteCrawlJobId?: string
+  websiteCrawlSourceHandle?: string
   canCreateDocument?: boolean
   onStepChange?: (delta: number) => void
   updateIndexingTypeCache?: (type: string) => void

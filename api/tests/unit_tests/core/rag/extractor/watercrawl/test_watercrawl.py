@@ -2,12 +2,13 @@
 
 import json
 from typing import Any
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock
 
 import httpx
 import pytest
 
 import core.rag.extractor.watercrawl.client as client_module
+from core.rag.extractor.entity.extract_setting import WebsiteJobRef
 from core.rag.extractor.watercrawl.client import BaseAPIClient, WaterCrawlAPIClient
 from core.rag.extractor.watercrawl.exceptions import (
     WaterCrawlAuthenticationError,
@@ -15,9 +16,8 @@ from core.rag.extractor.watercrawl.exceptions import (
     WaterCrawlPermissionError,
 )
 from core.rag.extractor.watercrawl.extractor import WaterCrawlWebExtractor
-from core.rag.extractor.watercrawl.provider import WaterCrawlProvider
-from services.data_source.provider_service import DatasourceProviderService
-from services.data_source.website_service import WebsiteService
+from services.data_source.watercrawl_provider import WaterCrawlProvider
+from tests.unit_tests.core.rag.extractor.website_test_fakes import unused_website_service
 
 
 def _response(
@@ -333,7 +333,7 @@ class TestWaterCrawlProvider:
             provider.client,
             "get_crawl_request",
             lambda job_id: {
-                "status": "completed",
+                "status": "finished",
                 "uuid": job_id,
                 "options": {"spider_options": {"page_limit": 2}},
                 "number_of_documents": 2,
@@ -413,8 +413,8 @@ class TestWaterCrawlProvider:
 class TestWaterCrawlWebExtractor:
     def test_extract_crawl_and_scrape_modes(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
-            "core.rag.extractor.watercrawl.extractor.WebsiteService.get_crawl_url_data",
-            lambda _self, job_id, provider, url, tenant_id: {
+            "core.rag.extractor.watercrawl.extractor.WebsiteService.get_crawl_url_data_by_ref",
+            lambda _self, job_ref, url: {
                 "markdown": "crawl",
                 "source_url": url,
                 "description": "d",
@@ -422,8 +422,8 @@ class TestWaterCrawlWebExtractor:
             },
         )
         monkeypatch.setattr(
-            "core.rag.extractor.watercrawl.extractor.WebsiteService.get_scrape_url_data",
-            lambda _self, provider, url, tenant_id, only_main_content: {
+            "core.rag.extractor.watercrawl.extractor.WebsiteService.get_scrape_url_data_by_ref",
+            lambda _self, job_ref, url, only_main_content: {
                 "markdown": "scrape",
                 "source_url": url,
                 "description": "d",
@@ -433,17 +433,15 @@ class TestWaterCrawlWebExtractor:
 
         crawl_extractor = WaterCrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="watercrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="crawl",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
         scrape_extractor = WaterCrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="watercrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="scrape",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
 
         assert crawl_extractor.extract()[0].page_content == "crawl"
@@ -451,16 +449,15 @@ class TestWaterCrawlWebExtractor:
 
     def test_extract_crawl_returns_empty_when_service_returns_none(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
-            "core.rag.extractor.watercrawl.extractor.WebsiteService.get_crawl_url_data",
-            lambda _self, job_id, provider, url, tenant_id: None,
+            "core.rag.extractor.watercrawl.extractor.WebsiteService.get_crawl_url_data_by_ref",
+            lambda _self, job_ref, url: None,
         )
 
         extractor = WaterCrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="watercrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="crawl",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
 
         assert extractor.extract() == []
@@ -468,10 +465,9 @@ class TestWaterCrawlWebExtractor:
     def test_extract_unknown_mode_returns_empty(self):
         extractor = WaterCrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="watercrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="other",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
 
         assert extractor.extract() == []

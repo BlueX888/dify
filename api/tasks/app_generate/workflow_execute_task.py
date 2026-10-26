@@ -1,7 +1,8 @@
 import contextlib
 import logging
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Mapping, Sequence
+from datetime import UTC, datetime
 from enum import StrEnum
 from functools import partial
 from typing import Annotated, Any
@@ -23,9 +24,12 @@ from core.app.entities.app_invoke_entities import (
 )
 from core.app.entities.task_entities import WorkflowFinishStreamResponse, WorkflowStartStreamResponse
 from core.app.layers.pause_state_persist_layer import PauseStateLayerConfig, WorkflowResumptionContext
+from core.app.layers.trigger_post_layer import TriggerPostLayer
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.repositories import DifyCoreRepositoryFactory
 from extensions.ext_database import db
 from graphon.engine.filter import ResponseStreamFilter
+from graphon.engine.layer import Layer
 from graphon.entities import WorkflowStartReason
 from graphon.enums import WorkflowExecutionStatus
 from graphon.runtime import RuntimeState
@@ -38,6 +42,7 @@ from models.model import App, AppMode, Conversation, EndUser, Message
 from models.workflow import Workflow, WorkflowNodeExecutionTriggeredFrom, WorkflowRun
 from repositories.factory import DifyAPIRepositoryFactory
 from repositories.sqlalchemy_api_workflow_run_repository import WorkflowRunNotPausedError
+from repositories.sqlalchemy_workflow_trigger_log_repository import SQLAlchemyWorkflowTriggerLogRepository
 from services.app_task_service import AppTaskService
 from services.workflow_run_agg import WorkflowRunAgg
 
@@ -137,11 +142,18 @@ class AppExecutionParams(BaseModel):
 
 
 class _AppRunner:
-    def __init__(self, session_factory: sessionmaker | Engine, exec_params: AppExecutionParams):
+    def __init__(
+        self,
+        session_factory: sessionmaker | Engine,
+        exec_params: AppExecutionParams,
+        *,
+        external_retrieval: ExternalDatasetRetriever,
+    ):
         if isinstance(session_factory, Engine):
             session_factory = sessionmaker(bind=session_factory)
         self._session_factory = session_factory
         self._exec_params = exec_params
+        self._external_retrieval = external_retrieval
 
     @contextlib.contextmanager
     def _session(self):
@@ -215,7 +227,9 @@ class _AppRunner:
     ):
         exec_params = self._exec_params
         if exec_params.app_mode == AppMode.ADVANCED_CHAT:
-            return AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
+            return AdvancedChatAppGenerator(
+                execution_driver=WorkflowRunAgg.run, external_retrieval=self._external_retrieval
+            ).generate(
                 app_model=app,
                 workflow=workflow,
                 user=user,
@@ -227,7 +241,9 @@ class _AppRunner:
                 session=session,
             )
         if exec_params.app_mode == AppMode.WORKFLOW:
-            return WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
+            return WorkflowAppGenerator(
+                execution_driver=WorkflowRunAgg.run, external_retrieval=self._external_retrieval
+            ).generate(
                 app_model=app,
                 workflow=workflow,
                 user=user,
@@ -477,15 +493,21 @@ def _publish_streaming_response(
 def workflow_based_app_execution_task(
     payload: str,
 ) -> Mapping[str, Any] | None:
+    from extensions.ext_application_services import application_services
+
     exec_params = AppExecutionParams.model_validate_json(payload)
 
     logger.info("workflow_based_app_execution_task run with params: %s", exec_params)
 
-    runner = _AppRunner(db.engine, exec_params=exec_params)
+    runner = _AppRunner(
+        db.engine,
+        exec_params=exec_params,
+        external_retrieval=application_services().knowledge.external_retrieval,
+    )
     return runner.run()
 
 
-def _resume_app_execution(payload: dict[str, Any]) -> None:
+def _resume_app_execution(payload: dict[str, Any], *, external_retrieval: ExternalDatasetRetriever) -> None:
     workflow_run_id = payload["workflow_run_id"]
 
     session_factory = sessionmaker(bind=db.engine, expire_on_commit=False)
@@ -604,6 +626,7 @@ def _resume_app_execution(payload: dict[str, Any]) -> None:
         session_factory=session_factory,
         state_owner_user_id=workflow.created_by,
     )
+    graph_engine_layers = _get_trigger_resume_layers(session_factory, workflow_run_id)
 
     match generate_entity:
         case AdvancedChatAppGenerateEntity():
@@ -611,6 +634,7 @@ def _resume_app_execution(payload: dict[str, Any]) -> None:
             assert message is not None
             with session_factory() as session:
                 _resume_advanced_chat(
+                    external_retrieval=external_retrieval,
                     app_model=app_model,
                     workflow=workflow,
                     user=user,
@@ -624,9 +648,11 @@ def _resume_app_execution(payload: dict[str, Any]) -> None:
                     workflow_run_id=workflow_run_id,
                     workflow_run=workflow_run,
                     session=session,
+                    graph_engine_layers=graph_engine_layers,
                 )
         case WorkflowAppGenerateEntity():
             _resume_workflow(
+                external_retrieval=external_retrieval,
                 app_model=app_model,
                 workflow=workflow,
                 user=user,
@@ -639,11 +665,22 @@ def _resume_app_execution(payload: dict[str, Any]) -> None:
                 workflow_run=workflow_run,
                 workflow_run_repo=workflow_run_repo,
                 pause_entity=pause_entity,
+                graph_engine_layers=graph_engine_layers,
             )
+
+
+def _get_trigger_resume_layers(session_factory: sessionmaker[Session], workflow_run_id: str) -> tuple[Layer, ...]:
+    with session_factory() as session:
+        trigger_log = SQLAlchemyWorkflowTriggerLogRepository(session).get_by_workflow_run_id(workflow_run_id)
+    if trigger_log is None:
+        return ()
+
+    return (TriggerPostLayer(datetime.now(UTC), trigger_log.id, None),)
 
 
 def _resume_advanced_chat(
     *,
+    external_retrieval: ExternalDatasetRetriever,
     app_model: App,
     workflow: Workflow,
     user: Account | EndUser,
@@ -657,6 +694,7 @@ def _resume_advanced_chat(
     workflow_run_id: str,
     workflow_run: WorkflowRun,
     session: Session,
+    graph_engine_layers: Sequence[Layer] = (),
 ) -> None:
     resumed_generate_entity = generate_entity.model_copy(update={"stream": True})
 
@@ -680,7 +718,7 @@ def _resume_advanced_chat(
         triggered_from=WorkflowNodeExecutionTriggeredFrom.WORKFLOW_RUN,
     )
 
-    generator = AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run)
+    generator = AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval)
 
     try:
         response = generator.resume(
@@ -693,6 +731,7 @@ def _resume_advanced_chat(
             workflow_execution_repository=workflow_execution_repository,
             workflow_node_execution_repository=workflow_node_execution_repository,
             graph_runtime_state=graph_runtime_state,
+            graph_engine_layers=graph_engine_layers,
             pause_state_config=pause_state_config,
             response_stream_filter=response_stream_filter,
             session=session,
@@ -714,6 +753,7 @@ def _resume_advanced_chat(
 
 def _resume_workflow(
     *,
+    external_retrieval: ExternalDatasetRetriever,
     app_model: App,
     workflow: Workflow,
     user: Account | EndUser,
@@ -726,6 +766,7 @@ def _resume_workflow(
     workflow_run: WorkflowRun,
     workflow_run_repo,
     pause_entity,
+    graph_engine_layers: Sequence[Layer] = (),
 ) -> None:
     resumed_generate_entity = generate_entity.model_copy(update={"stream": True})
 
@@ -749,7 +790,7 @@ def _resume_workflow(
         triggered_from=WorkflowNodeExecutionTriggeredFrom.WORKFLOW_RUN,
     )
 
-    generator = WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run)
+    generator = WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval)
 
     try:
         response = generator.resume(
@@ -760,6 +801,7 @@ def _resume_workflow(
             graph_runtime_state=graph_runtime_state,
             workflow_execution_repository=workflow_execution_repository,
             workflow_node_execution_repository=workflow_node_execution_repository,
+            graph_engine_layers=graph_engine_layers,
             pause_state_config=pause_state_config,
             response_stream_filter=response_stream_filter,
         )
@@ -790,4 +832,6 @@ def _resume_workflow(
 
 @shared_task(queue=WORKFLOW_BASED_APP_EXECUTION_QUEUE, name="resume_app_execution")
 def resume_app_execution(payload: dict[str, Any]) -> None:
-    _resume_app_execution(payload)
+    from extensions.ext_application_services import application_services
+
+    _resume_app_execution(payload, external_retrieval=application_services().knowledge.external_retrieval)

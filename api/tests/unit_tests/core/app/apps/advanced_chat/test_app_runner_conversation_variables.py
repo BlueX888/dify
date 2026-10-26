@@ -1,6 +1,6 @@
 """SQLite-backed conversation-variable synchronization tests for AdvancedChatAppRunner."""
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from sqlalchemy import select
@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session
 
 from core.app.apps.advanced_chat import app_runner as app_runner_module
 from core.app.apps.advanced_chat.app_runner import AdvancedChatAppRunner
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from factories import variable_factory
 from graphon.variables import SegmentType
 from models import App, Conversation, ConversationVariable, Message
@@ -47,6 +48,7 @@ def _runner(workflow_variables: list[object]) -> AdvancedChatAppRunner:
     return AdvancedChatAppRunner(
         application_generate_entity=MagicMock(),
         queue_manager=MagicMock(),
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         conversation=conversation,
         message=Message(id="77777777-7777-7777-7777-777777777777"),
         dialogue_count=1,

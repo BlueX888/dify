@@ -27,7 +27,7 @@ from services.knowledge.entities.knowledge_entities import (
     MetadataDetail,
     MetadataOperationData,
 )
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 
 BUILT_IN_METADATA_ACTION_PARAM = {
     "description": "`enable` to activate built-in metadata fields, `disable` to deactivate them.",
@@ -80,7 +80,7 @@ class DatasetMetadataCreateServiceApi(DatasetApiResource):
     @service_api_ns.response(
         201, "Metadata created successfully", service_api_ns.models[DatasetMetadataResponse.__name__]
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(MetadataArgs)
     def post(self, metadata_args: MetadataArgs, session: Session, tenant_id, dataset_id: UUID):
@@ -167,7 +167,7 @@ class DatasetMetadataServiceApi(DatasetApiResource):
     @service_api_ns.response(
         200, "Metadata updated successfully", service_api_ns.models[DatasetMetadataResponse.__name__]
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(MetadataUpdatePayload)
     def patch(self, payload: MetadataUpdatePayload, session: Session, tenant_id, dataset_id: UUID, metadata_id: UUID):
@@ -211,7 +211,7 @@ class DatasetMetadataServiceApi(DatasetApiResource):
         }
     )
     @service_api_ns.response(204, "Metadata deleted successfully")
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     def delete(self, session: Session, tenant_id, dataset_id: UUID, metadata_id: UUID):
         """Delete metadata."""
@@ -288,7 +288,7 @@ class DatasetMetadataBuiltInFieldActionServiceApi(DatasetApiResource):
     @service_api_ns.response(
         200, "Action completed successfully", service_api_ns.models[DatasetMetadataActionResponse.__name__]
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     def post(self, session: Session, tenant_id, dataset_id: UUID, action: Literal["enable", "disable"]):
         """Enable or disable built-in metadata field."""
@@ -344,7 +344,7 @@ class DocumentMetadataEditServiceApi(DatasetApiResource):
         "Documents metadata updated successfully",
         service_api_ns.models[DatasetMetadataActionResponse.__name__],
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(MetadataOperationData)
     def post(self, metadata_args: MetadataOperationData, session: Session, tenant_id, dataset_id: UUID):

@@ -73,7 +73,6 @@ from repositories.knowledge.dataset_read_repository import (
     get_next_segment,
     get_previous_segment,
     get_segment_child_chunks,
-    get_segment_dataset,
     get_segment_document,
 )
 from repositories.knowledge.keyword_table_repository import load_keyword_table
@@ -1012,7 +1011,6 @@ class TestDocumentSegmentIndexing:
         sqlite_session.add_all([dataset, document, segment])
         sqlite_session.flush()
 
-        assert get_segment_dataset(segment, session=sqlite_session) is dataset
         assert get_segment_document(segment, session=sqlite_session) is document
 
     def test_document_segment_creation_with_required_fields(self):

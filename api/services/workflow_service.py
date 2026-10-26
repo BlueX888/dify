@@ -4,7 +4,7 @@ import time
 import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from sqlalchemy import exists, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -112,6 +112,9 @@ from .human_input_delivery_test_service import (
 )
 from .workflow_draft_variable_service import DraftVariableSaver, DraftVarLoader, WorkflowDraftVariableService
 from .workflow_restore import apply_published_workflow_snapshot_to_draft
+
+if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 
 @dataclass(frozen=True)
@@ -1153,6 +1156,8 @@ class WorkflowService:
         account: Account,
         query: str = "",
         files: Sequence[File] | None = None,
+        *,
+        external_retrieval: "ExternalDatasetRetriever",
     ) -> WorkflowNodeExecutionModel:
         """
         Run draft workflow node
@@ -1217,6 +1222,7 @@ class WorkflowService:
             enclosing_node_id = None
 
         run = WorkflowEntry.single_step_run(
+            external_retrieval=external_retrieval,
             execution_driver=WorkflowRunAgg.run,
             workflow=draft_workflow,
             node_id=node_id,
@@ -1650,7 +1656,14 @@ class WorkflowService:
         return variable_pool
 
     def run_free_workflow_node(
-        self, node_data: dict[str, Any], tenant_id: str, user_id: str, node_id: str, user_inputs: dict[str, Any]
+        self,
+        node_data: dict[str, Any],
+        tenant_id: str,
+        user_id: str,
+        node_id: str,
+        user_inputs: dict[str, Any],
+        *,
+        external_retrieval: "ExternalDatasetRetriever",
     ) -> WorkflowNodeExecution:
         """
         Run free workflow node
@@ -1665,6 +1678,7 @@ class WorkflowService:
                 tenant_id=tenant_id,
                 user_id=user_id,
                 user_inputs=user_inputs,
+                external_retrieval=external_retrieval,
             ),
             start_at=start_at,
             node_id=node_id,

@@ -51,7 +51,7 @@ export function ChunkDetailDialog({ payload, open, onOpenChange }: ChunkDetailDi
     if (!files) return []
     return files.map((file) => ({
       name: file.name,
-      mimeType: file.mime_type,
+      mimeType: file.mime_type ?? '',
       sourceUrl: file.source_url,
       size: file.size,
       extension: file.extension,

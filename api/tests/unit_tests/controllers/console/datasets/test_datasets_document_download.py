@@ -28,6 +28,20 @@ DOC_ID = str(UUID(int=1))
 FILE_ID = str(UUID(int=2))
 
 
+class _UnexpectedActorCredentials:
+    def resolve(
+        self,
+        *,
+        workspace_id: str,
+        actor_id: str,
+        credential_id: str,
+        provider: str,
+        plugin_id: str,
+    ) -> dict[str, object]:
+        del workspace_id, actor_id, credential_id, provider, plugin_id
+        raise AssertionError("download test did not select a datasource credential")
+
+
 def _document(**values):
     return Document(
         **{
@@ -70,7 +84,10 @@ def downloads(monkeypatch, sqlite_session_factory):
     access.require_accessible.return_value = AccessibleDataset("dataset-1", "tenant-1")
     documents = DatasetDocumentApplicationService(
         dataset_access=access,
-        operations=SQLAlchemyDocumentOperations(session_factory=sqlite_session_factory),
+        operations=SQLAlchemyDocumentOperations(
+            session_factory=sqlite_session_factory,
+            actor_credentials=_UnexpectedActorCredentials(),
+        ),
         metadata_schema={},
     )
     monkeypatch.setattr(

@@ -3,15 +3,29 @@ from unittest.mock import patch
 
 import pytest
 from faker import Faker
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from models.dataset import Dataset, Document
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
+from repositories.knowledge.external_repository import SQLAlchemyExternalKnowledgeRepository
+from services.knowledge.external.adapters import ExternalDatasetRetrievalAdapter, ExternalKnowledgeGateway
 from tests.test_containers_integration_tests.helpers import accounts as account_fixtures
 from tests.test_containers_integration_tests.helpers import generate_valid_password
+
+
+def _dataset_retrieval(session: Session) -> DatasetRetrieval:
+    session_factory = sessionmaker(bind=session.get_bind(), expire_on_commit=False)
+    return DatasetRetrieval(
+        retrieval_finalizer=build_retrieval_finalizer(),
+        external_retrieval=ExternalDatasetRetrievalAdapter(
+            repository=SQLAlchemyExternalKnowledgeRepository(session_factory=session_factory),
+            gateway=ExternalKnowledgeGateway(),
+        ),
+    )
 
 
 class TestGetAvailableDatasetsIntegration:
@@ -69,7 +83,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant.id, [dataset.id])
 
         # Assert
@@ -126,7 +140,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant.id, [dataset.id])
 
         # Assert
@@ -180,7 +194,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant.id, [dataset.id])
 
         # Assert
@@ -234,7 +248,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant.id, [dataset.id])
 
         # Assert
@@ -278,7 +292,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant.id, [dataset.id])
 
         # Assert
@@ -355,7 +369,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act - request from tenant1, should only get tenant1's dataset
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant1.id, [dataset1.id, dataset2.id])
 
         # Assert
@@ -382,7 +396,7 @@ class TestGetAvailableDatasetsIntegration:
         # Don't create any datasets
 
         # Act
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         result = dataset_retrieval._get_available_datasets(tenant.id, [str(uuid.uuid4())])
 
         # Assert
@@ -439,7 +453,7 @@ class TestGetAvailableDatasetsIntegration:
         db_session_with_containers.commit()
 
         # Act - request only dataset 0 and 2, not dataset 1
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
         requested_ids = [datasets[0].id, datasets[2].id]
         result = dataset_retrieval._get_available_datasets(tenant.id, requested_ids)
 
@@ -507,7 +521,7 @@ class TestKnowledgeRetrievalIntegration:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
 
         # Mock rate limit check and retrieval
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -558,7 +572,7 @@ class TestKnowledgeRetrievalIntegration:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
 
         # Mock rate limit check
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -606,7 +620,7 @@ class TestKnowledgeRetrievalIntegration:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval(db_session_with_containers)
 
         # Mock rate limit check to raise exception
         with patch.object(

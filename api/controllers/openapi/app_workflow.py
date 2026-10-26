@@ -416,6 +416,7 @@ def run_draft_node(
     user_inputs = merge_files(inputs, files, ctx.caller)
     try:
         execution = workflow_service.run_draft_workflow_node(
+            external_retrieval=application_services().knowledge.external_retrieval,
             app_model=ctx.app,
             draft_workflow=draft,
             node_id=node_id,

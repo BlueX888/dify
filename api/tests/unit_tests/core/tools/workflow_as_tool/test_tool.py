@@ -5,7 +5,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from flask import Flask
@@ -13,6 +13,7 @@ from sqlalchemy import Engine, inspect, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.tools.__base.tool_runtime import ToolRuntime
 from core.tools.entities.common_entities import I18nObject
 from core.tools.entities.tool_entities import (
@@ -178,6 +179,7 @@ def _build_tool(*, tenant_id: str = "test_tool", workflow_app_id: str = "app-1",
     runtime = ToolRuntime(tenant_id=tenant_id, invoke_from=InvokeFrom.EXPLORE)
     return WorkflowTool(
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         workflow_app_id=workflow_app_id,
         workflow_id="workflow-1",
         workflow_as_tool_id="wf-tool-1",
@@ -239,6 +241,7 @@ def test_legacy_workflow_tool_executes_with_the_upper_owned_driver(
             user_id=user.id,
             invoke_from=InvokeFrom.SERVICE_API,
             execution_driver=WorkflowRunAgg.run,
+            external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         )
         messages = list(tool.invoke(session=sqlite_session, user_id=user.id, tool_parameters={}))
 
@@ -697,6 +700,7 @@ def test_workflow_tool_provider_type_and_fork_runtime():
     assert isinstance(forked, WorkflowTool)
     assert forked.workflow_app_id == tool.workflow_app_id
     assert forked.runtime.tenant_id == "tenant-2"
+    assert forked._external_retrieval is tool._external_retrieval
 
 
 def test_derive_usage_from_top_level_usage_key():

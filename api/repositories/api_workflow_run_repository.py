@@ -42,12 +42,13 @@ from typing import Protocol, TypedDict
 from sqlalchemy.orm import Session
 
 from core.workflow.nodes.human_input.pause_reason import PauseReason as DifyPauseReason
+from graphon.entities import WorkflowExecution
 from graphon.entities.pause_reason import PauseReason as GraphonPauseReason
 from graphon.enums import WorkflowExecutionStatus, WorkflowType
 from libs.infinite_scroll_pagination import InfiniteScrollPagination
 from models.enums import CreatorUserRole, WorkflowRunTriggeredFrom
 from models.workflow import WorkflowAppLog, WorkflowArchiveLog, WorkflowPause, WorkflowPauseReason, WorkflowRun
-from repositories.entities.workflow_pause import WorkflowPauseEntity
+from repositories.entities.workflow_pause import WorkflowPauseEntity, WorkflowTriggerPausePublication
 from repositories.types import (
     AverageInteractionStats,
     DailyRunsStats,
@@ -566,6 +567,18 @@ class APIWorkflowRunRepository(Protocol):
         # NOTE: we may get rid of the `state_owner_user_id` in parameter list.
         # However, removing it would require an extra for `Workflow` model
         # while creating pause.
+        ...
+
+    def publish_workflow_pause(
+        self,
+        *,
+        workflow_execution: WorkflowExecution,
+        state_owner_user_id: str,
+        state: str,
+        pause_reasons: Sequence[GraphonPauseReason | DifyPauseReason],
+        trigger_updates: Sequence[WorkflowTriggerPausePublication],
+    ) -> WorkflowPauseEntity:
+        """Atomically expose a resumable pause and release every owned trigger."""
         ...
 
     def bind_workflow_task(self, *, tenant_id: str, app_id: str, workflow_run_id: str, task_id: str) -> None:

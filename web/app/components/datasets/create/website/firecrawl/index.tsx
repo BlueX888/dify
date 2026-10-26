@@ -26,7 +26,7 @@ type Props = Readonly<{
   onPreview: (payload: CrawlResultItem) => void
   checkedCrawlResult: CrawlResultItem[]
   onCheckedCrawlResultChange: (payload: CrawlResultItem[]) => void
-  onJobIdChange: (jobId: string) => void
+  onJobIdChange: (jobId: string, sourceHandle?: string) => void
   crawlOptions: CrawlOptions
   onCrawlOptionsChange: (payload: CrawlOptions) => void
 }>
@@ -112,7 +112,7 @@ const FireCrawl: FC<Props> = ({
   const [crawlErrorMessage, setCrawlErrorMessage] = useState('')
   const showError = isCrawlFinished && crawlErrorMessage
   const waitForCrawlFinished = useCallback(
-    async (jobId: string): Promise<CrawlFinishedResult> => {
+    async (jobId: string, sourceHandle: string): Promise<CrawlFinishedResult> => {
       const cancelledResult: CrawlFinishedResult = {
         isCancelled: true,
         isError: false,
@@ -121,7 +121,7 @@ const FireCrawl: FC<Props> = ({
         },
       }
       try {
-        const res = (await checkFirecrawlTaskStatus(jobId)) as any
+        const res = (await checkFirecrawlTaskStatus(jobId, sourceHandle)) as any
         if (res.status === 'completed') {
           return {
             isError: false,
@@ -154,7 +154,7 @@ const FireCrawl: FC<Props> = ({
         onCheckedCrawlResultChange(res.data || []) // default select the crawl result
         await sleep(2500)
         if (!isMountedRef.current) return cancelledResult
-        return await waitForCrawlFinished(jobId)
+        return await waitForCrawlFinished(jobId, sourceHandle)
       } catch (e: any) {
         if (!isMountedRef.current) return cancelledResult
         return {
@@ -187,8 +187,12 @@ const FireCrawl: FC<Props> = ({
         })) as any
         if (!isMountedRef.current) return
         const jobId = res.job_id
-        onJobIdChange(jobId)
-        const { isCancelled, isError, data, errorMessage } = await waitForCrawlFinished(jobId)
+        const sourceHandle = res.source_handle
+        onJobIdChange(jobId, sourceHandle)
+        const { isCancelled, isError, data, errorMessage } = await waitForCrawlFinished(
+          jobId,
+          sourceHandle,
+        )
         if (isCancelled || !isMountedRef.current) return
         if (isError) {
           setCrawlErrorMessage(

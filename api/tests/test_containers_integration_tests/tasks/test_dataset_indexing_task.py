@@ -14,8 +14,8 @@ from enums import CloudPlan, DeploymentEdition
 from models import Account, AccountStatus, Tenant, TenantAccountJoin, TenantAccountRole, TenantStatus
 from models.dataset import Dataset, Document
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
+from services.knowledge.entities.resource_scope import DocumentRef
 from services.knowledge.indexing.errors import DocumentIsPausedError
-from services.knowledge.resource_scope import DocumentRef
 from tasks.document_indexing_task import (
     _document_indexing,
     _document_indexing_with_tenant_queue,
@@ -347,6 +347,7 @@ class TestDatasetIndexingTaskIntegration:
             "tenant_id": next_task["tenant_id"],
             "dataset_id": next_task["dataset_id"],
             "document_ids": next_task["document_ids"],
+            "indexing_request_id": None,
         }
         set_waiting_spy.assert_called_once()
         delete_key_spy.assert_not_called()

@@ -26,6 +26,7 @@ from models import (
 )
 from models.human_input import HumanInputDelivery, HumanInputFormRecipient
 from models.tools import ToolConversationVariables, ToolFile
+from repositories.upload_file_repository import register_upload_file_cleanup_candidates_in_session
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +70,30 @@ def _cleanup_conversation_related_data(conversation_id: str) -> bool:
             _delete_storage_object(tool_file.file_key)
             session.delete(tool_file)
 
+        # Persist file cleanup evidence before taking any UploadFile-owner
+        # locks. This keeps the file-domain order outbox -> owner; no
+        # UploadFile/outbox lock is acquired after MessageFile or Form rows are
+        # changed. Existing writer receipts are preserved by the registration
+        # helper.
+        candidate_uploads = tuple(
+            (tenant_id, upload_file_id)
+            for tenant_id, upload_file_id in session.execute(
+                select(HumanInputFormUploadFile.tenant_id, HumanInputFormUploadFile.upload_file_id)
+                .join(HumanInputForm, HumanInputForm.id == HumanInputFormUploadFile.form_id)
+                .where(HumanInputForm.conversation_id == conversation_id)
+                .order_by(HumanInputFormUploadFile.tenant_id, HumanInputFormUploadFile.upload_file_id)
+            )
+        )
+        candidate_ids_by_tenant: dict[str, list[str]] = {}
+        for tenant_id, upload_file_id in candidate_uploads:
+            candidate_ids_by_tenant.setdefault(tenant_id, []).append(upload_file_id)
+        for tenant_id in sorted(candidate_ids_by_tenant):
+            register_upload_file_cleanup_candidates_in_session(
+                session,
+                workspace_id=tenant_id,
+                file_ids=candidate_ids_by_tenant[tenant_id],
+            )
+
         message_ids = select(Message.id).where(Message.conversation_id == conversation_id)
         session.execute(delete(MessageAgentThought).where(MessageAgentThought.message_id.in_(message_ids)))
         session.execute(delete(MessageChain).where(MessageChain.message_id.in_(message_ids)))
@@ -81,12 +106,46 @@ def _cleanup_conversation_related_data(conversation_id: str) -> bool:
         )
         session.execute(delete(ConversationVariable).where(ConversationVariable.conversation_id == conversation_id))
 
-        form_ids = select(HumanInputForm.id).where(HumanInputForm.conversation_id == conversation_id)
-        session.execute(delete(HumanInputFormUploadFile).where(HumanInputFormUploadFile.form_id.in_(form_ids)))
-        session.execute(delete(HumanInputFormUploadToken).where(HumanInputFormUploadToken.form_id.in_(form_ids)))
-        session.execute(delete(HumanInputFormRecipient).where(HumanInputFormRecipient.form_id.in_(form_ids)))
-        session.execute(delete(HumanInputDelivery).where(HumanInputDelivery.form_id.in_(form_ids)))
-        session.execute(delete(HumanInputForm).where(HumanInputForm.conversation_id == conversation_id))
+        # Upload publication locks the same aggregate in form -> recipient ->
+        # token order before inserting its link. Take those owner locks before
+        # deleting any links so a slow publisher cannot commit an orphan after
+        # this cleanup has already passed the link table.
+        forms = session.scalars(
+            select(HumanInputForm)
+            .where(HumanInputForm.conversation_id == conversation_id)
+            .order_by(HumanInputForm.id)
+            .with_for_update()
+        ).all()
+        form_ids = tuple(form.id for form in forms)
+        if form_ids:
+            session.scalars(
+                select(HumanInputFormRecipient.id)
+                .where(HumanInputFormRecipient.form_id.in_(form_ids))
+                .order_by(HumanInputFormRecipient.id)
+                .with_for_update()
+            ).all()
+            session.scalars(
+                select(HumanInputFormUploadToken.id)
+                .where(HumanInputFormUploadToken.form_id.in_(form_ids))
+                .order_by(HumanInputFormUploadToken.id)
+                .with_for_update()
+            ).all()
+            current_uploads = {
+                (tenant_id, upload_file_id)
+                for tenant_id, upload_file_id in session.execute(
+                    select(HumanInputFormUploadFile.tenant_id, HumanInputFormUploadFile.upload_file_id)
+                    .where(HumanInputFormUploadFile.form_id.in_(form_ids))
+                    .order_by(HumanInputFormUploadFile.tenant_id, HumanInputFormUploadFile.upload_file_id)
+                    .with_for_update()
+                )
+            }
+            if not current_uploads.issubset(set(candidate_uploads)):
+                raise RuntimeError("Human-input upload links changed while cleanup owners were being locked")
+            session.execute(delete(HumanInputFormUploadFile).where(HumanInputFormUploadFile.form_id.in_(form_ids)))
+            session.execute(delete(HumanInputFormUploadToken).where(HumanInputFormUploadToken.form_id.in_(form_ids)))
+            session.execute(delete(HumanInputFormRecipient).where(HumanInputFormRecipient.form_id.in_(form_ids)))
+            session.execute(delete(HumanInputDelivery).where(HumanInputDelivery.form_id.in_(form_ids)))
+            session.execute(delete(HumanInputForm).where(HumanInputForm.id.in_(form_ids)))
 
         session.execute(delete(Message).where(Message.conversation_id == conversation_id))
         session.execute(delete(PinnedConversation).where(PinnedConversation.conversation_id == conversation_id))

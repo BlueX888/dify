@@ -373,7 +373,11 @@ describe('WaterCrawl', () => {
             resume = resolve
           }),
       )
-      vi.mocked(createWatercrawlTask).mockResolvedValueOnce({ job_id: 'limit-job' })
+      vi.mocked(createWatercrawlTask).mockResolvedValueOnce({
+        status: 'active',
+        job_id: 'limit-job',
+        source_handle: 'watercrawl-limit-source-handle',
+      })
       vi.mocked(checkWatercrawlTaskStatus)
         .mockResolvedValueOnce({ status: 'running', current: 1, total: 100, data: [] })
         .mockResolvedValueOnce({
@@ -391,7 +395,10 @@ describe('WaterCrawl', () => {
       )
       await user.click(screen.getByRole('button', { name: /run/i }))
       await waitFor(() => expect(screen.getByText(/totalPageScraped/)).toHaveTextContent('1/5'))
-      expect(checkWatercrawlTaskStatus).toHaveBeenCalledExactlyOnceWith('limit-job')
+      expect(checkWatercrawlTaskStatus).toHaveBeenCalledExactlyOnceWith(
+        'limit-job',
+        'watercrawl-limit-source-handle',
+      )
       await act(async () => resume())
       await screen.findByText('Test Page Title')
       expect(props.onCheckedCrawlResultChange).toHaveBeenLastCalledWith([createCrawlResultItem()])
@@ -769,7 +776,10 @@ describe('WaterCrawl', () => {
       const onJobIdChange = vi.fn()
       const onPreview = vi.fn()
 
-      mockCreateTask.mockResolvedValueOnce({ job_id: 'full-workflow-job' })
+      mockCreateTask.mockResolvedValueOnce({
+        job_id: 'full-workflow-job',
+        source_handle: 'watercrawl-workflow-source-handle',
+      })
       mockCheckStatus
         .mockResolvedValueOnce({
           status: 'running',
@@ -807,7 +817,10 @@ describe('WaterCrawl', () => {
 
       // Assert - job id should be set
       await waitFor(() => {
-        expect(onJobIdChange).toHaveBeenCalledWith('full-workflow-job')
+        expect(onJobIdChange).toHaveBeenCalledWith(
+          'full-workflow-job',
+          'watercrawl-workflow-source-handle',
+        )
       })
 
       // Assert - final results should be displayed
@@ -821,8 +834,16 @@ describe('WaterCrawl', () => {
         options: props.crawlOptions,
       })
       expect(mockCheckStatus).toHaveBeenCalledTimes(2)
-      expect(mockCheckStatus).toHaveBeenNthCalledWith(1, 'full-workflow-job')
-      expect(mockCheckStatus).toHaveBeenNthCalledWith(2, 'full-workflow-job')
+      expect(mockCheckStatus).toHaveBeenNthCalledWith(
+        1,
+        'full-workflow-job',
+        'watercrawl-workflow-source-handle',
+      )
+      expect(mockCheckStatus).toHaveBeenNthCalledWith(
+        2,
+        'full-workflow-job',
+        'watercrawl-workflow-source-handle',
+      )
       // Assert - checked results should be updated
       expect(onCheckedCrawlResultChange).toHaveBeenLastCalledWith(
         [1, 2, 3, 4, 5].map((index) =>
@@ -839,7 +860,10 @@ describe('WaterCrawl', () => {
       const onCheckedCrawlResultChange = vi.fn()
       const onJobIdChange = vi.fn()
 
-      mockCreateTask.mockResolvedValueOnce({ job_id: 'preview-workflow-job' })
+      mockCreateTask.mockResolvedValueOnce({
+        job_id: 'preview-workflow-job',
+        source_handle: 'watercrawl-preview-source-handle',
+      })
       mockCheckStatus.mockResolvedValueOnce({
         status: 'completed',
         current: 1,
@@ -878,7 +902,10 @@ describe('WaterCrawl', () => {
       const previewButton = screen.getByText('datasetCreation.stepOne.website.preview')
       await user.click(previewButton)
 
-      expect(onJobIdChange).toHaveBeenCalledWith('preview-workflow-job')
+      expect(onJobIdChange).toHaveBeenCalledWith(
+        'preview-workflow-job',
+        'watercrawl-preview-source-handle',
+      )
       expect(onCheckedCrawlResultChange).toHaveBeenCalled()
       expect(onPreview).toHaveBeenCalledExactlyOnceWith(
         createCrawlResultItem({

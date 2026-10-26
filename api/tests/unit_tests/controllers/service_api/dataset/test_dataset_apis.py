@@ -7,7 +7,6 @@ persisted through the shared SQLite session fixture.
 import uuid
 from datetime import UTC, datetime
 from inspect import unwrap
-from types import SimpleNamespace
 from typing import cast
 from unittest.mock import MagicMock, patch
 
@@ -16,12 +15,16 @@ from flask import Flask, request
 from sqlalchemy.orm import Session
 from werkzeug.exceptions import Forbidden, NotFound, UnprocessableEntity
 
+import libs.login as login_module
 import services.errors.base
+from controllers.service_api import wraps as wraps_module
 from controllers.service_api.dataset.error import DatasetInUseError, DatasetNameDuplicateError, InvalidActionError
+from extensions.ext_application_services import ApplicationServices
 from models.account import Account, Tenant, TenantAccountRole
 from models.dataset import AppDatasetJoin, Dataset, DatasetMetadata, Document
-from models.enums import PermissionEnum
-from models.model import App, Tag, TagBinding
+from models.enums import ApiTokenType, PermissionEnum
+from models.model import ApiToken, App, DatasetApiTokenBinding, Tag, TagBinding
+from services.entities.feature_entities import KnowledgeRateLimitModel
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -34,6 +37,8 @@ DATASET_MODEL_TABLES = (
     App,
     AppDatasetJoin,
     DatasetMetadata,
+    ApiToken,
+    DatasetApiTokenBinding,
     Tag,
     TagBinding,
 )
@@ -44,6 +49,16 @@ pytestmark = pytest.mark.parametrize("sqlite_session", [DATASET_MODEL_TABLES], i
 def controller_session(sqlite_session: Session) -> Session:
     """Expose the shared SQLite session under the controller-focused fixture name."""
     return sqlite_session
+
+
+@pytest.fixture
+def dataset_application_services(
+    monkeypatch: pytest.MonkeyPatch, account_application_services: ApplicationServices
+) -> ApplicationServices:
+    from controllers.service_api.dataset import dataset as dataset_module
+
+    monkeypatch.setattr(dataset_module, "application_services", lambda: account_application_services)
+    return account_application_services
 
 
 @pytest.fixture
@@ -66,6 +81,7 @@ def account(controller_session: Session, tenant: Tenant, monkeypatch: pytest.Mon
     from controllers.service_api.dataset import dataset as dataset_module
 
     monkeypatch.setattr(dataset_module, "current_user", account)
+    monkeypatch.setattr(login_module, "current_user", account)
     return account
 
 
@@ -448,6 +464,7 @@ class TestDatasetListApiPost:
         account: Account,
         tenant: Tenant,
         controller_session: Session,
+        dataset_application_services: ApplicationServices,
     ) -> None:
         from controllers.service_api.dataset.dataset import DatasetCreatePayload, DatasetListApi
 
@@ -470,6 +487,9 @@ class TestDatasetListApiPost:
         assert_dataset_detail_shape(response)
         assert response["name"] == "New Dataset"
         mock_dataset_svc.create_empty_dataset.assert_called_once()
+        kwargs = mock_dataset_svc.create_empty_dataset.call_args.kwargs
+        assert kwargs["session"] is controller_session
+        assert kwargs["external_templates"] is dataset_application_services.knowledge.external_templates
 
     @pytest.mark.usefixtures("account")
     @patch("controllers.service_api.dataset.dataset.DatasetService")
@@ -479,6 +499,7 @@ class TestDatasetListApiPost:
         app: Flask,
         tenant: Tenant,
         controller_session: Session,
+        dataset_application_services: ApplicationServices,
     ) -> None:
         from controllers.service_api.dataset.dataset import DatasetCreatePayload, DatasetListApi
 
@@ -494,23 +515,51 @@ class TestDatasetListApiPost:
             with pytest.raises(DatasetNameDuplicateError):
                 unwrap(api.post)(api, validated_payload, controller_session, tenant_id=tenant.id)
 
+        assert (
+            mock_dataset_svc.create_empty_dataset.call_args.kwargs["external_templates"]
+            is dataset_application_services.knowledge.external_templates
+        )
+
     @pytest.mark.usefixtures("account")
-    @patch("controllers.service_api.wraps.FeatureService")
-    @patch("controllers.service_api.wraps.validate_and_get_api_token")
     def test_invalid_body_is_rejected_before_the_handler_runs(
         self,
-        mock_validate_token: MagicMock,
-        mock_feature_svc: MagicMock,
         app: Flask,
         tenant: Tenant,
+        controller_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The tests above unwrap the view, so this is what covers the decorator."""
         from controllers.service_api.dataset.dataset import DatasetListApi
 
-        mock_validate_token.return_value = SimpleNamespace(tenant_id=tenant.id)
-        mock_feature_svc.get_knowledge_rate_limit.return_value = SimpleNamespace(enabled=False)
+        api_token = ApiToken(
+            id=str(uuid.uuid4()),
+            tenant_id=tenant.id,
+            type=ApiTokenType.DATASET,
+            token="test_token",
+        )
+        controller_session.add(api_token)
+        controller_session.flush()
 
-        with app.test_request_context("/datasets", method="POST", json={}):
+        def validate_token(scope: str | None = None) -> ApiToken:
+            assert scope == "dataset"
+            return api_token
+
+        monkeypatch.setattr(wraps_module, "validate_and_get_api_token", validate_token)
+        monkeypatch.setattr(
+            wraps_module.FeatureService,
+            "get_knowledge_rate_limit",
+            lambda _tenant_id: KnowledgeRateLimitModel(enabled=False),
+        )
+
+        with (
+            app.test_request_context(
+                "/datasets",
+                method="POST",
+                json={},
+                headers={"Authorization": f"Bearer {api_token.token}"},
+            ),
+            patch("controllers.service_api.wraps.db.session", controller_session),
+        ):
             with pytest.raises(UnprocessableEntity):
                 DatasetListApi().post(tenant_id=tenant.id)
 
@@ -665,12 +714,13 @@ class TestDatasetApiPatch:
         app: Flask,
         dataset: Dataset,
         controller_session: Session,
+        dataset_application_services: ApplicationServices,
     ) -> None:
         from controllers.service_api.dataset.dataset import DatasetApi, DatasetUpdatePayload
 
         dataset.name = "Updated Dataset"
         mock_dataset_svc.get_dataset.return_value = dataset
-        mock_dataset_svc.update_dataset.return_value = dataset
+        mock_dataset_svc.update_dataset.return_value.__enter__.return_value = dataset
         mock_perm_svc.check_permission.return_value = None
         mock_perm_svc.get_dataset_partial_member_list.return_value = ["user-1"]
 
@@ -704,6 +754,10 @@ class TestDatasetApiPatch:
         _, update_data, _ = mock_dataset_svc.update_dataset.call_args.args
         session = mock_dataset_svc.update_dataset.call_args.kwargs["session"]
         assert session is controller_session
+        assert (
+            mock_dataset_svc.update_dataset.call_args.kwargs["external_templates"]
+            is dataset_application_services.knowledge.external_templates
+        )
         assert update_data["name"] == "Updated Dataset"
         assert update_data["permission"] == "partial_members"
         mock_perm_svc.update_partial_member_list.assert_called_once_with(
@@ -717,12 +771,10 @@ class TestDatasetApiPatch:
 class TestDatasetApiDelete:
     """Test suite for DatasetApi.delete() endpoint."""
 
-    @patch("controllers.service_api.dataset.dataset.DatasetPermissionService")
     @patch("controllers.service_api.dataset.dataset.DatasetService")
     def test_delete_dataset_success(
         self,
         mock_dataset_svc: MagicMock,
-        mock_perm_svc: MagicMock,
         app: Flask,
         dataset: Dataset,
         controller_session: Session,
@@ -739,7 +791,10 @@ class TestDatasetApiDelete:
             result = unwrap(api.delete)(api, controller_session, _=dataset.tenant_id, dataset_id=dataset.id)
 
         assert result == ("", 204)
-        mock_perm_svc.clear_partial_member_list.assert_called_once_with(dataset.id, controller_session)
+        mock_dataset_svc.delete_dataset.assert_called_once()
+        args = mock_dataset_svc.delete_dataset.call_args.args
+        assert args[0] == dataset.id
+        assert args[2] is controller_session
 
     @patch("controllers.service_api.dataset.dataset.DatasetService")
     def test_delete_dataset_not_found(

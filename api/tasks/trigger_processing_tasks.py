@@ -40,6 +40,7 @@ from models.model import App, EndUser
 from models.provider_ids import TriggerProviderID
 from models.trigger import TriggerSubscription, WorkflowPluginTrigger, WorkflowTriggerLog
 from models.workflow import Workflow, WorkflowAppLog, WorkflowAppLogCreatedFrom, WorkflowRun
+from repositories.workflow_run_history import advance_workflow_run_history
 from services.async_workflow_service import AsyncWorkflowService
 from services.errors.app import QuotaExceededError
 from services.quota_service import QuotaService, unlimited
@@ -184,6 +185,7 @@ def _record_trigger_failure_log(
         finished_at=now,
         exceptions_count=0,
     )
+    advance_workflow_run_history(workflow_run)
     session.add(workflow_run)
     session.flush()
 

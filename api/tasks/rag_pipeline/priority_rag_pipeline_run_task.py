@@ -1,34 +1,20 @@
-import contextvars
 import logging
 import time
-import uuid
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 import click
 from celery import shared_task  # type: ignore
-from flask import current_app, g
+from flask import current_app
 from pydantic import TypeAdapter
-from sqlalchemy import select
-from sqlalchemy.orm import Session, sessionmaker
 
 from configs import dify_config
 from core.app.apps.pipeline.pipeline_generator import PipelineGenerator
-from core.app.entities.app_invoke_entities import InvokeFrom, RagPipelineGenerateEntity
-from core.app.entities.rag_pipeline_invoke_entities import RagPipelineInvokeEntity
-from core.db.session_factory import get_session_maker
 from core.rag.pipeline.queue import TenantIsolatedTaskQueue
-from core.repositories.factory import DifyCoreRepositoryFactory
-from extensions.application_services.data_sources import build_data_source_credentials
 from extensions.ext_database import db
-from models import Account, Tenant
-from models.dataset import Pipeline
-from models.enums import WorkflowRunTriggeredFrom
-from models.workflow import Workflow, WorkflowNodeExecutionTriggeredFrom
-from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
 from services.file_service import FileService
-from services.workflow_run_agg import WorkflowRunAgg
+from tasks.rag_pipeline.rag_pipeline_run_task import run_single_rag_pipeline_task as _run_owned_pipeline_task
 
 logger = logging.getLogger(__name__)
 
@@ -47,9 +33,12 @@ def priority_rag_pipeline_run_task(
     :param rag_pipeline_invoke_entities_file_id: File ID containing serialized RAG pipeline invoke entities
     :param tenant_id: Tenant ID for the pipeline execution
     """
+    from extensions.ext_application_services import application_services
+
     # run with threading, thread pool size is 10
 
     try:
+        pipeline_generator = application_services().knowledge.pipeline_generator
         start_at = time.perf_counter()
         rag_pipeline_invoke_entities_content = FileService(db.engine).get_file_content(
             rag_pipeline_invoke_entities_file_id
@@ -65,7 +54,12 @@ def priority_rag_pipeline_run_task(
             futures = []
             for rag_pipeline_invoke_entity in rag_pipeline_invoke_entities:
                 # Submit task to thread pool with Flask app
-                future = executor.submit(run_single_rag_pipeline_task, rag_pipeline_invoke_entity, flask_app)
+                future = executor.submit(
+                    run_single_rag_pipeline_task,
+                    rag_pipeline_invoke_entity,
+                    flask_app,
+                    pipeline_generator=pipeline_generator,
+                )
                 futures.append(future)
 
             # Wait for all tasks to complete
@@ -110,96 +104,12 @@ def priority_rag_pipeline_run_task(
         db.session.close()
 
 
-def run_single_rag_pipeline_task(rag_pipeline_invoke_entity: Mapping[str, Any], flask_app):
-    """Run a single RAG pipeline task within Flask app context."""
-    # Create Flask application context for this thread
-    with flask_app.app_context():
-        try:
-            rag_pipeline_invoke_entity_model = RagPipelineInvokeEntity.model_validate(rag_pipeline_invoke_entity)
-            user_id = rag_pipeline_invoke_entity_model.user_id
-            tenant_id = rag_pipeline_invoke_entity_model.tenant_id
-            pipeline_id = rag_pipeline_invoke_entity_model.pipeline_id
-            workflow_id = rag_pipeline_invoke_entity_model.workflow_id
-            streaming = rag_pipeline_invoke_entity_model.streaming
-            workflow_execution_id = rag_pipeline_invoke_entity_model.workflow_execution_id
-            workflow_thread_pool_id = rag_pipeline_invoke_entity_model.workflow_thread_pool_id
-            application_generate_entity = rag_pipeline_invoke_entity_model.application_generate_entity
-
-            with Session(db.engine, expire_on_commit=False) as session:
-                # Load required entities
-                account = session.scalar(select(Account).where(Account.id == user_id).limit(1))
-                if not account:
-                    raise ValueError(f"Account {user_id} not found")
-
-                tenant = session.scalar(select(Tenant).where(Tenant.id == tenant_id).limit(1))
-                if not tenant:
-                    raise ValueError(f"Tenant {tenant_id} not found")
-                account.set_current_tenant_with_session(tenant, session=session)
-
-                pipeline = session.scalar(select(Pipeline).where(Pipeline.id == pipeline_id).limit(1))
-                if not pipeline:
-                    raise ValueError(f"Pipeline {pipeline_id} not found")
-
-                workflow = session.scalar(select(Workflow).where(Workflow.id == pipeline.workflow_id).limit(1))
-                if not workflow:
-                    raise ValueError(f"Workflow {pipeline.workflow_id} not found")
-
-                if workflow_execution_id is None:
-                    workflow_execution_id = str(uuid.uuid4())
-
-                # Create application generate entity from dict
-                entity = RagPipelineGenerateEntity.model_validate(application_generate_entity)
-
-                # Create workflow repositories
-                session_factory = sessionmaker(bind=db.engine, expire_on_commit=False)
-                workflow_execution_repository = DifyCoreRepositoryFactory.create_workflow_execution_repository(
-                    session_factory=session_factory,
-                    tenant_id=pipeline.tenant_id,
-                    user=account,
-                    app_id=entity.app_config.app_id,
-                    triggered_from=WorkflowRunTriggeredFrom.RAG_PIPELINE_RUN,
-                )
-
-                workflow_node_execution_repository = (
-                    DifyCoreRepositoryFactory.create_workflow_node_execution_repository(
-                        session_factory=session_factory,
-                        tenant_id=pipeline.tenant_id,
-                        user=account,
-                        app_id=entity.app_config.app_id,
-                        triggered_from=WorkflowNodeExecutionTriggeredFrom.RAG_PIPELINE_RUN,
-                    )
-                )
-
-            # Set the user directly in g for preserve_flask_contexts
-            g._login_user = account
-
-            # Copy context for passing to pipeline generator
-            context = contextvars.copy_context()
-
-            # Direct execution without creating another thread
-            # Since we're already in a thread pool, no need for nested threading
-
-            pipeline_generator = PipelineGenerator(
-                execution_driver=WorkflowRunAgg.run,
-                documents=SQLAlchemyDocumentRepository(session_factory=session_factory),
-                datasource_providers=build_data_source_credentials(database_client=get_session_maker()).providers,
-            )
-            # Using protected method intentionally for async execution
-            with Session(db.engine, expire_on_commit=False) as session:
-                pipeline_generator._generate(  # type: ignore[attr-defined]
-                    session=session,
-                    flask_app=flask_app,
-                    context=context,
-                    pipeline=pipeline,
-                    workflow_id=workflow_id,
-                    user=account,
-                    application_generate_entity=entity,
-                    invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
-                    workflow_execution_repository=workflow_execution_repository,
-                    workflow_node_execution_repository=workflow_node_execution_repository,
-                    streaming=streaming,
-                    workflow_thread_pool_id=workflow_thread_pool_id,
-                )
-        except Exception:
-            logging.exception("Error in priority pipeline task")
-            raise
+def run_single_rag_pipeline_task(
+    rag_pipeline_invoke_entity: Mapping[str, Any], flask_app, *, pipeline_generator: PipelineGenerator
+):
+    """Run through the same durable owner path as the regular queue."""
+    return _run_owned_pipeline_task(
+        rag_pipeline_invoke_entity,
+        flask_app,
+        pipeline_generator=pipeline_generator,
+    )

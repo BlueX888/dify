@@ -42,16 +42,22 @@ from models.account import Account, Tenant
 from models.dataset import Dataset
 from models.enums import PermissionEnum
 from services.errors.base import NoPermissionError
-from services.errors.metadata import MetadataResourceNotFoundError
+from services.errors.metadata import InvalidMetadataValueError, MetadataResourceNotFoundError
 from services.knowledge.entities.knowledge_entities import MetadataArgs, MetadataOperationData
+from services.knowledge.entities.resource_scope import DatasetRef
 from services.knowledge.metadata.application import MetadataService
-from services.knowledge.resource_scope import DatasetRef
 
 
 @pytest.mark.parametrize(
     ("error", "status", "code", "message"),
     [
         (NoPermissionError("Access denied"), 400, "invalid_param", "Access denied"),
+        (
+            InvalidMetadataValueError("Metadata value must match its field type."),
+            400,
+            "invalid_param",
+            "Metadata value must match its field type.",
+        ),
         (RuntimeError("backend detail"), 500, "unknown", "Internal Server Error"),
     ],
 )

@@ -44,6 +44,7 @@ from core.errors.error import (
 )
 from core.helper.trace_id_helper import get_external_trace_id, get_trace_session_id, omit_trace_session_id_from_payload
 from enums import CloudPlan, DeploymentEdition
+from extensions.ext_application_services import application_services
 from graphon.model_runtime.errors.invoke import InvokeError
 from libs import helper
 from libs.external_api import error_responses
@@ -252,6 +253,7 @@ class CompletionApi(Resource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,
@@ -444,6 +446,7 @@ class ChatApi(Resource):
                 )
 
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 from sqlalchemy import event
@@ -22,6 +22,7 @@ from core.helper.provider_cache import NoOpProviderCredentialCache
 from core.helper.provider_encryption import ProviderConfigEncrypter
 from core.plugin.entities.plugin_daemon import CredentialType
 from core.plugin.impl.exc import PluginDaemonNotFoundError, PluginNotFoundError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.tools.__base.tool_runtime import ToolRuntime
 from core.tools.entities.common_entities import I18nObject
 from core.tools.entities.tool_entities import (
@@ -652,6 +653,7 @@ def test_get_tool_runtime_workflow_path(monkeypatch: pytest.MonkeyPatch, tool_da
             identity=ToolIdentity(author="test", name="wf", label=I18nObject(en_US="Workflow"), provider=provider_id),
         ),
         runtime=ToolRuntime(tenant_id=tenant_id),
+        external_retrieval=None,
     )
     workflow_controller = WorkflowToolProviderController(
         entity=ToolProviderEntity(
@@ -670,11 +672,13 @@ def test_get_tool_runtime_workflow_path(monkeypatch: pytest.MonkeyPatch, tool_da
         "core.tools.tool_manager.ToolTransformService.workflow_provider_to_controller",
         return_value=workflow_controller,
     ):
+        external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
         runtime_tool = ToolManager.get_tool_runtime(
             provider_type=ToolProviderType.WORKFLOW,
             provider_id=provider_id,
             tool_name="wf",
             tenant_id=tenant_id,
+            external_retrieval=external_retrieval,
         )
     assert isinstance(runtime_tool, WorkflowTool)
     assert runtime_tool is not workflow_tool
@@ -686,6 +690,8 @@ def test_get_tool_runtime_workflow_path(monkeypatch: pytest.MonkeyPatch, tool_da
         tool_invoke_from=ToolInvokeFrom.AGENT,
     )
     assert runtime_tool.execution_driver is None
+    assert runtime_tool._external_retrieval is external_retrieval
+    assert "external_retrieval" not in ToolRuntime.model_fields
 
 
 def test_get_tool_runtime_plugin_path():
@@ -777,6 +783,7 @@ def test_get_agent_runtime_apply_runtime_parameters():
         tool_invoke_from=ToolInvokeFrom.AGENT,
         credential_id=None,
         execution_driver=None,
+        external_retrieval=None,
     )
 
 
@@ -798,6 +805,7 @@ def test_get_workflow_runtime_apply_runtime_parameters():
     )
     tool_runtime2 = SimpleNamespace(runtime=ToolRuntime(tenant_id="tenant-1", runtime_parameters={}))
     tool_runtime2.get_merged_runtime_parameters = Mock(return_value=[parameter])
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
     with patch.object(ToolManager, "get_tool_runtime", return_value=tool_runtime2) as mock_get_tool_runtime:
         with patch.object(ToolManager, "_convert_tool_parameters_type", return_value={"query": "workflow"}):
             manager = Mock()
@@ -811,6 +819,7 @@ def test_get_workflow_runtime_apply_runtime_parameters():
                     user_id="user-1",
                     invoke_from=InvokeFrom.DEBUGGER,
                     variable_pool=None,
+                    external_retrieval=external_retrieval,
                 )
 
     assert workflow_result is tool_runtime2
@@ -825,6 +834,7 @@ def test_get_workflow_runtime_apply_runtime_parameters():
         tool_invoke_from=ToolInvokeFrom.WORKFLOW,
         credential_id=None,
         execution_driver=None,
+        external_retrieval=external_retrieval,
     )
 
 
@@ -866,6 +876,7 @@ def test_get_tool_runtime_from_plugin_only_uses_form_parameters():
 
     tool_entity = SimpleNamespace(runtime=ToolRuntime(tenant_id="tenant-1", runtime_parameters={}))
     tool_entity.get_merged_runtime_parameters = Mock(return_value=[form_param, llm_param])
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
     with patch.object(ToolManager, "get_tool_runtime", return_value=tool_entity) as mock_get_tool_runtime:
         result = ToolManager.get_tool_runtime_from_plugin(
@@ -875,6 +886,7 @@ def test_get_tool_runtime_from_plugin_only_uses_form_parameters():
             tool_name="search",
             tool_parameters={"q": "hello", "llm": "ignore"},
             user_id="user-1",
+            external_retrieval=external_retrieval,
         )
 
     assert result is tool_entity
@@ -889,6 +901,7 @@ def test_get_tool_runtime_from_plugin_only_uses_form_parameters():
         tool_invoke_from=ToolInvokeFrom.PLUGIN,
         credential_id=None,
         execution_driver=None,
+        external_retrieval=external_retrieval,
     )
 
 

@@ -37,6 +37,7 @@ from models.workflow import Workflow
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 logger = logging.getLogger(__name__)
 _file_access_controller = DatabaseFileAccessController()
@@ -59,6 +60,7 @@ class WorkflowTool(Tool):
         workflow_call_depth: int,
         entity: ToolEntity,
         runtime: ToolRuntime,
+        external_retrieval: ExternalDatasetRetriever | None,
         label: str = "Workflow",
         execution_driver: WorkflowRunDriver | None = None,
     ):
@@ -69,6 +71,7 @@ class WorkflowTool(Tool):
         self.workflow_call_depth = workflow_call_depth
         self.label = label
         self.execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
         self._latest_usage = LLMUsage.empty_usage()
         self._parent_trace_context = None
         self._trace_session_id = None
@@ -107,7 +110,13 @@ class WorkflowTool(Tool):
 
         if self.execution_driver is None:
             raise ToolInvokeError("Workflow execution driver is required")
-        generator = WorkflowAppGenerator(execution_driver=self.execution_driver)
+        external_retrieval = self._external_retrieval
+        if external_retrieval is None:
+            raise ToolInvokeError("External dataset retrieval runtime is required")
+        generator = WorkflowAppGenerator(
+            execution_driver=self.execution_driver,
+            external_retrieval=external_retrieval,
+        )
         assert self.runtime is not None
         assert self.runtime.invoke_from is not None
 
@@ -248,10 +257,21 @@ class WorkflowTool(Tool):
             version=self.version,
             label=self.label,
             execution_driver=self.execution_driver,
+            external_retrieval=self._external_retrieval,
         )
         forked._parent_trace_context = self._parent_trace_context.model_copy() if self._parent_trace_context else None
         forked._trace_session_id = self._trace_session_id
         return forked
+
+    def bind_execution_dependencies(
+        self,
+        *,
+        execution_driver: WorkflowRunDriver | None,
+        external_retrieval: ExternalDatasetRetriever | None,
+    ) -> None:
+        """Bind dependencies on an execution-scoped fork of this tool definition."""
+        self.execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
 
     def set_parent_trace_context(
         self,

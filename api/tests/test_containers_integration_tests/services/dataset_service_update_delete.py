@@ -16,10 +16,10 @@ from core.rag.index_processor.constant.index_type import IndexTechniqueType
 from models import Account, AccountStatus, Tenant, TenantAccountJoin, TenantAccountRole, TenantStatus
 from models.dataset import AppDatasetJoin, Dataset, DatasetPermissionEnum
 from models.enums import DataSourceType
-from models.model import App
+from models.model import App, ResourceCleanupOutbox
 from services.errors.base import NoPermissionError
 from services.knowledge.dataset_service import DatasetService
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 
 
 class DatasetUpdateDeleteTestDataFactory:
@@ -122,13 +122,12 @@ class TestDatasetServiceDeleteDataset:
         """
         Test successful deletion of a dataset.
 
-        Verifies that when all validation passes, a dataset is deleted
-        correctly with proper event signaling and database cleanup.
+        Verifies that deletion persists cleanup work before publishing it.
 
         This test ensures:
         - Dataset is retrieved correctly
         - Permission is checked
-        - Event is sent for cleanup
+        - Durable cleanup intent is created and published
         - Dataset is deleted from database
         - Transaction is committed
         - Method returns True
@@ -140,13 +139,18 @@ class TestDatasetServiceDeleteDataset:
         dataset = DatasetUpdateDeleteTestDataFactory.create_dataset(db_session_with_containers, tenant.id, owner.id)
 
         # Act
-        with patch("services.knowledge.dataset_service.dataset_was_deleted") as mock_dataset_was_deleted:
+        with patch("services.knowledge.dataset_service.enqueue_resource_cleanup_intent", autospec=True) as enqueue:
             result = DatasetService.delete_dataset(dataset.id, owner, session=db_session_with_containers)
 
         # Assert
         assert result is True
         assert db_session_with_containers.get(Dataset, dataset.id) is None
-        mock_dataset_was_deleted.send.assert_called_once_with(dataset)
+        enqueue.assert_called_once()
+        intent = db_session_with_containers.get(ResourceCleanupOutbox, enqueue.call_args.args[0])
+        assert intent is not None
+        assert intent.tenant_id == tenant.id
+        assert intent.dataset_id == dataset.id
+        assert intent.resource_type == "dataset"
 
     def test_delete_dataset_not_found(self, db_session_with_containers: Session):
         """

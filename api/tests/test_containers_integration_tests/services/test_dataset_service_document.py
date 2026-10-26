@@ -6,6 +6,7 @@ from unittest.mock import create_autospec, patch
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from werkzeug.exceptions import Forbidden, NotFound
 
@@ -15,11 +16,11 @@ from models import Account
 from models.account import TenantAccountRole
 from models.dataset import Dataset, Document
 from models.enums import CreatorUserRole, DataSourceType, DocumentCreatedFrom, IndexingStatus
-from models.model import UploadFile
+from models.model import ResourceCleanupOutbox, UploadFile
 from repositories.knowledge.dataset_read_repository import get_dataset_doc_form
 from services.errors.base import NoPermissionError
 from services.knowledge.dataset_service import DocumentService
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 
 FIXED_UPLOAD_CREATED_AT = datetime.datetime(2024, 1, 1, 0, 0, 0)
 
@@ -602,7 +603,7 @@ def test_get_document_file_detail_returns_upload_file(db_session_with_containers
     assert result.id == upload_file.id
 
 
-def test_delete_document_emits_signal_and_commits(db_session_with_containers: Session):
+def test_delete_document_persists_cleanup_intent_and_commits(db_session_with_containers: Session):
     dataset = DocumentServiceIntegrationFactory.create_dataset(db_session_with_containers)
     upload_file = DocumentServiceIntegrationFactory.create_upload_file(
         db_session_with_containers,
@@ -615,23 +616,25 @@ def test_delete_document_emits_signal_and_commits(db_session_with_containers: Se
         data_source_info={"upload_file_id": upload_file.id},
     )
 
-    with patch("services.knowledge.dataset_service.document_was_deleted.send") as signal_send:
+    with patch("services.knowledge.dataset_service.enqueue_resource_cleanup_intent", autospec=True) as enqueue:
         DocumentService.delete_document(document, session=db_session_with_containers)
 
     assert db_session_with_containers.get(Document, document.id) is None
-    signal_send.assert_called_once_with(
-        document.id,
-        dataset_id=document.dataset_id,
-        doc_form=document.doc_form,
-        file_id=upload_file.id,
-    )
+    enqueue.assert_called_once()
+    intent = db_session_with_containers.get(ResourceCleanupOutbox, enqueue.call_args.args[0])
+    assert intent is not None
+    assert intent.tenant_id == dataset.tenant_id
+    assert intent.dataset_id == dataset.id
+    assert intent.resource_type == "document"
+    assert intent.resource_id == document.id
+    assert intent.source_file_id == upload_file.id
 
 
 def test_delete_documents_ignores_empty_input(db_session_with_containers: Session):
     dataset = DocumentServiceIntegrationFactory.create_dataset(db_session_with_containers)
     dataset_ref = DatasetRef(tenant_id=dataset.tenant_id, dataset_id=dataset.id)
 
-    with patch("services.knowledge.dataset_service.batch_clean_document_task.delay") as delay:
+    with patch("services.knowledge.dataset_service.enqueue_resource_cleanup_intent", autospec=True) as enqueue:
         DocumentService.delete_documents(
             dataset_ref,
             [],
@@ -639,10 +642,10 @@ def test_delete_documents_ignores_empty_input(db_session_with_containers: Sessio
             session=db_session_with_containers,
         )
 
-    delay.assert_not_called()
+    enqueue.assert_not_called()
 
 
-def test_delete_documents_deletes_rows_and_dispatches_cleanup_task(db_session_with_containers: Session):
+def test_delete_documents_deletes_rows_and_publishes_cleanup_intents(db_session_with_containers: Session):
     dataset = DocumentServiceIntegrationFactory.create_dataset(db_session_with_containers)
     dataset.chunk_structure = IndexStructureType.PARAGRAPH_INDEX
     db_session_with_containers.commit()
@@ -671,7 +674,7 @@ def test_delete_documents_deletes_rows_and_dispatches_cleanup_task(db_session_wi
     )
     dataset_ref = DatasetRef(tenant_id=dataset.tenant_id, dataset_id=dataset.id)
 
-    with patch("services.knowledge.dataset_service.batch_clean_document_task.delay") as delay:
+    with patch("services.knowledge.dataset_service.enqueue_resource_cleanup_intent", autospec=True) as enqueue:
         DocumentService.delete_documents(
             dataset_ref,
             [document_a.id, document_b.id],
@@ -681,11 +684,14 @@ def test_delete_documents_deletes_rows_and_dispatches_cleanup_task(db_session_wi
 
     assert db_session_with_containers.get(Document, document_a.id) is None
     assert db_session_with_containers.get(Document, document_b.id) is None
-    delay.assert_called_once()
-    args = delay.call_args.args
-    assert args[0] == [document_a.id, document_b.id]
-    assert args[1] == dataset.id
-    assert set(args[3]) == {upload_file_a.id, upload_file_b.id}
+    assert enqueue.call_count == 2
+    intent_ids = [call.args[0] for call in enqueue.call_args_list]
+    intents = db_session_with_containers.scalars(
+        select(ResourceCleanupOutbox).where(ResourceCleanupOutbox.id.in_(intent_ids))
+    ).all()
+    assert {intent.resource_id for intent in intents} == {document_a.id, document_b.id}
+    assert {intent.source_file_id for intent in intents} == {upload_file_a.id, upload_file_b.id}
+    assert {intent.dataset_id for intent in intents} == {dataset.id}
 
 
 def test_get_documents_position_returns_next_position_when_documents_exist(db_session_with_containers: Session):

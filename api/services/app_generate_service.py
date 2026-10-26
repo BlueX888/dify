@@ -21,6 +21,7 @@ from core.app.features.rate_limiting import RateLimit
 from core.app.features.rate_limiting.rate_limit import rate_limit_context
 from core.app.layers.pause_state_persist_layer import PauseStateLayerConfig
 from core.db import session_factory
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from enums import DeploymentEdition, QuotaType
 from extensions.otel import AppGenerateHandler, trace_span
 from models.model import Account, App, AppMode, EndUser
@@ -105,6 +106,7 @@ class AppGenerateService:
         args: Mapping[str, Any],
         invoke_from: InvokeFrom,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session: Session,
         streaming: bool = True,
         root_node_id: str | None = None,
@@ -122,6 +124,7 @@ class AppGenerateService:
             app_model=app_model,
             streaming=streaming,
             action=lambda rate_limit, request_id: cls._dispatch_generate(
+                external_retrieval=external_retrieval,
                 app_model=app_model,
                 user=user,
                 args=args,
@@ -172,6 +175,7 @@ class AppGenerateService:
     def _dispatch_generate(
         cls,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         app_model: App,
         user: Account | EndUser,
         args: Mapping[str, Any],
@@ -191,7 +195,7 @@ class AppGenerateService:
             case AppMode.COMPLETION:
                 return rate_limit.generate(
                     CompletionAppGenerator.convert_to_event_stream(
-                        CompletionAppGenerator().generate(
+                        CompletionAppGenerator(external_retrieval=external_retrieval).generate(
                             session=session,
                             app_model=app_model,
                             user=user,
@@ -205,7 +209,9 @@ class AppGenerateService:
             case AppMode.AGENT_CHAT:
                 return rate_limit.generate(
                     AgentChatAppGenerator.convert_to_event_stream(
-                        AgentChatAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
+                        AgentChatAppGenerator(
+                            execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                        ).generate(
                             session=session,
                             app_model=app_model,
                             user=user,
@@ -233,7 +239,7 @@ class AppGenerateService:
             case AppMode.CHAT:
                 return rate_limit.generate(
                     ChatAppGenerator.convert_to_event_stream(
-                        ChatAppGenerator().generate(
+                        ChatAppGenerator(external_retrieval=external_retrieval).generate(
                             session=session,
                             app_model=app_model,
                             user=user,
@@ -284,7 +290,9 @@ class AppGenerateService:
                     session_factory=session_factory.get_session_maker(),
                     state_owner_user_id=workflow.created_by,
                 )
-                advanced_generator = AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run)
+                advanced_generator = AdvancedChatAppGenerator(
+                    execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                )
                 return rate_limit.generate(
                     advanced_generator.convert_to_event_stream(
                         advanced_generator.generate(
@@ -341,7 +349,9 @@ class AppGenerateService:
                 )
                 return rate_limit.generate(
                     WorkflowAppGenerator.convert_to_event_stream(
-                        WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
+                        WorkflowAppGenerator(
+                            execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                        ).generate(
                             app_model=app_model,
                             workflow=workflow,
                             user=user,
@@ -392,6 +402,7 @@ class AppGenerateService:
         node_id: str,
         args: Any,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session: Session,
         streaming: bool = True,
     ):
@@ -401,7 +412,9 @@ class AppGenerateService:
             case AppMode.ADVANCED_CHAT:
                 workflow = cls._get_workflow(app_model, InvokeFrom.DEBUGGER, session=session)
                 return AdvancedChatAppGenerator.convert_to_event_stream(
-                    AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run).single_iteration_generate(
+                    AdvancedChatAppGenerator(
+                        execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                    ).single_iteration_generate(
                         app_model=app_model,
                         workflow=workflow,
                         node_id=node_id,
@@ -414,7 +427,9 @@ class AppGenerateService:
             case AppMode.WORKFLOW:
                 workflow = cls._get_workflow(app_model, InvokeFrom.DEBUGGER, session=session)
                 return AdvancedChatAppGenerator.convert_to_event_stream(
-                    WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).single_iteration_generate(
+                    WorkflowAppGenerator(
+                        execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                    ).single_iteration_generate(
                         app_model=app_model,
                         workflow=workflow,
                         node_id=node_id,
@@ -437,6 +452,7 @@ class AppGenerateService:
         node_id: str,
         args: LoopNodeRunPayload,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session: Session,
         streaming: bool = True,
     ):
@@ -446,7 +462,9 @@ class AppGenerateService:
             case AppMode.ADVANCED_CHAT:
                 workflow = cls._get_workflow(app_model, InvokeFrom.DEBUGGER, session=session)
                 return AdvancedChatAppGenerator.convert_to_event_stream(
-                    AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run).single_loop_generate(
+                    AdvancedChatAppGenerator(
+                        execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                    ).single_loop_generate(
                         app_model=app_model,
                         workflow=workflow,
                         node_id=node_id,
@@ -459,7 +477,9 @@ class AppGenerateService:
             case AppMode.WORKFLOW:
                 workflow = cls._get_workflow(app_model, InvokeFrom.DEBUGGER, session=session)
                 return AdvancedChatAppGenerator.convert_to_event_stream(
-                    WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).single_loop_generate(
+                    WorkflowAppGenerator(
+                        execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                    ).single_loop_generate(
                         app_model=app_model,
                         workflow=workflow,
                         node_id=node_id,
@@ -482,6 +502,7 @@ class AppGenerateService:
         message_id: str,
         invoke_from: InvokeFrom,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session: Session,
         streaming: bool = True,
     ) -> Mapping | Generator:
@@ -494,7 +515,7 @@ class AppGenerateService:
         :param streaming: streaming
         :return:
         """
-        return CompletionAppGenerator().generate_more_like_this(
+        return CompletionAppGenerator(external_retrieval=external_retrieval).generate_more_like_this(
             session=session,
             app_model=app_model,
             message_id=message_id,

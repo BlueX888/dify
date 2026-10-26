@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vite-plus/test'
+import { externalHitTesting } from './generated/api/console/datasets/orpc.gen.ts'
 import { consoleRouterContract } from './generated/api/console/router.gen.ts'
 import { contract as openapiContract } from './generated/api/openapi/orpc.gen.ts'
 import { contract as serviceContract } from './generated/api/service/orpc.gen.ts'
@@ -20,6 +21,20 @@ const errorEntries = (contract: unknown, trail: string[] = []): [string, ErrorMa
 }
 
 describe('generated oRPC error maps', () => {
+  it('declares access denial for external hit testing', () => {
+    const errors = externalHitTesting.post['~orpc'].errorMap
+
+    expect(errors.dataset_access_denied.status).toBe(403)
+    expect(
+      errors.dataset_access_denied.data.parse({
+        code: 'dataset_access_denied',
+        message: 'denied',
+        status: 403,
+      }),
+    ).toEqual({ code: 'dataset_access_denied', message: 'denied', status: 403 })
+    expect(errors).not.toHaveProperty('dataset_name_duplicate')
+  })
+
   it.each([
     ['console', consoleRouterContract],
     ['openapi', openapiContract],

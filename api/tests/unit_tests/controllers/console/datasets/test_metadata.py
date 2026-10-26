@@ -1,5 +1,6 @@
 """Console metadata routes use admission, explicit context, and response models."""
 
+from collections.abc import Callable
 from types import SimpleNamespace
 from unittest.mock import Mock, create_autospec
 from uuid import uuid4
@@ -16,26 +17,36 @@ from controllers.console.datasets.metadata import DatasetMetadataCreateApi
 from enums import DeploymentEdition
 from libs.login import AccountWithTenant
 from models.account import Account, TenantAccountRole
+from services.enterprise.rbac_service import RBACService
 from services.errors.base import NoPermissionError
-from services.errors.metadata import MetadataResourceNotFoundError
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
+from services.errors.metadata import InvalidMetadataValueError, MetadataResourceNotFoundError
+from services.knowledge.entities.resource_scope import DatasetRef
 from services.knowledge.metadata.application import MetadataService
-from services.knowledge.resource_scope import DatasetRef
 from tests.unit_tests.controllers.rbac_introspection import rbac_checks
 
 
 @pytest.fixture
-def routes(monkeypatch: pytest.MonkeyPatch, config_overrides):
+def metadata_account() -> Account:
+    account = Account(name="Owner", email="metadata@example.com")
+    account.id = "account-1"
+    account.role = TenantAccountRole.OWNER
+    return account
+
+
+@pytest.fixture
+def routes(
+    monkeypatch: pytest.MonkeyPatch,
+    config_overrides: Callable[..., None],
+    metadata_account: Account,
+) -> tuple[FlaskClient, Mock]:
     config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.CLOUD, LOGIN_DISABLED=True, RBAC_ENABLED=False)
     app = Flask(__name__)
     app.config.update(TESTING=False, PROPAGATE_EXCEPTIONS=False)
     api = Api(app)
     api.error_handlers = console_api.error_handlers.copy()
     api.add_namespace(console_ns, path="/console/api")
-    account = Account(name="Owner", email="metadata@example.com")
-    account.id = "account-1"
-    account.role = TenantAccountRole.OWNER
-    identity = AccountWithTenant(account=account, tenant_id="tenant-1")
+    identity = AccountWithTenant(account=metadata_account, tenant_id="tenant-1")
     monkeypatch.setattr("controllers.console.flask_admission.current_account_with_tenant", lambda: identity)
     monkeypatch.setattr("controllers.console.wraps.current_account_with_tenant", lambda: identity)
     service = create_autospec(MetadataService, instance=True, spec_set=True)
@@ -47,9 +58,79 @@ def routes(monkeypatch: pytest.MonkeyPatch, config_overrides):
 
 
 @pytest.mark.parametrize(
+    "role",
+    [
+        TenantAccountRole.OWNER,
+        TenantAccountRole.ADMIN,
+        TenantAccountRole.EDITOR,
+        TenantAccountRole.DATASET_OPERATOR,
+    ],
+)
+def test_metadata_create_allows_dataset_edit_roles(
+    routes: tuple[FlaskClient, Mock], metadata_account: Account, role: TenantAccountRole
+) -> None:
+    client, service = routes
+    metadata_account.role = role
+    service.create_metadata.return_value = {"id": str(uuid4()), "name": "author", "type": "string"}
+
+    response = client.post(f"/console/api/datasets/{uuid4()}/metadata", json={"type": "string", "name": "author"})
+
+    assert response.status_code == 201
+    service.create_metadata.assert_called_once()
+
+
+@pytest.mark.parametrize("rbac_enabled", [False, True], ids=["legacy-roles", "rbac"])
+@pytest.mark.parametrize(
+    ("method", "path", "payload"),
+    [
+        ("POST", "/datasets/{dataset_id}/metadata", {"type": "string", "name": "author"}),
+        ("PATCH", "/datasets/{dataset_id}/metadata/{metadata_id}", {"name": "writer"}),
+        ("DELETE", "/datasets/{dataset_id}/metadata/{metadata_id}", None),
+        ("POST", "/datasets/{dataset_id}/metadata/built-in/enable", None),
+        ("POST", "/datasets/{dataset_id}/documents/metadata", {"operation_data": []}),
+    ],
+)
+def test_metadata_mutations_reject_normal_members_before_writes(
+    routes: tuple[FlaskClient, Mock],
+    metadata_account: Account,
+    config_overrides: Callable[..., None],
+    monkeypatch: pytest.MonkeyPatch,
+    rbac_enabled: bool,
+    method: str,
+    path: str,
+    payload: dict[str, object] | None,
+) -> None:
+    client, service = routes
+    metadata_account.role = TenantAccountRole.NORMAL
+    config_overrides(RBAC_ENABLED=rbac_enabled)
+    check_access = None
+    if rbac_enabled:
+        check_access = create_autospec(RBACService.CheckAccess.check, return_value=False)
+        monkeypatch.setattr(RBACService.CheckAccess, "check", check_access)
+        monkeypatch.setattr(DatasetId, "owner_id", lambda _self, _tenant_id, _identity: None)
+
+    response = client.open(
+        f"/console/api{path.format(dataset_id=uuid4(), metadata_id=uuid4())}",
+        method=method,
+        json=payload,
+    )
+
+    assert response.status_code == 403
+    assert service.mock_calls == []
+    if check_access is not None:
+        check_access.assert_called_once()
+
+
+@pytest.mark.parametrize(
     ("error", "status", "code", "message"),
     [
         (NoPermissionError("Access denied"), 400, "invalid_param", "Access denied"),
+        (
+            InvalidMetadataValueError("Metadata value must match its field type."),
+            400,
+            "invalid_param",
+            "Metadata value must match its field type.",
+        ),
         (RuntimeError("backend detail"), 500, "unknown", "Internal Server Error"),
     ],
 )

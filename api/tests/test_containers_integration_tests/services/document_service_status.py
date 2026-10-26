@@ -479,7 +479,7 @@ class TestDocumentServiceRecoverDocument:
         """
         with (
             patch("services.knowledge.dataset_service.redis_client") as mock_redis,
-            patch("services.knowledge.dataset_service.recover_document_indexing_task") as mock_task,
+            patch("services.knowledge.dataset_service.enqueue_document_indexing_intent") as mock_task,
         ):
             yield {
                 "redis_client": mock_redis,
@@ -527,9 +527,7 @@ class TestDocumentServiceRecoverDocument:
 
         expected_cache_key = f"document_{document.id}_is_paused"
         mock_document_service_dependencies["redis_client"].delete.assert_called_once_with(expected_cache_key)
-        mock_document_service_dependencies["recover_task"].delay.assert_called_once_with(
-            document.dataset_id, document.id
-        )
+        mock_document_service_dependencies["recover_task"].assert_called_once_with(document.indexing_request_id)
 
     def test_recover_document_not_paused_error(
         self, db_session_with_containers: Session, mock_document_service_dependencies
@@ -601,7 +599,7 @@ class TestDocumentServiceRetryDocument:
                 "services.knowledge.dataset_service.current_user", create_autospec(Account, instance=True)
             ) as mock_current_user,
             patch("services.knowledge.dataset_service.redis_client") as mock_redis,
-            patch("services.knowledge.dataset_service.retry_document_indexing_task") as mock_task,
+            patch("services.knowledge.dataset_service.enqueue_document_indexing_intent") as mock_task,
         ):
             user_id = str(uuid4())
             mock_current_user.id = user_id
@@ -667,9 +665,7 @@ class TestDocumentServiceRetryDocument:
         )
         retry_lock = mock_document_service_dependencies["retry_locks"][0]
         retry_lock.acquire.assert_called_once_with(blocking=False)
-        mock_document_service_dependencies["retry_task"].delay.assert_called_once_with(
-            dataset.id, [document.id], mock_document_service_dependencies["user_id"]
-        )
+        mock_document_service_dependencies["retry_task"].assert_called_once_with(document.indexing_request_id)
 
     def test_retry_document_multiple_success(
         self, db_session_with_containers: Session, mock_document_service_dependencies
@@ -717,9 +713,8 @@ class TestDocumentServiceRetryDocument:
         assert document1.indexing_status == IndexingStatus.WAITING
         assert document2.indexing_status == IndexingStatus.WAITING
 
-        mock_document_service_dependencies["retry_task"].delay.assert_called_once_with(
-            dataset.id, [document1.id, document2.id], mock_document_service_dependencies["user_id"]
-        )
+        assert document1.indexing_request_id == document2.indexing_request_id
+        mock_document_service_dependencies["retry_task"].assert_called_once_with(document1.indexing_request_id)
 
     def test_retry_document_concurrent_retry_error(
         self, db_session_with_containers: Session, mock_document_service_dependencies
@@ -801,7 +796,7 @@ class TestDocumentServiceRetryDocument:
         assert document2.indexing_status == IndexingStatus.ERROR
         first_retry_lock.release.assert_called_once_with()
         second_retry_lock.release.assert_not_called()
-        mock_document_service_dependencies["retry_task"].delay.assert_not_called()
+        mock_document_service_dependencies["retry_task"].assert_not_called()
 
     def test_retry_document_missing_actor_id_error(
         self, db_session_with_containers: Session, mock_document_service_dependencies
@@ -876,7 +871,6 @@ class TestDocumentServiceBatchUpdateDocumentStatus:
         with (
             patch("services.knowledge.dataset_service.redis_client") as mock_redis,
             patch("services.knowledge.dataset_service.add_document_to_index_task") as mock_add_task,
-            patch("services.knowledge.dataset_service.remove_document_from_index_task") as mock_remove_task,
             patch("services.knowledge.dataset_service.naive_utc_now") as mock_naive_utc_now,
         ):
             current_time = datetime.datetime(2023, 1, 1, 12, 0, 0)
@@ -885,7 +879,6 @@ class TestDocumentServiceBatchUpdateDocumentStatus:
             yield {
                 "redis_client": mock_redis,
                 "add_task": mock_add_task,
-                "remove_task": mock_remove_task,
                 "naive_utc_now": mock_naive_utc_now,
                 "current_time": current_time,
             }
@@ -984,7 +977,7 @@ class TestDocumentServiceBatchUpdateDocumentStatus:
         assert document.enabled is False
         assert document.disabled_at == mock_document_service_dependencies["current_time"]
         assert document.disabled_by == user.id
-        mock_document_service_dependencies["remove_task"].delay.assert_called_once_with(document.id)
+        mock_document_service_dependencies["redis_client"].setex.assert_not_called()
 
     def test_batch_update_document_status_archive_success(
         self, db_session_with_containers: Session, mock_document_service_dependencies
@@ -1028,7 +1021,7 @@ class TestDocumentServiceBatchUpdateDocumentStatus:
         assert document.archived is True
         assert document.archived_at == mock_document_service_dependencies["current_time"]
         assert document.archived_by == user.id
-        mock_document_service_dependencies["remove_task"].delay.assert_called_once_with(document.id)
+        mock_document_service_dependencies["redis_client"].setex.assert_not_called()
 
     def test_batch_update_document_status_unarchive_success(
         self, db_session_with_containers: Session, mock_document_service_dependencies
@@ -1100,7 +1093,6 @@ class TestDocumentServiceBatchUpdateDocumentStatus:
 
         # Assert
         mock_document_service_dependencies["add_task"].delay.assert_not_called()
-        mock_document_service_dependencies["remove_task"].delay.assert_not_called()
 
     def test_batch_update_document_status_document_indexing_error(
         self, db_session_with_containers: Session, mock_document_service_dependencies

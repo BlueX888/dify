@@ -7,8 +7,12 @@ from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from core.rag.models.document import AttachmentDocument, Document
-from models.dataset import ChildChunk, Dataset, DocumentSegment, SegmentAttachmentBinding
+from models.dataset import ChildChunk, Dataset, DocumentSegment
 from models.enums import SegmentType
+from repositories.knowledge.segment_cleanup_repository import (
+    add_segment_attachment_bindings,
+    require_locked_segment_attachment_document_owner,
+)
 
 
 class DatasetDocumentStore:
@@ -73,6 +77,14 @@ class DatasetDocumentStore:
         save_child: bool = False,
     ) -> None:
         document_token_pairs = list(zip(docs, token_counts, strict=True))
+        if self._document_id is None:
+            raise ValueError("document_id is required when adding documents")
+        require_locked_segment_attachment_document_owner(
+            session,
+            tenant_id=self._dataset.tenant_id,
+            dataset_id=self._dataset.id,
+            document_id=self._document_id,
+        )
 
         max_position = session.scalar(
             select(func.max(DocumentSegment.position)).where(DocumentSegment.document_id == self._document_id)
@@ -249,12 +261,12 @@ class DatasetDocumentStore:
         self, segment_id: str, multimodel_documents: list[AttachmentDocument] | None, session: Session
     ):
         if multimodel_documents and self._document_id is not None:
-            for multimodel_document in multimodel_documents:
-                binding = SegmentAttachmentBinding(
-                    tenant_id=self._dataset.tenant_id,
-                    dataset_id=self._dataset.id,
-                    document_id=self._document_id,
-                    segment_id=segment_id,
-                    attachment_id=multimodel_document.metadata["doc_id"],
-                )
-                session.add(binding)
+            attachment_ids = sorted({document.metadata["doc_id"] for document in multimodel_documents})
+            add_segment_attachment_bindings(
+                session,
+                tenant_id=self._dataset.tenant_id,
+                dataset_id=self._dataset.id,
+                document_id=self._document_id,
+                segment_id=segment_id,
+                attachment_ids=attachment_ids,
+            )

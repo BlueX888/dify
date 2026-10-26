@@ -385,6 +385,7 @@ it.each([
       files: [],
       websiteCrawlProvider: DataSourceProvider.jinaReader,
       websiteCrawlJobId: 'job-1',
+      websiteCrawlSourceHandle: 'jina-source-handle',
       websitePages: [
         {
           source_url: 'https://example.com/guide',
@@ -408,6 +409,7 @@ it.each([
       website_info_list: expect.objectContaining({
         provider: DataSourceProvider.jinaReader,
         job_id: 'job-1',
+        source_handle: 'jina-source-handle',
         urls: ['https://example.com/reference'],
       }),
     },

@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
 from datetime import datetime
 from types import SimpleNamespace
@@ -10,7 +11,9 @@ from sqlalchemy import event
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.entities.knowledge_entities import PreviewDetail
+from core.rag.extractor.entity.extract_setting import ExtractionResult
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
+from core.rag.index_processor.index_processor_base import AttachmentRef, IndexingMutationGuard
 from core.rag.index_processor.processor.paragraph_index_processor import ParagraphIndexProcessor
 from core.rag.models.document import AttachmentDocument, Document
 from extensions.storage.storage_type import StorageType
@@ -24,18 +27,94 @@ from models.enums import CreatorUserRole, DataSourceType
 from models.model import UploadFile
 
 
+class _PublishAllAttachmentVectorStore:
+    def __init__(self) -> None:
+        self.routes: list[tuple[str | None, str, str, str]] = []
+
+    def publish_bound(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        attachment_refs: Sequence[AttachmentRef],
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None,
+        publish: Callable[
+            [frozenset[AttachmentRef], Callable[[Sequence[str]], None], Callable[[Sequence[str]], None]], None
+        ],
+        mutation_guard: IndexingMutationGuard | None = None,
+    ) -> frozenset[AttachmentRef]:
+        del session, tenant_id, dataset_id, routing_index_struct, mutation_guard
+        self.routes.append((collection_binding_id, indexing_technique, vector_type, collection_name))
+        bound_refs = frozenset(attachment_refs)
+        publish(bound_refs, self.before_write, self.after_write)
+        return bound_refs
+
+    @staticmethod
+    def before_write(_attachment_ids: Sequence[str]) -> None:
+        pass
+
+    @staticmethod
+    def after_write(_attachment_ids: Sequence[str]) -> None:
+        pass
+
+    def delete_unreferenced(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None,
+        document_ids: Sequence[str] | None = None,
+        segment_ids: Sequence[str] | None = None,
+        candidate_attachment_ids: Sequence[str] | None = None,
+        mutation_guard: IndexingMutationGuard | None = None,
+        validate: Callable[[Session], None] | None = None,
+    ) -> tuple[str, ...]:
+        _ = (
+            session,
+            tenant_id,
+            dataset_id,
+            collection_binding_id,
+            indexing_technique,
+            vector_type,
+            collection_name,
+            routing_index_struct,
+            document_ids,
+            segment_ids,
+            candidate_attachment_ids,
+            mutation_guard,
+            validate,
+        )
+        raise AssertionError("attachment deletion is outside these processor tests")
+
+
 class TestParagraphIndexProcessor:
     session: Session
     session_factory: sessionmaker[Session]
 
     @pytest.fixture(autouse=True)
-    def _inject_sqlite_sessions(self, sqlite_session: Session, sqlite_session_factory: sessionmaker[Session]) -> None:
+    def _inject_sqlite_sessions(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ) -> None:
         self.session = sqlite_session
         self.session_factory = sqlite_session_factory
 
+        self.attachment_vectors = _PublishAllAttachmentVectorStore()
+
     @pytest.fixture
     def processor(self) -> ParagraphIndexProcessor:
-        return ParagraphIndexProcessor()
+        return ParagraphIndexProcessor(attachment_vectors=self.attachment_vectors)
 
     @pytest.fixture
     def dataset(self) -> Dataset:
@@ -114,16 +193,21 @@ class TestParagraphIndexProcessor:
     def test_extract_forwards_automatic_flag(self, processor: ParagraphIndexProcessor) -> None:
         extract_setting = Mock()
         session = self.session
-        expected_docs = [Document(page_content="chunk", metadata={})]
+        expected = ExtractionResult(documents=[Document(page_content="chunk", metadata={})])
 
         with patch(
             "core.rag.index_processor.processor.paragraph_index_processor.ExtractProcessor.extract"
         ) as mock_extract:
-            mock_extract.return_value = expected_docs
-            docs = processor.extract(extract_setting, process_rule_mode="hierarchical", session=session)
+            mock_extract.return_value = expected
+            result = processor.extract(extract_setting, process_rule_mode="hierarchical", session=session)
 
-        assert docs == expected_docs
-        mock_extract.assert_called_once_with(extract_setting=extract_setting, is_automatic=True, session=session)
+        assert result == expected
+        mock_extract.assert_called_once_with(
+            extract_setting=extract_setting,
+            is_automatic=True,
+            session=session,
+            on_upload_artifact_created=None,
+        )
 
     def test_transform_validates_process_rule(self, processor: ParagraphIndexProcessor) -> None:
         session = self.session
@@ -235,18 +319,28 @@ class TestParagraphIndexProcessor:
         self, processor: ParagraphIndexProcessor, dataset: Dataset
     ) -> None:
         docs = [Document(page_content="chunk", metadata={})]
-        multimodal_docs = [AttachmentDocument(page_content="image", metadata={})]
+        multimodal_docs = [
+            AttachmentDocument(page_content="image", metadata={"document_id": "document-1", "doc_id": "attachment-1"})
+        ]
         session = self.session
 
         with (
             patch("core.rag.index_processor.processor.paragraph_index_processor.Vector") as mock_vector_cls,
             patch("core.rag.index_processor.processor.paragraph_index_processor.Keyword") as mock_keyword_cls,
         ):
+            mock_vector_cls.return_value.get_routing_target.return_value = ("qdrant", "collection-a")
             processor.load(dataset, docs, multimodal_documents=multimodal_docs, session=session)
         mock_vector_cls.assert_called_once_with(dataset, session=session)
         vector = mock_vector_cls.return_value
         vector.create.assert_called_once_with(docs)
-        vector.create_multimodal.assert_called_once_with(multimodal_docs)
+        vector.create_multimodal.assert_called_once_with(
+            multimodal_docs,
+            before_write=self.attachment_vectors.before_write,
+            after_write=self.attachment_vectors.after_write,
+        )
+        assert self.attachment_vectors.routes == [
+            (dataset.collection_binding_id, str(dataset.indexing_technique), "qdrant", "collection-a")
+        ]
         mock_keyword_cls.assert_not_called()
 
     def test_load_uses_keyword_add_texts_with_keywords_when_economy(
@@ -339,7 +433,14 @@ class TestParagraphIndexProcessor:
                 return_value="hash",
             ),
             patch.object(
-                processor, "_get_content_files", return_value=[AttachmentDocument(page_content="img", metadata={})]
+                processor,
+                "_get_content_files",
+                return_value=[
+                    AttachmentDocument(
+                        page_content="img",
+                        metadata={"document_id": dataset_document.id, "doc_id": "attachment-1"},
+                    )
+                ],
             ),
             patch(
                 "core.rag.index_processor.processor.paragraph_index_processor.DatasetDocumentStore"
@@ -351,6 +452,7 @@ class TestParagraphIndexProcessor:
         ):
             mock_token_counter.side_effect = lambda **_kwargs: phase_events.append("count") or [11, 22]
             mock_store_cls.return_value.add_documents.side_effect = lambda **_kwargs: phase_events.append("store")
+            mock_vector_cls.return_value.get_routing_target.return_value = ("qdrant", "collection-a")
             mock_vector_cls.return_value.create.side_effect = lambda _documents: phase_events.append("vector")
             processor.index(dataset, dataset_document, ["chunk-1", "chunk-2"], session)
 
@@ -367,6 +469,17 @@ class TestParagraphIndexProcessor:
         mock_vector_cls.assert_called_once_with(dataset, session=session)
         mock_vector_cls.return_value.create.assert_called_once()
         mock_vector_cls.return_value.create_multimodal.assert_called_once()
+        assert (
+            mock_vector_cls.return_value.create_multimodal.call_args.kwargs["before_write"]
+            == self.attachment_vectors.before_write
+        )
+        assert (
+            mock_vector_cls.return_value.create_multimodal.call_args.kwargs["after_write"]
+            == self.attachment_vectors.after_write
+        )
+        assert self.attachment_vectors.routes == [
+            (dataset.collection_binding_id, str(dataset.indexing_technique), "qdrant", "collection-a")
+        ]
 
     def test_index_list_chunks_economy(
         self, processor: ParagraphIndexProcessor, dataset: Dataset, dataset_document: DatasetDocument
@@ -422,15 +535,23 @@ class TestParagraphIndexProcessor:
                 return_value="hash",
             ),
             patch.object(
-                processor, "_get_content_files", return_value=[AttachmentDocument(page_content="img", metadata={})]
+                processor,
+                "_get_content_files",
+                return_value=[
+                    AttachmentDocument(
+                        page_content="img",
+                        metadata={"document_id": dataset_document.id, "doc_id": "attachment-1"},
+                    )
+                ],
             ) as mock_files,
             patch("core.rag.index_processor.processor.paragraph_index_processor.DatasetDocumentStore"),
             patch(
                 "core.rag.index_processor.processor.paragraph_index_processor.calculate_segment_token_counts",
                 return_value=[11, 22],
             ),
-            patch("core.rag.index_processor.processor.paragraph_index_processor.Vector"),
+            patch("core.rag.index_processor.processor.paragraph_index_processor.Vector") as mock_vector_cls,
         ):
+            mock_vector_cls.return_value.get_routing_target.return_value = ("qdrant", "collection-a")
             processor.index(dataset, dataset_document, {"general_chunks": []}, session)
 
         assert mock_files.call_count == 1

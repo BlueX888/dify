@@ -1,4 +1,33 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
 from pydantic import BaseModel, ConfigDict, Field
+
+if TYPE_CHECKING:
+    from core.rag.models.document import Document
+
+
+@dataclass(frozen=True)
+class CreatedUploadArtifact:
+    """A storage object created while constructing its UploadFile record."""
+
+    id: str
+    key: str
+
+
+@dataclass(frozen=True)
+class ExtractionResult:
+    documents: list[Document]
+    created_upload_artifacts: tuple[CreatedUploadArtifact, ...] = ()
+    source_version: str | None = None
+
+    @property
+    def created_upload_file_ids(self) -> tuple[str, ...]:
+        """Compatibility view for owners that only need committed record ids."""
+
+        return tuple(artifact.id for artifact in self.created_upload_artifacts)
 
 
 class UploadFileExtractionInput(BaseModel):
@@ -35,17 +64,36 @@ class NotionInfo(BaseModel):
     notion_access_token: str | None = Field(default=None, exclude=True, repr=False)
 
 
+class WebsiteJobRef(BaseModel):
+    """Stable ownership and provider-instance identity for one website crawl job."""
+
+    tenant_id: str
+    provider: str
+    provider_instance_id: str = Field(pattern=r"^[0-9a-f]{64}$")
+    job_id: str
+
+
 class WebsiteInfo(BaseModel):
     """
     website import info.
     """
 
-    provider: str
-    job_id: str
+    job_ref: WebsiteJobRef
     url: str
     mode: str
-    tenant_id: str
     only_main_content: bool = False
+
+    @property
+    def provider(self) -> str:
+        return self.job_ref.provider
+
+    @property
+    def job_id(self) -> str:
+        return self.job_ref.job_id
+
+    @property
+    def tenant_id(self) -> str:
+        return self.job_ref.tenant_id
 
 
 class ExtractSetting(BaseModel):

@@ -1,22 +1,21 @@
 from collections.abc import Callable
 from dataclasses import replace
-from typing import Literal
 from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
 from machinery.context import RequestContext
-from services.knowledge.dataset_access import AccessibleDataset, DatasetAccess, DatasetAccessDeniedError
+from services.errors.dataset import DatasetAccessDeniedError
+from services.knowledge.dataset_access import AccessibleDataset, DatasetAccess
 from services.knowledge.documents.application import (
     DatasetDocumentApplicationService,
     DocumentArchivedError,
     DocumentIndexingStateError,
-    DocumentInvalidActionError,
     DocumentNotFoundError,
     DocumentOperations,
     DocumentState,
 )
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 
 CONTEXT = RequestContext("request-1", None, "actor-1", "tenant-1")
 DATASET = DatasetRef("tenant-1", "dataset-1")
@@ -109,38 +108,6 @@ def test_archived_documents_cannot_be_reprocessed(
 
 
 @pytest.mark.parametrize(
-    ("action", "status", "paused"),
-    [("pause", "indexing", True), ("resume", "paused", False), ("resume", "error", False)],
-)
-def test_processing_transition_records_explicit_actor(
-    service: DatasetDocumentApplicationService,
-    operations: MagicMock,
-    action: Literal["pause", "resume"],
-    status: str,
-    paused: bool,
-) -> None:
-    operations.get_state.return_value = replace(STATE, indexing_status=status)
-    service.update_processing(CONTEXT, dataset_id="dataset-1", document_id="document-1", action=action)
-    ref, values = operations.update_document.call_args.args
-    assert ref == DOCUMENT
-    assert values["is_paused"] is paused
-    assert values["paused_by"] == (CONTEXT.account_id if paused else None)
-    assert (values["paused_at"] is not None) is paused
-
-
-@pytest.mark.parametrize(
-    ("action", "status"), [("pause", "completed"), ("resume", "indexing"), ("invalid", "indexing")]
-)
-def test_invalid_processing_transition_does_not_write(
-    service: DatasetDocumentApplicationService, operations: MagicMock, action: Literal["pause", "resume"], status: str
-) -> None:
-    operations.get_state.return_value = replace(STATE, indexing_status=status)
-    with pytest.raises(DocumentInvalidActionError):
-        service.update_processing(CONTEXT, dataset_id="dataset-1", document_id="document-1", action=action)
-    operations.update_document.assert_not_called()
-
-
-@pytest.mark.parametrize(
     ("doc_type", "expected"), [("book", {"title": "Title"}), ("others", {"title": "Title", "unknown": 12})]
 )
 def test_metadata_policy_filters_schema_but_preserves_custom_fields(
@@ -153,10 +120,7 @@ def test_metadata_policy_filters_schema_but_preserves_custom_fields(
         doc_type=doc_type,
         doc_metadata={"title": "Title", "unknown": 12},
     )
-    ref, values = operations.update_document.call_args.args
-    assert ref == DOCUMENT
-    assert values["doc_metadata"] == expected
-    assert values["doc_type"] == doc_type
+    operations.update_metadata.assert_called_once_with(DOCUMENT, doc_type=doc_type, doc_metadata=expected)
 
 
 @pytest.mark.parametrize(("doc_type", "metadata"), [(None, {}), ("book", None), ("invalid", {})])
@@ -170,7 +134,7 @@ def test_invalid_metadata_never_writes(
         service.update_metadata(
             CONTEXT, dataset_id="dataset-1", document_id="document-1", doc_type=doc_type, doc_metadata=metadata
         )
-    operations.update_document.assert_not_called()
+    operations.update_metadata.assert_not_called()
 
 
 def test_retry_filters_missing_archived_completed_and_duplicate_documents(

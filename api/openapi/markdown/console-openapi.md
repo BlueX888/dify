@@ -6438,26 +6438,6 @@ Update document metadata
 | 403 | Forbidden | **application/json**: [ArchivedDocumentImmutableError](#archiveddocumentimmutableerror)<br>[ErrorResponse](#errorresponse)<br> |
 | default | Error | **application/json**: [ErrorResponse](#errorresponse)<br> |
 
-### [PATCH] /datasets/{dataset_id}/documents/{document_id}/processing/{action}
-Update document processing status (pause/resume)
-
-#### Parameters
-
-| Name | Located in | Description | Required | Schema |
-| ---- | ---------- | ----------- | -------- | ------ |
-| action | path | Action to perform (pause/resume) | Yes | string |
-| dataset_id | path | Dataset ID | Yes | string (uuid) |
-| document_id | path | Document ID | Yes | string (uuid) |
-
-#### Responses
-
-| Code | Description | Schema |
-| ---- | ----------- | ------ |
-| 200 | Processing status updated successfully | **application/json**: [SimpleResultResponse](#simpleresultresponse)<br> |
-| 400 | Invalid action | **application/json**: [InvalidActionError](#invalidactionerror)<br>[ErrorResponse](#errorresponse)<br> |
-| 404 | Document not found | **application/json**: [ErrorResponse](#errorresponse)<br> |
-| default | Error | **application/json**: [ErrorResponse](#errorresponse)<br> |
-
 ### [POST] /datasets/{dataset_id}/documents/{document_id}/rename
 #### Parameters
 
@@ -6810,8 +6790,8 @@ Test external knowledge retrieval for dataset
 | ---- | ----------- | ------ |
 | 200 | External hit testing completed successfully | **application/json**: [ExternalHitTestingResponse](#externalhittestingresponse)<br> |
 | 400 | Invalid parameters | **application/json**: [ErrorResponse](#errorresponse)<br> |
+| 403 | Forbidden | **application/json**: [DatasetAccessDeniedError](#datasetaccessdeniederror)<br>[ErrorResponse](#errorresponse)<br> |
 | 404 | Dataset not found | **application/json**: [ErrorResponse](#errorresponse)<br> |
-| 409 | Conflict | **application/json**: [DatasetNameDuplicateError](#datasetnameduplicateerror)<br>[ErrorResponse](#errorresponse)<br> |
 | default | Error | **application/json**: [ErrorResponse](#errorresponse)<br> |
 
 ### [POST] /datasets/{dataset_id}/hit-testing
@@ -6834,7 +6814,8 @@ Test dataset knowledge retrieval
 | Code | Description | Schema |
 | ---- | ----------- | ------ |
 | 200 | Hit testing completed successfully | **application/json**: [HitTestingResponse](#hittestingresponse)<br> |
-| 400 | Invalid parameters | **application/json**: [CompletionRequestError](#completionrequesterror)<br>[ModelCurrentlyNotSupportError](#modelcurrentlynotsupporterror)<br>[ProviderNotInitializeError](#providernotinitializeerror)<br>[ProviderQuotaExceededError](#providerquotaexceedederror)<br>[ErrorResponse](#errorresponse)<br> |
+| 400 | Invalid parameters | **application/json**: [CompletionRequestError](#completionrequesterror)<br>[DatasetNotInitializedError](#datasetnotinitializederror)<br>[ModelCurrentlyNotSupportError](#modelcurrentlynotsupporterror)<br>[ProviderNotInitializeError](#providernotinitializeerror)<br>[ProviderQuotaExceededError](#providerquotaexceedederror)<br>[ErrorResponse](#errorresponse)<br> |
+| 403 | Forbidden | **application/json**: [DatasetAccessDeniedError](#datasetaccessdeniederror)<br>[ErrorResponse](#errorresponse)<br> |
 | 404 | Dataset not found | **application/json**: [ErrorResponse](#errorresponse)<br> |
 | default | Error | **application/json**: [ErrorResponse](#errorresponse)<br> |
 
@@ -10906,6 +10887,7 @@ Get website crawl status
 | ---- | ---------- | ----------- | -------- | ------ |
 | job_id | path | Crawl job ID | Yes | string |
 | provider | query | Crawl provider (firecrawl/watercrawl/jinareader) | Yes | string, <br>**Available values:** "firecrawl", "jinareader", "watercrawl" |
+| source_handle | query | Opaque source handle returned by the crawl endpoint | Yes | string |
 
 #### Responses
 
@@ -20484,6 +20466,14 @@ The dataset name already exists. Please modify your dataset name.
 | ---- | ---- | ----------- | -------- |
 | DatasetNameDuplicateError |  | The dataset name already exists. Please modify your dataset name. |  |
 
+#### DatasetNotInitializedError
+
+The dataset is still being initialized or indexing. Please wait a moment.
+
+| Name | Type | Description | Required |
+| ---- | ---- | ----------- | -------- |
+| DatasetNotInitializedError |  | The dataset is still being initialized or indexing. Please wait a moment. |  |
+
 #### DatasetQueryContentResponse
 
 | Name | Type | Description | Required |
@@ -22283,7 +22273,7 @@ Enum class for form type.
 | ---- | ---- | ----------- | -------- |
 | extension | string |  | Yes |
 | id | string |  | Yes |
-| mime_type | string |  | Yes |
+| mime_type | string | MIME type, or null when the upload has no recorded MIME type. | Yes |
 | name | string |  | Yes |
 | size | integer |  | Yes |
 | source_url | string |  | Yes |
@@ -22293,7 +22283,6 @@ Enum class for form type.
 | Name | Type | Description | Required |
 | ---- | ---- | ----------- | -------- |
 | attachment_ids | [ string ] | List of attachment IDs to include in the retrieval context. | No |
-| external_retrieval_model | object | Retrieval settings for external knowledge bases. | No |
 | query | string | Search query text. | Yes |
 | retrieval_model | [RetrievalModel](#retrievalmodel) | Retrieval model configuration. Controls how chunks are searched and ranked when querying this knowledge base. | No |
 
@@ -28546,13 +28535,20 @@ The app access service is unavailable. Try again later.
 
 | Name | Type | Description | Required |
 | ---- | ---- | ----------- | -------- |
-| WebsiteCrawlResponse | object |  |  |
+| current | integer |  | No |
+| data |  |  | No |
+| job_id | string |  | No |
+| source_handle | string |  | No |
+| status | string |  | Yes |
+| time_consuming | string<br>number |  | No |
+| total | integer |  | No |
 
 #### WebsiteCrawlStatusQuery
 
 | Name | Type | Description | Required |
 | ---- | ---- | ----------- | -------- |
 | provider | string, <br>**Available values:** "firecrawl", "jinareader", "watercrawl" | *Enum:* `"firecrawl"`, `"jinareader"`, `"watercrawl"` | Yes |
+| source_handle | string | Opaque source handle returned by the crawl endpoint | Yes |
 
 #### WebsiteInfo
 
@@ -28561,6 +28557,7 @@ The app access service is unavailable. Try again later.
 | job_id | string |  | Yes |
 | only_main_content | boolean, <br>**Default:** true |  | No |
 | provider | string |  | Yes |
+| source_handle | string |  | No |
 | urls | [ string ] |  | Yes |
 
 #### WeightKeywordSetting

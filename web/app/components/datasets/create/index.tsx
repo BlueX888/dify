@@ -2,7 +2,12 @@
 
 import type { DatasetAndDocumentResponse } from '@dify/contracts/api/console/datasets/types.gen'
 import type { NotionPage } from '@/models/common'
-import type { CrawlOptions, CrawlResultItem, FileItem } from '@/models/datasets'
+import type {
+  CrawlOptions,
+  CrawlResultItem,
+  FileItem,
+  WebsiteCrawlReference,
+} from '@/models/datasets'
 import type { RETRIEVE_METHOD } from '@/types/app'
 import { useQuery, useSuspenseQuery } from '@tanstack/react-query'
 import { produce } from 'immer'
@@ -84,7 +89,9 @@ const DatasetUpdateForm = ({ datasetId }: DatasetUpdateFormProps) => {
   const [websiteCrawlProvider, setWebsiteCrawlProvider] = useState<DataSourceProvider>(
     DataSourceProvider.jinaReader,
   )
-  const [websiteCrawlJobId, setWebsiteCrawlJobId] = useState('')
+  const [websiteCrawlReference, setWebsiteCrawlReference] = useState<WebsiteCrawlReference>({
+    jobId: '',
+  })
 
   const {
     data: dataSourceList,
@@ -179,7 +186,9 @@ const DatasetUpdateForm = ({ datasetId }: DatasetUpdateFormProps) => {
                 websitePages={websitePages}
                 updateWebsitePages={setWebsitePages}
                 onWebsiteCrawlProviderChange={setWebsiteCrawlProvider}
-                onWebsiteCrawlJobIdChange={setWebsiteCrawlJobId}
+                onWebsiteCrawlJobIdChange={(jobId, sourceHandle) =>
+                  setWebsiteCrawlReference({ jobId, sourceHandle })
+                }
                 crawlOptions={crawlOptions}
                 onCrawlOptionsChange={setCrawlOptions}
               />
@@ -196,7 +205,8 @@ const DatasetUpdateForm = ({ datasetId }: DatasetUpdateFormProps) => {
                 notionCredentialId={notionCredentialId}
                 websitePages={websitePages}
                 websiteCrawlProvider={websiteCrawlProvider}
-                websiteCrawlJobId={websiteCrawlJobId}
+                websiteCrawlJobId={websiteCrawlReference.jobId}
+                websiteCrawlSourceHandle={websiteCrawlReference.sourceHandle}
                 onStepChange={changeStep}
                 canCreateDocument={canAddDocumentsToDataset}
                 updateIndexingTypeCache={updateIndexingTypeCache}

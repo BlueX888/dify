@@ -26,6 +26,7 @@ from core.workflow.nodes.human_input.pause_reason import PauseReason as DifyPaus
 from extensions.logstore.aliyun_logstore import AliyunLogStore
 from extensions.logstore.repositories import safe_float, safe_int
 from extensions.logstore.sql_escape import escape_identifier, escape_logstore_query_value, escape_sql_string
+from graphon.entities import WorkflowExecution
 from graphon.entities.pause_reason import PauseReason as GraphonPauseReason
 from graphon.enums import WorkflowExecutionStatus
 from libs.datetime_utils import ensure_naive_utc, naive_utc_now
@@ -33,7 +34,7 @@ from libs.infinite_scroll_pagination import InfiniteScrollPagination
 from models.enums import CreatorUserRole, WorkflowRunTriggeredFrom
 from models.workflow import WorkflowRun, WorkflowType
 from repositories.api_workflow_run_repository import APIWorkflowRunRepository, AppWorkflowRunStats
-from repositories.entities.workflow_pause import WorkflowPauseEntity
+from repositories.entities.workflow_pause import WorkflowPauseEntity, WorkflowTriggerPausePublication
 from repositories.sqlalchemy_api_workflow_run_repository import DifyAPISQLAlchemyWorkflowRunRepository
 from repositories.types import (
     AverageInteractionStats,
@@ -187,6 +188,24 @@ class LogstoreAPIWorkflowRunRepository(APIWorkflowRunRepository):
         )
 
     @override
+    def publish_workflow_pause(
+        self,
+        *,
+        workflow_execution: WorkflowExecution,
+        state_owner_user_id: str,
+        state: str,
+        pause_reasons: Sequence[GraphonPauseReason | DifyPauseReason],
+        trigger_updates: Sequence[WorkflowTriggerPausePublication],
+    ) -> WorkflowPauseEntity:
+        return self._control_repository.publish_workflow_pause(
+            workflow_execution=workflow_execution,
+            state_owner_user_id=state_owner_user_id,
+            state=state,
+            pause_reasons=pause_reasons,
+            trigger_updates=trigger_updates,
+        )
+
+    @override
     def bind_workflow_task(self, *, tenant_id: str, app_id: str, workflow_run_id: str, task_id: str) -> None:
         self._control_repository.bind_workflow_task(
             tenant_id=tenant_id, app_id=app_id, workflow_run_id=workflow_run_id, task_id=task_id
@@ -286,7 +305,8 @@ class LogstoreAPIWorkflowRunRepository(APIWorkflowRunRepository):
             ]
         )
 
-        # Build status filter with escaped value
+        # Filter only after selecting the latest version. Filtering inside the
+        # window would resurrect an older PAUSED/RUNNING version after resume.
         status_filter = f"AND status='{escape_sql_string(status)}'" if status else ""
 
         # Build last_id filter for pagination
@@ -304,10 +324,9 @@ class LogstoreAPIWorkflowRunRepository(APIWorkflowRunRepository):
                 WHERE tenant_id='{escaped_tenant_id}'
                   AND app_id='{escaped_app_id}'
                   AND ({triggered_from_filter})
-                  {status_filter}
                   {last_id_filter}
             ) t
-            WHERE rn = 1
+            WHERE rn = 1 {status_filter}
             ORDER BY created_at DESC
             LIMIT {limit + 1}
         """
@@ -562,37 +581,23 @@ class LogstoreAPIWorkflowRunRepository(APIWorkflowRunRepository):
             # TODO: Parse time_range and convert to from_time/to_time
             logger.warning("time_range filter not implemented")
 
-        # If status is provided, simple count
+        latest_versions_sql = f"""
+            SELECT id, status
+            FROM (
+                SELECT id, status, ROW_NUMBER() OVER (PARTITION BY id ORDER BY log_version DESC) AS rn
+                FROM {AliyunLogStore.workflow_execution_logstore}
+                WHERE tenant_id='{escaped_tenant_id}'
+                  AND app_id='{escaped_app_id}'
+                  AND triggered_from='{escaped_triggered_from}'
+                  {time_filter}
+            ) latest
+            WHERE rn = 1
+        """
+
+        # If status is provided, count the latest version of each run.
         if status:
             escaped_status = escape_sql_string(status)
-
-            if status == "running":
-                # Running status requires window function
-                sql = f"""
-                    SELECT COUNT(*) as count
-                    FROM (
-                        SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY log_version DESC) AS rn
-                        FROM {AliyunLogStore.workflow_execution_logstore}
-                        WHERE tenant_id='{escaped_tenant_id}'
-                          AND app_id='{escaped_app_id}'
-                          AND triggered_from='{escaped_triggered_from}'
-                          AND status='running'
-                          {time_filter}
-                    ) t
-                    WHERE rn = 1
-                """
-            else:
-                # Finished status uses optimized filter
-                sql = f"""
-                    SELECT COUNT(DISTINCT id) as count
-                    FROM {AliyunLogStore.workflow_execution_logstore}
-                    WHERE tenant_id='{escaped_tenant_id}'
-                      AND app_id='{escaped_app_id}'
-                      AND triggered_from='{escaped_triggered_from}'
-                      AND status='{escaped_status}'
-                      AND finished_at IS NOT NULL
-                      {time_filter}
-                """
+            sql = f"SELECT COUNT(*) AS count FROM ({latest_versions_sql}) current WHERE status='{escaped_status}'"
 
             try:
                 results = self.logstore_client.execute_sql(
@@ -612,42 +617,13 @@ class LogstoreAPIWorkflowRunRepository(APIWorkflowRunRepository):
                 logger.exception("Failed to get workflow runs count")
                 raise
 
-        # No status filter - get counts grouped by status
-        # Use optimized query for finished runs, separate query for running
+        # No status filter - group the latest version of every run. PAUSED has
+        # no finished_at, so terminal-only optimization would omit it entirely.
         try:
-            # Escape parameters (already escaped above, reuse variables)
-            # Count finished runs grouped by status
-            finished_sql = f"""
-                SELECT status, COUNT(DISTINCT id) as count
-                FROM {AliyunLogStore.workflow_execution_logstore}
-                WHERE tenant_id='{escaped_tenant_id}'
-                  AND app_id='{escaped_app_id}'
-                  AND triggered_from='{escaped_triggered_from}'
-                  AND finished_at IS NOT NULL
-                  {time_filter}
-                GROUP BY status
-            """
-
-            # Count running runs
-            running_sql = f"""
-                SELECT COUNT(*) as count
-                FROM (
-                    SELECT *, ROW_NUMBER() OVER (PARTITION BY id ORDER BY log_version DESC) AS rn
-                    FROM {AliyunLogStore.workflow_execution_logstore}
-                    WHERE tenant_id='{escaped_tenant_id}'
-                      AND app_id='{escaped_app_id}'
-                      AND triggered_from='{escaped_triggered_from}'
-                      AND status='running'
-                      {time_filter}
-                ) t
-                WHERE rn = 1
-            """
-
-            finished_results = self.logstore_client.execute_sql(
-                sql=finished_sql, query="*", logstore=AliyunLogStore.workflow_execution_logstore
-            )
-            running_results = self.logstore_client.execute_sql(
-                sql=running_sql, query="*", logstore=AliyunLogStore.workflow_execution_logstore
+            results = self.logstore_client.execute_sql(
+                sql=f"SELECT status, COUNT(*) AS count FROM ({latest_versions_sql}) current GROUP BY status",
+                query="*",
+                logstore=AliyunLogStore.workflow_execution_logstore,
             )
 
             # Build response
@@ -660,17 +636,12 @@ class LogstoreAPIWorkflowRunRepository(APIWorkflowRunRepository):
             }
 
             total = 0
-            for result in finished_results:
+            for result in results:
                 status_val = result.get("status")
                 count = result.get("count", 0)
                 if status_val in status_counts:
                     status_counts[status_val] = count
-                    total += count
-
-            # Add running count
-            running_count = running_results[0]["count"] if running_results and len(running_results) > 0 else 0
-            status_counts["running"] = running_count
-            total += running_count
+                total += count
 
             return {"total": total} | status_counts
 

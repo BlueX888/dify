@@ -650,6 +650,7 @@ class TestInvokeKnowledgeIndex:
             batch,
             summary_setting,
             session=session,
+            enforce_projected_capacity=None,
         )
         assert commits == ["commit"]
         assert result == {"status": "indexed"}

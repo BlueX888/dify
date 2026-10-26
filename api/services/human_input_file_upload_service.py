@@ -173,6 +173,7 @@ class HumanInputFileUploadService:
             mimetype=mimetype,
             user=context.owner,
             source=None,
+            temporary=True,
         )
         self.record_upload_file(context=context, file_id=upload_file.id)
         return upload_file
@@ -186,6 +187,7 @@ class HumanInputFileUploadService:
         upload_file = self._remote_files.upload_from_url(
             url=url,
             user=context.owner,
+            temporary=True,
         )
         self.record_upload_file(context=context, file_id=upload_file.id)
         return upload_file

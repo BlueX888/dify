@@ -369,7 +369,11 @@ describe('JinaReader', () => {
             resume = resolve
           }),
       )
-      vi.mocked(createJinaReaderTask).mockResolvedValueOnce({ job_id: 'limit-job' })
+      vi.mocked(createJinaReaderTask).mockResolvedValueOnce({
+        status: 'active',
+        job_id: 'limit-job',
+        source_handle: 'jina-limit-source-handle',
+      })
       vi.mocked(checkJinaReaderTaskStatus)
         .mockResolvedValueOnce({ status: 'running', current: 1, total: 100, data: [] })
         .mockResolvedValueOnce({
@@ -384,7 +388,10 @@ describe('JinaReader', () => {
       await user.type(screen.getByRole('textbox'), 'https://example.com')
       await user.click(screen.getByRole('button', { name: /run/i }))
       await waitFor(() => expect(screen.getByText(/totalPageScraped/)).toHaveTextContent('1/5'))
-      expect(checkJinaReaderTaskStatus).toHaveBeenCalledExactlyOnceWith('limit-job')
+      expect(checkJinaReaderTaskStatus).toHaveBeenCalledExactlyOnceWith(
+        'limit-job',
+        'jina-limit-source-handle',
+      )
       await act(async () => resume())
       await screen.findByText('Test Page Title')
       expect(props.onCheckedCrawlResultChange).toHaveBeenLastCalledWith([createCrawlResultItem()])
@@ -800,7 +807,10 @@ describe('JinaReader', () => {
       const onJobIdChange = vi.fn()
       const onPreview = vi.fn()
 
-      mockCreateTask.mockResolvedValueOnce({ job_id: 'full-workflow-job' })
+      mockCreateTask.mockResolvedValueOnce({
+        job_id: 'full-workflow-job',
+        source_handle: 'jina-workflow-source-handle',
+      })
       mockCheckStatus
         .mockResolvedValueOnce({
           status: 'running',
@@ -838,7 +848,10 @@ describe('JinaReader', () => {
 
       // Assert - job id should be set
       await waitFor(() => {
-        expect(onJobIdChange).toHaveBeenCalledWith('full-workflow-job')
+        expect(onJobIdChange).toHaveBeenCalledWith(
+          'full-workflow-job',
+          'jina-workflow-source-handle',
+        )
       })
 
       // Assert - final results should be displayed
@@ -852,8 +865,16 @@ describe('JinaReader', () => {
         options: props.crawlOptions,
       })
       expect(mockCheckStatus).toHaveBeenCalledTimes(2)
-      expect(mockCheckStatus).toHaveBeenNthCalledWith(1, 'full-workflow-job')
-      expect(mockCheckStatus).toHaveBeenNthCalledWith(2, 'full-workflow-job')
+      expect(mockCheckStatus).toHaveBeenNthCalledWith(
+        1,
+        'full-workflow-job',
+        'jina-workflow-source-handle',
+      )
+      expect(mockCheckStatus).toHaveBeenNthCalledWith(
+        2,
+        'full-workflow-job',
+        'jina-workflow-source-handle',
+      )
       // Assert - checked results should be updated
       expect(onCheckedCrawlResultChange).toHaveBeenLastCalledWith(
         [1, 2, 3, 4, 5].map((index) =>

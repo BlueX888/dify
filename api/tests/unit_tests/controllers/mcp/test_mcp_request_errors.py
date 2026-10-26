@@ -1,5 +1,6 @@
 """MCP request parsing errors exercised through the real HTTP blueprint."""
 
+from unittest.mock import create_autospec
 from uuid import uuid4
 
 import pytest
@@ -11,6 +12,8 @@ from sqlalchemy.orm import Session
 
 import controllers.mcp as mcp_controller
 import controllers.mcp.mcp as module
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+from extensions.ext_application_services import ApplicationServices
 from models.engine import db
 from models.enums import EndUserType
 from models.model import App, AppMCPServer, AppMode, AppModelConfig, EndUser
@@ -131,8 +134,14 @@ def test_unparseable_notification_has_no_jsonrpc_response(client: FlaskClient, m
 
 
 def test_legacy_initialize_and_list_tools_remain_compatible(
-    client: FlaskClient, published_server: AppMCPServer, sqlite_session: Session
+    client: FlaskClient,
+    published_server: AppMCPServer,
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    services.knowledge.external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    monkeypatch.setattr(module, "application_services", lambda: services)
     response = client.post(
         _URL,
         json={

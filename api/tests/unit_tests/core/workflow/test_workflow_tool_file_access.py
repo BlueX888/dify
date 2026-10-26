@@ -9,6 +9,7 @@ from core.app.file_access import FileAccessScope, bind_file_access_scope
 from core.app.layers.execution_context_layer import ExecutionContextLayer
 from core.tools.workflow_as_tool.repository import WorkflowToolSource
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.workflow_tool_container_handler import WorkflowToolContainerHandler
 from enums import WorkflowKind
 from extensions.storage.storage_type import StorageType
@@ -20,6 +21,7 @@ from graphon.runtime import RuntimeState, VariablePool
 from graphon.variables.segments import ArrayFileSegment
 from models import ToolFile, UploadFile
 from models.enums import CreatorUserRole
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.unit_tests.core.workflow.test_workflow_tool_container import _workflow_tool_node
 from tests.workflow_test_utils import build_test_run_context
 
@@ -137,6 +139,8 @@ def test_workflow_tool_dispatcher_enforces_file_ownership(
             }
         ),
         runtime_state=runtime_state,
+        external_retrieval=make_external_dataset_retriever(),
+        knowledge_index_runtime=build_knowledge_index_runtime(),
     )
     variables: list[dict[str, object]] = []
     if input_kind == "system_files":

@@ -1,9 +1,19 @@
 import json
-from unittest.mock import Mock, patch
+from collections.abc import Generator
+from unittest.mock import Mock, create_autospec, patch
 
 import jsonschema
 import pytest
 
+from core.app.apps.agent_chat.app_generator import AgentChatAppGenerator
+from core.app.apps.agent_chat.generate_response_converter import AgentChatAppGenerateResponseConverter
+from core.app.entities.app_invoke_entities import InvokeFrom
+from core.app.entities.task_entities import (
+    AgentMessageStreamResponse,
+    AgentThoughtStreamResponse,
+    ChatbotAppStreamResponse,
+    MessageEndStreamResponse,
+)
 from core.app.features.rate_limiting.rate_limit import RateLimit, RateLimitGenerator
 from core.mcp import types
 from core.mcp.server.streamable_http import (
@@ -20,9 +30,15 @@ from core.mcp.server.streamable_http import (
     prepare_tool_arguments,
     process_mapping_response,
 )
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.variables.input_entities import VariableEntity, VariableEntityType
 from models.model import App, AppMCPServer, AppMode, EndUser
 from services.errors.app import TriggerWorkflowServiceModeUnavailableError
+
+
+@pytest.fixture
+def external_retrieval() -> ExternalDatasetRetriever:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
 
 class TestHandleMCPRequest:
@@ -50,20 +66,27 @@ class TestHandleMCPRequest:
 
         self.request = types.ClientRequest(root=types.PingRequest())
 
-    def test_handle_ping_request(self):
+    def test_handle_ping_request(self, external_retrieval):
         """Test handling ping request"""
         # Setup ping request
         self.request.root = types.PingRequest()
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
         assert result.jsonrpc == "2.0"
         assert result.id == 123
 
-    def test_handle_initialize_request(self):
+    def test_handle_initialize_request(self, external_retrieval):
         """Test handling initialize request"""
         # Setup initialize request
         self.request.root = types.InitializeRequest(
@@ -75,32 +98,54 @@ class TestHandleMCPRequest:
         )
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
         assert result.jsonrpc == "2.0"
         assert result.id == 123
 
-    def test_handle_list_tools_request(self):
+    def test_handle_list_tools_request(self, external_retrieval):
         """Test handling list tools request"""
         # Setup list tools request
         self.request.root = types.ListToolsRequest()
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
         assert result.jsonrpc == "2.0"
         assert result.id == 123
 
-    def test_handle_list_tools_request_threads_protocol_version(self):
+    def test_handle_list_tools_request_threads_protocol_version(self, external_retrieval):
         """The negotiated version reaches handle_list_tools through the dispatcher."""
         self.request.root = types.ListToolsRequest()
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123, "2025-06-18"
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            "2025-06-18",
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
@@ -108,12 +153,20 @@ class TestHandleMCPRequest:
         assert tool["outputSchema"] == {"type": "object"}
         assert tool["title"] == "test_app"
 
-    def test_handle_list_tools_request_legacy_serialization_unchanged(self):
+    def test_handle_list_tools_request_legacy_serialization_unchanged(self, external_retrieval):
         """A 2024-11-05 tools/list response serializes without any 2025-06-18 fields."""
         self.request.root = types.ListToolsRequest()
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123, "2024-11-05"
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            "2024-11-05",
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
@@ -121,7 +174,7 @@ class TestHandleMCPRequest:
         assert set(tool) == {"name", "description", "inputSchema"}
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool_request(self, mock_app_generate):
+    def test_handle_call_tool_request(self, mock_app_generate, external_retrieval):
         """Test handling call tool request"""
         # Setup call tool request
         call_request = types.CallToolRequest(
@@ -135,7 +188,14 @@ class TestHandleMCPRequest:
         mock_app_generate.generate.return_value = mock_response
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
@@ -144,9 +204,10 @@ class TestHandleMCPRequest:
 
         # Verify AppGenerateService was called
         mock_app_generate.generate.assert_called_once()
+        assert mock_app_generate.generate.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool_returns_trigger_workflow_business_error(self, mock_app_generate):
+    def test_handle_call_tool_returns_trigger_workflow_business_error(self, mock_app_generate, external_retrieval):
         call_request = types.CallToolRequest(
             params=types.CallToolRequestParams(name="test_app", arguments={"query": "test question"})
         )
@@ -161,6 +222,7 @@ class TestHandleMCPRequest:
             self.mcp_server,
             self.end_user,
             123,
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCError)
@@ -168,7 +230,7 @@ class TestHandleMCPRequest:
         assert result.error.data == {"code": "trigger_workflow_service_mode_unavailable"}
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool_request_threads_protocol_version(self, mock_app_generate):
+    def test_handle_call_tool_request_threads_protocol_version(self, mock_app_generate, external_retrieval):
         """The negotiated version reaches handle_call_tool through the dispatcher."""
         call_request = types.CallToolRequest(
             params=types.CallToolRequestParams(name="test_app", arguments={"query": "test question"})
@@ -178,14 +240,22 @@ class TestHandleMCPRequest:
         mock_app_generate.generate.return_value = {"answer": "test answer"}
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123, "2025-06-18"
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            "2025-06-18",
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
         assert result.result["structuredContent"] == {"answer": "test answer"}
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool_request_legacy_serialization_unchanged(self, mock_app_generate):
+    def test_handle_call_tool_request_legacy_serialization_unchanged(self, mock_app_generate, external_retrieval):
         """A 2024-11-05 tools/call response serializes without structuredContent."""
         call_request = types.CallToolRequest(
             params=types.CallToolRequestParams(name="test_app", arguments={"query": "test question"})
@@ -195,21 +265,36 @@ class TestHandleMCPRequest:
         mock_app_generate.generate.return_value = {"answer": "test answer"}
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123, "2024-11-05"
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            "2024-11-05",
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCResponse)
         assert "structuredContent" not in result.result
         assert result.result["content"][0]["text"] == "test answer"
 
-    def test_handle_unknown_request_type(self):
+    def test_handle_unknown_request_type(self, external_retrieval):
         """Test handling unknown request type"""
 
         # A valid request type with no application-side handler.
         self.request.root = types.ListResourcesRequest()
 
         result = handle_mcp_request(
-            Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            self.end_user,
+            123,
+            external_retrieval=external_retrieval,
         )
 
         assert isinstance(result, types.JSONRPCError)
@@ -217,18 +302,27 @@ class TestHandleMCPRequest:
         assert result.id == 123
         assert result.error.code == types.METHOD_NOT_FOUND
 
-    def test_handle_value_error(self):
+    def test_handle_value_error(self, external_retrieval):
         """Test handling ValueError"""
         # Setup request that will cause ValueError
         self.request.root = types.CallToolRequest(params=types.CallToolRequestParams(name="test_app", arguments={}))
 
         # Don't provide end_user to cause ValueError
-        result = handle_mcp_request(Mock(), self.app, self.request, self.user_input_form, self.mcp_server, None, 123)
+        result = handle_mcp_request(
+            Mock(),
+            self.app,
+            self.request,
+            self.user_input_form,
+            self.mcp_server,
+            None,
+            123,
+            external_retrieval=external_retrieval,
+        )
 
         assert isinstance(result, types.JSONRPCError)
         assert result.error.code == types.INVALID_PARAMS
 
-    def test_handle_generic_exception(self):
+    def test_handle_generic_exception(self, external_retrieval):
         """Test handling generic exception"""
         # Setup request that will cause generic exception
         self.request.root = types.PingRequest()
@@ -236,7 +330,14 @@ class TestHandleMCPRequest:
         # Inject the handler failure while preserving normal request dispatch.
         with patch("core.mcp.server.streamable_http.handle_ping", side_effect=Exception("Test error")):
             result = handle_mcp_request(
-                Mock(), self.app, self.request, self.user_input_form, self.mcp_server, self.end_user, 123
+                Mock(),
+                self.app,
+                self.request,
+                self.user_input_form,
+                self.mcp_server,
+                self.end_user,
+                123,
+                external_retrieval=external_retrieval,
             )
 
         assert isinstance(result, types.JSONRPCError)
@@ -324,7 +425,7 @@ class TestIndividualHandlers:
         assert tool.title is None
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool(self, mock_app_generate):
+    def test_handle_call_tool(self, mock_app_generate, external_retrieval):
         """Test call tool handler"""
         app = App(
             mode=AppMode.CHAT,
@@ -342,7 +443,9 @@ class TestIndividualHandlers:
         mock_response = {"answer": "test answer"}
         mock_app_generate.generate.return_value = mock_response
 
-        result = handle_call_tool(Mock(), app, request, user_input_form, end_user)
+        result = handle_call_tool(
+            Mock(), app, request, user_input_form, end_user, external_retrieval=external_retrieval
+        )
 
         assert isinstance(result, types.CallToolResult)
         assert len(result.content) == 1
@@ -352,7 +455,7 @@ class TestIndividualHandlers:
         assert text_content.text == "test answer"
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool_structured_output_modern_client(self, mock_app_generate):
+    def test_handle_call_tool_structured_output_modern_client(self, mock_app_generate, external_retrieval):
         """structuredContent is attached alongside TextContent for >= 2025-06-18."""
         app = App(
             mode=AppMode.CHAT,
@@ -365,13 +468,15 @@ class TestIndividualHandlers:
 
         mock_app_generate.generate.return_value = {"answer": "test answer"}
 
-        result = handle_call_tool(Mock(), app, request, [], EndUser(), "2025-06-18")
+        result = handle_call_tool(
+            Mock(), app, request, [], EndUser(), "2025-06-18", external_retrieval=external_retrieval
+        )
 
         assert result.structuredContent == {"answer": "test answer"}
         assert result.content[0].text == "test answer"
 
     @patch("core.mcp.server.streamable_http.AppGenerateService")
-    def test_handle_call_tool_no_structured_output_legacy_client(self, mock_app_generate):
+    def test_handle_call_tool_no_structured_output_legacy_client(self, mock_app_generate, external_retrieval):
         """structuredContent is omitted for 2024-11-05 clients."""
         app = App(
             mode=AppMode.CHAT,
@@ -384,19 +489,21 @@ class TestIndividualHandlers:
 
         mock_app_generate.generate.return_value = {"answer": "test answer"}
 
-        result = handle_call_tool(Mock(), app, request, [], EndUser(), "2024-11-05")
+        result = handle_call_tool(
+            Mock(), app, request, [], EndUser(), "2024-11-05", external_retrieval=external_retrieval
+        )
 
         assert result.structuredContent is None
         assert result.content[0].text == "test answer"
 
-    def test_handle_call_tool_no_end_user(self):
+    def test_handle_call_tool_no_end_user(self, external_retrieval):
         """Test call tool handler without end user"""
         app = App()
         request = types.ClientRequest(root=types.CallToolRequest(params=types.CallToolRequestParams(name="test_app")))
         user_input_form: list[VariableEntity] = []
 
         with pytest.raises(ValueError, match="End user not found"):
-            handle_call_tool(Mock(), app, request, user_input_form, None)
+            handle_call_tool(Mock(), app, request, user_input_form, None, external_retrieval=external_retrieval)
 
 
 class TestUtilityFunctions:
@@ -515,26 +622,47 @@ class TestUtilityFunctions:
 
     def test_extract_answer_from_streaming_response(self, monkeypatch: pytest.MonkeyPatch):
         """Test extracting answer from streaming response"""
-        app = App()
+        app = App(mode=AppMode.AGENT_CHAT)
 
-        events = [
-            'data: {"event": "agent_thought", "thought": "thinking..."}',
-            'data: {"event": "agent_thought", "thought": "more thinking"}',
-            'data: {"event": "other", "content": "ignore this"}',
-            "not data format",
-        ]
+        def generate_app_stream() -> Generator[ChatbotAppStreamResponse]:
+            for stream_response in (
+                AgentThoughtStreamResponse(
+                    task_id="task",
+                    id="thought",
+                    position=1,
+                    thought="private reasoning",
+                ),
+                AgentMessageStreamResponse(task_id="task", id="message", answer="FINAL "),
+                AgentMessageStreamResponse(task_id="task", id="message", answer="ANSWER"),
+                MessageEndStreamResponse(task_id="task", id="message"),
+            ):
+                yield ChatbotAppStreamResponse(
+                    conversation_id="conversation",
+                    message_id="message",
+                    created_at=1,
+                    stream_response=stream_response,
+                )
+
+        converted_response = AgentChatAppGenerateResponseConverter.convert(
+            response=generate_app_stream(),
+            invoke_from=InvokeFrom.SERVICE_API,
+        )
+        events = AgentChatAppGenerator.convert_to_event_stream(converted_response)
+        assert not isinstance(events, dict)
 
         monkeypatch.setattr(RateLimit, "_instance_dict", {})
         rate_limit = RateLimit(client_id="mcp-stream-fixture", max_active_requests=0)
         response = RateLimitGenerator(
-            rate_limit=rate_limit, generator=(item for item in events), request_id=rate_limit.enter()
+            rate_limit=rate_limit,
+            generator=events,
+            request_id=rate_limit.enter(),
         )
         try:
             result = extract_answer_from_response(app, response)
         finally:
             response.close()
 
-        assert result == "thinking...more thinking"
+        assert result == "FINAL ANSWER"
 
     def test_extract_structured_output_workflow(self):
         """Workflow mode exposes the raw outputs mapping as structured content."""

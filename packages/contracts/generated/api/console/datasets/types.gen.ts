@@ -613,11 +613,6 @@ export type ExternalHitTestingResponse = {
 
 export type HitTestingPayload = {
   attachment_ids?: Array<string> | null
-  external_retrieval_model?: {
-    score_threshold?: number
-    score_threshold_enabled?: boolean
-    top_k?: number
-  } | null
   query: string
   retrieval_model?: RetrievalModel | null
 }
@@ -629,6 +624,11 @@ export type HitTestingResponse = {
 
 export type CompletionRequestError = ErrorResponse & {
   code: 'completion_request_error'
+  status: 400
+}
+
+export type DatasetNotInitializedError = ErrorResponse & {
+  code: 'dataset_not_initialized'
   status: 400
 }
 
@@ -1130,7 +1130,7 @@ export type HitTestingChildChunk = {
 export type HitTestingFile = {
   extension: string
   id: string
-  mime_type: string
+  mime_type: string | null
   name: string
   size: number
   source_url: string
@@ -1208,6 +1208,7 @@ export type WebsiteInfo = {
   job_id: string
   only_main_content?: boolean
   provider: string
+  source_handle?: string | null
   urls: Array<string>
 }
 
@@ -2387,33 +2388,6 @@ export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumeRespons
 export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumeResponse =
   PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumeResponses[keyof PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumeResponses]
 
-export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionData = {
-  body?: never
-  path: {
-    action: string
-    dataset_id: string
-    document_id: string
-  }
-  query?: never
-  url: '/datasets/{dataset_id}/documents/{document_id}/processing/{action}'
-}
-
-export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionErrors = {
-  400: InvalidActionError | ErrorResponse
-  404: ErrorResponse
-  default: ErrorResponse
-}
-
-export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionError =
-  PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionErrors[keyof PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionErrors]
-
-export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponses = {
-  200: SimpleResultResponse
-}
-
-export type PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponse =
-  PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponses[keyof PatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponses]
-
 export type PostDatasetsByDatasetIdDocumentsByDocumentIdRenameData = {
   body: DocumentRenamePayload
   path: {
@@ -2851,8 +2825,8 @@ export type PostDatasetsByDatasetIdExternalHitTestingData = {
 
 export type PostDatasetsByDatasetIdExternalHitTestingErrors = {
   400: ErrorResponse
+  403: DatasetAccessDeniedError | ErrorResponse
   404: ErrorResponse
-  409: DatasetNameDuplicateError | ErrorResponse
   default: ErrorResponse
 }
 
@@ -2878,10 +2852,12 @@ export type PostDatasetsByDatasetIdHitTestingData = {
 export type PostDatasetsByDatasetIdHitTestingErrors = {
   400:
     | CompletionRequestError
+    | DatasetNotInitializedError
     | ModelCurrentlyNotSupportError
     | ProviderNotInitializeError
     | ProviderQuotaExceededError
     | ErrorResponse
+  403: DatasetAccessDeniedError | ErrorResponse
   404: ErrorResponse
   default: ErrorResponse
 }

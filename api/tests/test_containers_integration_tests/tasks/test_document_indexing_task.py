@@ -11,7 +11,7 @@ from enums import CloudPlan, DeploymentEdition
 from models import Account, AccountStatus, Tenant, TenantAccountJoin, TenantAccountRole, TenantStatus
 from models.dataset import Dataset, Document
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
-from services.knowledge.resource_scope import DocumentRef
+from services.knowledge.entities.resource_scope import DocumentRef
 from tasks.document_indexing_task import (
     _document_indexing,  # Core function
     _document_indexing_with_tenant_queue,  # Tenant queue wrapper function
@@ -456,18 +456,25 @@ class TestDocumentIndexingTasks:
         mock_external_service_dependencies["indexing_runner"].assert_called_once()
         mock_external_service_dependencies["indexing_runner_instance"].run.assert_called_once()
 
-        # Verify all documents were updated to parsing status
+        # Only waiting documents are atomically claimed. A redelivered task must
+        # not move an already completed document back to parsing.
         # Re-query documents from database since _document_indexing uses a different session
-        for doc_id in document_ids:
+        completed_document = db_session_with_containers.query(Document).where(Document.id == doc1.id).first()
+        assert completed_document is not None
+        assert completed_document.indexing_status == IndexingStatus.COMPLETED
+        assert completed_document.processing_started_at is None
+        claimed_ids = [doc.id for doc in [*base_documents, doc2]]
+        for doc_id in claimed_ids:
             updated_document = db_session_with_containers.query(Document).where(Document.id == doc_id).first()
+            assert updated_document is not None
             assert updated_document.indexing_status == IndexingStatus.PARSING
             assert updated_document.processing_started_at is not None
 
-        # Verify the run method was called with all documents
+        # Verify the runner received only the documents won by this delivery.
         call_args = mock_external_service_dependencies["indexing_runner_instance"].run.call_args
         assert call_args is not None
         processed_documents = self._runner_documents_arg(mock_external_service_dependencies)
-        assert len(processed_documents) == 4
+        assert {ref.document_id for ref in processed_documents} == set(claimed_ids)
 
     @config_overrides_context(DEPLOYMENT_EDITION=DeploymentEdition.CLOUD)
     def test_document_indexing_task_billing_sandbox_plan_batch_limit(
@@ -765,7 +772,12 @@ class TestDocumentIndexingTasks:
 
         # Add waiting tasks to the real Redis queue
         waiting_tasks = [
-            DocumentTask(tenant_id=tenant_id, dataset_id=dataset.id, document_ids=["waiting-doc-1"]),
+            DocumentTask(
+                tenant_id=tenant_id,
+                dataset_id=dataset.id,
+                document_ids=["waiting-doc-1"],
+                indexing_request_id="waiting-request-1",
+            ),
             DocumentTask(tenant_id=tenant_id, dataset_id=dataset.id, document_ids=["waiting-doc-2"]),
         ]
         # Convert DocumentTask objects to dictionaries for serialization
@@ -785,7 +797,12 @@ class TestDocumentIndexingTasks:
         # Verify correct parameters for each call
         calls = mock_task_func.apply_async.call_args_list
         sent_kwargs = calls[0][1]["kwargs"]
-        assert sent_kwargs == {"tenant_id": tenant_id, "dataset_id": dataset_id, "document_ids": ["waiting-doc-1"]}
+        assert sent_kwargs == {
+            "tenant_id": tenant_id,
+            "dataset_id": dataset_id,
+            "document_ids": ["waiting-doc-1"],
+            "indexing_request_id": "waiting-request-1",
+        }
 
         # Verify queue is empty after processing (tasks were pulled)
         remaining_tasks = queue.pull_tasks(count=10)  # Pull more than we added
@@ -853,6 +870,7 @@ class TestDocumentIndexingTasks:
             "tenant_id": tenant_id,
             "dataset_id": dataset_id,
             "document_ids": ["waiting-doc-1"],
+            "indexing_request_id": None,
         }
 
         # Verify queue is empty after processing (task was pulled)
@@ -920,6 +938,7 @@ class TestDocumentIndexingTasks:
             "tenant_id": tenant1_id,
             "dataset_id": dataset1_id,
             "document_ids": ["tenant1-doc-1"],
+            "indexing_request_id": None,
         }
 
         # Verify tenant1's queue is empty

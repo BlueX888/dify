@@ -5,7 +5,7 @@ import json
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, create_autospec
 
 import pytest
 from flask import Flask
@@ -16,7 +16,9 @@ from werkzeug.exceptions import HTTPException, NotFound
 from controllers.common.errors import InvalidArgumentError
 from controllers.console.app import workflow as workflow_module
 from controllers.console.app.error import DraftWorkflowNotExist, DraftWorkflowNotSync
+from core.rag.retrieval.dataset_retrieval import ExternalDatasetRetriever
 from core.workflow.llm_environment_variable import LLMEnvironmentVariable
+from extensions.ext_application_services import ApplicationServices
 from graphon.file import File, FileTransferMethod, FileType
 from graphon.variables import SecretVariable, StringVariable
 from graphon.variables.variables import RAGPipelineVariable
@@ -35,6 +37,15 @@ def _identity_workflow_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(workflow_module.encrypter, "encrypt_token", lambda *, tenant_id, token: token)
     monkeypatch.setattr(workflow_module.encrypter, "decrypt_token", lambda *, tenant_id, token: token)
+
+
+@pytest.fixture
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    retriever = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    services.knowledge.external_retrieval = retriever
+    monkeypatch.setattr(workflow_module, "application_services", lambda: services)
+    return retriever
 
 
 def _account() -> Account:
@@ -1036,15 +1047,18 @@ def test_draft_workflow_get_projects_agent_node_job_to_graph(
 
 
 def test_advanced_chat_run_conversation_not_exists(
-    app: Flask, monkeypatch: pytest.MonkeyPatch, unbound_session: Session
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    unbound_session: Session,
+    external_retrieval: MagicMock,
 ) -> None:
-    monkeypatch.setattr(
-        workflow_module.AppGenerateService,
-        "generate",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            workflow_module.services.errors.conversation.ConversationNotExistsError()
-        ),
-    )
+    generate_call: dict[str, object] = {}
+
+    def generate(**kwargs: object) -> None:
+        generate_call.update(kwargs)
+        raise workflow_module.services.errors.conversation.ConversationNotExistsError()
+
+    monkeypatch.setattr(workflow_module.AppGenerateService, "generate", generate)
 
     api = workflow_module.AdvancedChatDraftWorkflowRunApi()
     handler = inspect.unwrap(api.post)
@@ -1057,6 +1071,8 @@ def test_advanced_chat_run_conversation_not_exists(
         payload = workflow_module.AdvancedChatWorkflowRunPayload.model_validate({"inputs": {}})
         with pytest.raises(NotFound):
             handler(api, payload, unbound_session, _account(), app_model=_app())
+
+    assert generate_call["external_retrieval"] is external_retrieval
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,6 @@ from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
 
 @pytest.fixture
 def persisted_document(
-    monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: Engine,
 ) -> Iterator[tuple[sessionmaker[Session], DocumentModel]]:
     """Persist a Notion document and bind the extractor's ``db.session`` to SQLite."""
@@ -45,7 +44,6 @@ def persisted_document(
     with session_maker() as sqlite_session:
         sqlite_session.add(document)
         sqlite_session.commit()
-        monkeypatch.setattr(notion_extractor, "db", SimpleNamespace(session=sqlite_session))
         yield session_maker, document
 
 
@@ -106,15 +104,21 @@ class TestNotionExtractorInitAndPublicMethods:
             notion_token_loader=lambda: "token",
         )
 
-        update_mock = mock.Mock()
+        version_calls: list[None] = []
+
+        def get_last_edited_time() -> str:
+            version_calls.append(None)
+            return "2026-01-01T00:00:00.000Z"
+
         load_mock = mock.Mock(return_value=[SimpleNamespace(page_content="doc")])
-        monkeypatch.setattr(extractor, "update_last_edited_time", update_mock)
+        monkeypatch.setattr(extractor, "get_notion_last_edited_time", get_last_edited_time)
         monkeypatch.setattr(extractor, "_load_data_as_documents", load_mock)
 
         docs = extractor.extract()
 
-        update_mock.assert_called_once_with(None)
+        assert version_calls == [None]
         load_mock.assert_called_once_with("obj", "page")
+        assert extractor.last_edited_time == "2026-01-01T00:00:00.000Z"
         assert len(docs) == 1
 
     def test_load_data_as_documents_page_database_and_invalid(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -578,7 +582,7 @@ class TestNotionBlocks:
 
 
 class TestNotionMetadataAndCredentialMethods:
-    def test_update_last_edited_time_no_document_model(self) -> None:
+    def test_source_version_is_empty_before_extraction(self) -> None:
         extractor = notion_extractor.NotionExtractor(
             notion_workspace_id="ws",
             notion_obj_id="obj",
@@ -588,9 +592,9 @@ class TestNotionMetadataAndCredentialMethods:
             notion_token_loader=lambda: "token",
         )
 
-        assert extractor.update_last_edited_time(None) is None
+        assert extractor.last_edited_time is None
 
-    def test_update_last_edited_time_updates_document_and_commits(
+    def test_extract_returns_version_without_publishing_document_metadata(
         self,
         monkeypatch: pytest.MonkeyPatch,
         persisted_document: tuple[sessionmaker[Session], DocumentModel],
@@ -604,27 +608,27 @@ class TestNotionMetadataAndCredentialMethods:
             notion_token_loader=lambda: "token",
         )
         monkeypatch.setattr(extractor, "get_notion_last_edited_time", lambda: "2026-01-01T00:00:00.000Z")
+        monkeypatch.setattr(extractor, "_load_data_as_documents", lambda *_args: [])
         session_maker, document = persisted_document
 
-        snapshot = StoredDocumentExtractionInput.model_validate(document)
-        extractor.update_last_edited_time(snapshot)
+        extractor._document_model = StoredDocumentExtractionInput.model_validate(document)
+        extractor.extract()
 
-        # Closing the writer session rolls back an uncommitted update before the independent read below.
-        notion_extractor.db.session.close()
+        assert extractor.last_edited_time == "2026-01-01T00:00:00.000Z"
         with session_maker() as verification_session:
             stored_document = verification_session.get(DocumentModel, document.id)
             assert stored_document is not None
             assert stored_document.data_source_info_dict == {
                 "source": "notion",
-                "last_edited_time": "2026-01-01T00:00:00.000Z",
+                "last_edited_time": "2025-01-01T00:00:00.000Z",
             }
 
-    def test_last_edited_time_update_rejects_a_foreign_owner_snapshot(
+    def test_source_version_capture_does_not_depend_on_document_snapshot_owner(
         self,
         monkeypatch: pytest.MonkeyPatch,
         persisted_document: tuple[sessionmaker[Session], DocumentModel],
     ) -> None:
-        session_maker, document = persisted_document
+        _session_maker, document = persisted_document
         extractor = notion_extractor.NotionExtractor(
             notion_workspace_id="ws",
             notion_obj_id="obj",
@@ -634,12 +638,11 @@ class TestNotionMetadataAndCredentialMethods:
             notion_token_loader=lambda: "token",
         )
         monkeypatch.setattr(extractor, "get_notion_last_edited_time", lambda: "2026-01-01T00:00:00.000Z")
+        monkeypatch.setattr(extractor, "_load_data_as_documents", lambda *_args: [])
         snapshot = StoredDocumentExtractionInput.model_validate(document).model_copy(update={"tenant_id": "foreign"})
-        extractor.update_last_edited_time(snapshot)
-        with session_maker() as session:
-            stored = session.get(DocumentModel, document.id)
-            assert stored is not None
-            assert stored.data_source_info_dict["last_edited_time"] == "2025-01-01T00:00:00.000Z"
+        extractor._document_model = snapshot
+        extractor.extract()
+        assert extractor.last_edited_time == "2026-01-01T00:00:00.000Z"
 
     def test_get_notion_last_edited_time_uses_page_and_database_urls(self, mocker: MockerFixture) -> None:
         extractor_page = notion_extractor.NotionExtractor(

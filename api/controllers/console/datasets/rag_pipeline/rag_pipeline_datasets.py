@@ -93,6 +93,7 @@ class CreateRagPipelineDatasetApi(Resource):
                     db.session(),
                 )
             db.session.commit()
+            rag_pipeline_dsl_service.finalize_committed_import()
         except services.errors.dataset.DatasetNameDuplicateError as caught_error:
             raise DatasetNameDuplicateError() from caught_error
 

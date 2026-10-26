@@ -30,6 +30,7 @@ from core.errors.error import (
     ProviderTokenNotInitError,
     QuotaExceededError,
 )
+from extensions.ext_application_services import application_services
 from graphon.model_runtime.errors.invoke import InvokeError
 from libs import helper
 from libs.external_api import error_responses
@@ -132,6 +133,7 @@ class CompletionApi(WebApiResource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,
@@ -246,6 +248,7 @@ class ChatApi(WebApiResource):
                 )
 
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,

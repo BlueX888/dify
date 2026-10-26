@@ -39,7 +39,7 @@ from controllers.console.datasets.error import (
 )
 from machinery.context import RequestContext
 from services.data_source.entities.notion_import import NotionPageType
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
 from services.knowledge.datasets.application import DatasetApplicationService, DatasetListFilter
 from services.knowledge.entities.indexing_estimate import (
     NotionEstimateSource,
@@ -176,6 +176,7 @@ def test_new_estimate_sources_maps_each_supported_transport_shape() -> None:
             "website_info_list": {
                 "provider": "firecrawl",
                 "job_id": "job-1",
+                "source_handle": "source-handle",
                 "urls": ["https://example.com/a", "https://example.com/b"],
                 "only_main_content": True,
             },
@@ -185,8 +186,12 @@ def test_new_estimate_sources_maps_each_supported_transport_shape() -> None:
     assert upload_sources == (UploadFileEstimateSource("file-1"), UploadFileEstimateSource("file-2"))
     assert notion_sources == (NotionEstimateSource("notion-workspace", "page-1", NotionPageType.PAGE, "credential-1"),)
     assert website_sources == (
-        WebsiteEstimateSource("firecrawl", "job-1", "https://example.com/a", only_main_content=True),
-        WebsiteEstimateSource("firecrawl", "job-1", "https://example.com/b", only_main_content=True),
+        WebsiteEstimateSource(
+            "firecrawl", "job-1", "https://example.com/a", source_handle="source-handle", only_main_content=True
+        ),
+        WebsiteEstimateSource(
+            "firecrawl", "job-1", "https://example.com/b", source_handle="source-handle", only_main_content=True
+        ),
     )
 
 

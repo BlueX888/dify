@@ -14,10 +14,16 @@ from models.human_input import (
     HumanInputFormUploadToken,
 )
 from models.model import App, EndUser
+from repositories.upload_file_repository import (
+    complete_created_upload_artifact_publication_in_session,
+    lock_and_validate_owned_upload_files_in_session,
+    lock_created_upload_artifact_publication_in_session,
+)
 from services.human_input_file_upload_service import (
     HumanInputFileUploadRepository,
     HumanInputUploadFormRecord,
     HumanInputUploadGrantRecord,
+    InvalidUploadTokenError,
 )
 
 
@@ -140,6 +146,26 @@ class SQLAlchemyHumanInputFileUploadRepository(HumanInputFileUploadRepository):
         file_id: str,
     ) -> None:
         with self._session_factory.begin() as session:
+            # Match global cleanup's UploadFile -> writer marker lock order.
+            # The remaining locks protect the exact HITL owner chain until
+            # the durable reference and marker acknowledgement commit together.
+            lock_and_validate_owned_upload_files_in_session(
+                session,
+                tenant_id=tenant_id,
+                upload_file_ids=(file_id,),
+            )
+            lock_created_upload_artifact_publication_in_session(
+                session,
+                workspace_id=tenant_id,
+                upload_file_ids=(file_id,),
+            )
+            self._lock_and_validate_upload_owner(
+                session,
+                tenant_id=tenant_id,
+                app_id=app_id,
+                form_id=form_id,
+                upload_token_id=upload_token_id,
+            )
             session.add(
                 HumanInputFormUploadFile(
                     tenant_id=tenant_id,
@@ -149,6 +175,72 @@ class SQLAlchemyHumanInputFileUploadRepository(HumanInputFileUploadRepository):
                     upload_token_id=upload_token_id,
                 )
             )
+            session.flush()
+            complete_created_upload_artifact_publication_in_session(
+                session,
+                workspace_id=tenant_id,
+                upload_file_ids=(file_id,),
+            )
+
+    @staticmethod
+    def _lock_and_validate_upload_owner(
+        session: Session,
+        *,
+        tenant_id: str,
+        app_id: str,
+        form_id: str,
+        upload_token_id: str,
+    ) -> None:
+        app_exists = session.scalar(
+            select(App.id)
+            .where(
+                App.id == app_id,
+                App.tenant_id == tenant_id,
+            )
+            .with_for_update(read=True)
+        )
+        if app_exists is None:
+            raise InvalidUploadTokenError()
+
+        # The form is the aggregate owner. Conversation cleanup takes these
+        # same locks in form -> recipient -> token order before removing links.
+        form_exists = session.scalar(
+            select(HumanInputForm.id)
+            .where(
+                HumanInputForm.id == form_id,
+                HumanInputForm.tenant_id == tenant_id,
+                HumanInputForm.app_id == app_id,
+            )
+            .with_for_update(read=True)
+        )
+        if form_exists is None:
+            raise InvalidUploadTokenError()
+
+        recipient_ids = tuple(
+            session.scalars(
+                select(HumanInputFormRecipient.id)
+                .where(HumanInputFormRecipient.form_id == form_id)
+                .order_by(HumanInputFormRecipient.id)
+                .with_for_update(read=True)
+            )
+        )
+        if not recipient_ids:
+            raise InvalidUploadTokenError()
+
+        upload_token = session.scalar(
+            select(HumanInputFormUploadToken)
+            .where(
+                HumanInputFormUploadToken.id == upload_token_id,
+                HumanInputFormUploadToken.tenant_id == tenant_id,
+                HumanInputFormUploadToken.app_id == app_id,
+                HumanInputFormUploadToken.form_id == form_id,
+                HumanInputFormUploadToken.recipient_id.in_(recipient_ids),
+            )
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        if upload_token is None:
+            raise InvalidUploadTokenError()
 
     @staticmethod
     def _to_form_record(*, form: HumanInputForm, recipient_id: str) -> HumanInputUploadFormRecord:

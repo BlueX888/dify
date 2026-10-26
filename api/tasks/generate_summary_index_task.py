@@ -5,26 +5,36 @@ import time
 
 import click
 from celery import shared_task
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from core.db.session_factory import session_factory
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
-from models.dataset import Dataset, DocumentSegment
 from models.dataset import Document as DatasetDocument
+from repositories.knowledge.dataset_indexing_outbox_repository import lock_dataset_indexing_generation_shared
 from services.knowledge.summaries.adapters import SummaryIndexAdapter
 
 logger = logging.getLogger(__name__)
 
 
 @shared_task(queue="dataset_summary")
-def generate_summary_index_task(dataset_id: str, document_id: str, segment_ids: list[str] | None = None):
-    """
-    Async generate summary index for document segments.
+def generate_summary_index_task(
+    dataset_id: str,
+    document_id: str,
+    segment_ids: list[str] | None = None,
+    indexing_request_id: str | None = None,
+):
+    """Generate document summaries for the generation captured at dispatch.
+
+    A missing token is the legacy ``NULL`` generation, not permission to adopt
+    whichever generation is current when the task starts. Superseded tasks exit
+    without changing summary versions, content, or errors; same-generation
+    failures keep their normal Celery retry/error behavior.
 
     Args:
         dataset_id: Dataset ID
         document_id: Document ID
         segment_ids: Optional list of specific segment IDs to process. If None, process all segments.
+        indexing_request_id: Exact Dataset generation captured by the dispatcher.
 
     Usage:
         generate_summary_index_task.delay(dataset_id, document_id)
@@ -40,9 +50,19 @@ def generate_summary_index_task(dataset_id: str, document_id: str, segment_ids: 
 
     try:
         with session_factory.create_session() as session:
-            dataset = session.scalar(select(Dataset).where(Dataset.id == dataset_id).limit(1))
+            dataset = lock_dataset_indexing_generation_shared(
+                session,
+                dataset_id=dataset_id,
+                generation_id=indexing_request_id,
+            )
             if not dataset:
-                logger.error(click.style(f"Dataset not found: {dataset_id}", fg="red"))
+                logger.info(
+                    click.style(
+                        f"Skipping superseded summary generation for dataset {dataset_id}: "
+                        f"generation={indexing_request_id}",
+                        fg="cyan",
+                    )
+                )
                 return
 
             document = session.scalar(
@@ -99,6 +119,7 @@ def generate_summary_index_task(dataset_id: str, document_id: str, segment_ids: 
                 summary_index_setting=summary_index_setting,
                 segment_ids=segment_ids,
                 only_parent_chunks=only_parent_chunks,
+                indexing_request_id=indexing_request_id,
             )
 
             end_at = time.perf_counter()
@@ -110,18 +131,5 @@ def generate_summary_index_task(dataset_id: str, document_id: str, segment_ids: 
                 )
             )
 
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to generate summary index for document %s", document_id)
-        # Update document segments with error status if needed
-        if segment_ids:
-            error_message = f"Summary generation failed: {str(e)}"
-            with session_factory.create_session() as session:
-                session.execute(
-                    update(DocumentSegment)
-                    .where(
-                        DocumentSegment.id.in_(segment_ids),
-                        DocumentSegment.dataset_id == dataset_id,
-                    )
-                    .values(error=error_message)
-                )
-                session.commit()

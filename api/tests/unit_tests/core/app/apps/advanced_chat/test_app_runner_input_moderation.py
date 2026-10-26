@@ -1,6 +1,6 @@
 import json
 from contextlib import contextmanager
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
@@ -14,6 +14,7 @@ from core.app.apps.advanced_chat.app_runner import AdvancedChatAppRunner
 from core.app.entities.app_invoke_entities import AdvancedChatAppGenerateEntity, InvokeFrom
 from core.app.entities.queue_entities import QueueAnnotationReplyEvent, QueueStopEvent
 from core.moderation.base import ModerationError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models.model import App, AppMode, Conversation, IconType, Message, MessageAnnotation
 from models.workflow import Workflow, WorkflowType
 
@@ -87,6 +88,7 @@ def build_runner(sqlite_session: Session):
     runner = AdvancedChatAppRunner(
         application_generate_entity=gen,
         queue_manager=mock_queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         conversation=conversation,
         message=message,
         dialogue_count=1,

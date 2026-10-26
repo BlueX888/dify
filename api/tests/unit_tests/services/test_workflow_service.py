@@ -28,6 +28,7 @@ from core.repositories.celery_workflow_node_execution_repository import CeleryWo
 from core.repositories.sqlalchemy_workflow_node_execution_repository import SQLAlchemyWorkflowNodeExecutionRepository
 from core.workflow.llm_environment_variable import LLMEnvironmentVariable
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.nodes.agent_v2.session_store import WorkflowAgentWorkspaceStore
 from core.workflow.system_variables import SystemVariableKey, get_system_text
 from enums import DeploymentEdition
@@ -78,6 +79,7 @@ from services.workflow_service import (
     _rebuild_single_file,
     _setup_variable_pool,
 )
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.workflow_test_utils import build_test_graph_init_params
 
 
@@ -3306,6 +3308,7 @@ class TestWorkflowServiceDraftExecution:
             service._node_execution_service_repo.get_execution_by_id.return_value = mock_execution_record
 
             # Act
+            external_retrieval = make_external_dataset_retriever()
             result = service.run_draft_workflow_node(
                 app_model=app,
                 draft_workflow=draft_workflow,
@@ -3314,11 +3317,13 @@ class TestWorkflowServiceDraftExecution:
                 user_inputs={"key": "val"},
                 query="hi",
                 files=[],
+                external_retrieval=external_retrieval,
             )
 
             # Assert
             assert result is not None
             mock_run.assert_called_once()
+            assert mock_run.call_args.kwargs["external_retrieval"] is external_retrieval
             mock_repo.save_synchronously.assert_called_once()
             mock_saver_cls.return_value.save.assert_called_once()
 
@@ -3392,6 +3397,7 @@ class TestWorkflowServiceDraftExecution:
                 user_inputs={},
                 query="",
                 files=None,
+                external_retrieval=make_external_dataset_retriever(),
             )
 
             # Assert
@@ -3448,6 +3454,8 @@ class TestWorkflowServiceDraftExecution:
                 user_id=account.id,
             ),
             runtime_state=RuntimeState(workflow_id=workflow.id, variable_pool=VariablePool(), start_at=0),
+            knowledge_index_runtime=build_knowledge_index_runtime(),
+            external_retrieval=make_external_dataset_retriever(),
         ).create_node(
             {
                 "id": node_id,
@@ -3553,7 +3561,12 @@ class TestWorkflowServiceDraftExecution:
             ) as async_save,
         ):
             result = service.run_draft_workflow_node(
-                app_model=app, draft_workflow=workflow, node_id=node_id, user_inputs={}, account=account
+                app_model=app,
+                draft_workflow=workflow,
+                node_id=node_id,
+                user_inputs={},
+                account=account,
+                external_retrieval=make_external_dataset_retriever(),
             )
 
         assert result.id == execution_id
@@ -3824,12 +3837,24 @@ class TestWorkflowServiceFreeNodeExecution:
 
     def test_run_free_workflow_node_success(self, service: WorkflowService) -> None:
         node_execution = MagicMock()
+        external_retrieval = make_external_dataset_retriever()
         with (
-            patch.object(service, "_handle_single_step_result", return_value=node_execution),
-            patch("services.workflow_service.WorkflowEntry.run_free_node"),
+            patch.object(service, "_handle_single_step_result", return_value=node_execution) as handle_result,
+            patch("services.workflow_service.WorkflowEntry.run_free_node") as run_free_node,
         ):
-            result = service.run_free_workflow_node({}, "tenant-1", "user-1", "node-1", {})
+            result = service.run_free_workflow_node(
+                {},
+                "tenant-1",
+                "user-1",
+                "node-1",
+                {},
+                external_retrieval=external_retrieval,
+            )
             assert result == node_execution
+            handle_result.call_args.kwargs["invoke_node_fn"]()
+
+        run_free_node.assert_called_once()
+        assert run_free_node.call_args.kwargs["external_retrieval"] is external_retrieval
 
     def test_validate_graph_structure_coexist_error(self, service: WorkflowService) -> None:
         graph = {

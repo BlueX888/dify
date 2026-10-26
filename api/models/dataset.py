@@ -197,6 +197,8 @@ class Dataset(TypeBase, kw_only=True):
     embedding_model_provider: Mapped[Any] = mapped_column(sa.String(255), nullable=True, default=None)
     keyword_number: Mapped[Any] = mapped_column(sa.Integer, nullable=True, server_default=sa.text("10"), default=None)
     collection_binding_id: Mapped[Any] = mapped_column(StringUUID, nullable=True, default=None)
+    indexing_request_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    indexing_applied_representation: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
     retrieval_model: Mapped[Any] = mapped_column(AdjustedJSON, nullable=True, default=None)
     summary_index_setting: Mapped[Any] = mapped_column(AdjustedJSON, nullable=True, default=None)
     built_in_field_enabled: Mapped[bool] = mapped_column(
@@ -372,6 +374,9 @@ class Document(Base):
     __table_args__ = (
         sa.PrimaryKeyConstraint("id", name="document_pkey"),
         sa.Index("document_dataset_id_idx", "dataset_id"),
+        sa.Index("document_dataset_indexing_request_idx", "dataset_indexing_request_id"),
+        sa.Index("document_indexing_dataset_generation_idx", "indexing_dataset_generation_id"),
+        sa.Index("document_indexing_request_idx", "indexing_request_id"),
         sa.Index("document_is_paused_idx", "is_paused"),
         sa.Index("document_tenant_idx", "tenant_id"),
         adjusted_json_index("document_metadata_idx", "doc_metadata"),
@@ -393,6 +398,11 @@ class Document(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, server_default=func.current_timestamp())
 
     # start processing
+    indexing_request_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    indexing_claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    indexing_claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    indexing_dataset_generation_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    dataset_indexing_request_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
     processing_started_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     # parsing
@@ -589,6 +599,7 @@ class DocumentSegment(TypeBase):
         sa.Index("document_segment_tenant_dataset_idx", "dataset_id", "tenant_id"),
         sa.Index("document_segment_tenant_document_idx", "document_id", "tenant_id"),
         sa.Index("document_segment_node_dataset_idx", "index_node_id", "dataset_id"),
+        sa.Index("document_segment_indexing_request_idx", "indexing_request_id"),
         sa.Index("document_segment_tenant_idx", "tenant_id"),
     )
 
@@ -607,6 +618,7 @@ class DocumentSegment(TypeBase):
     # indexing fields
     index_node_id: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     index_node_hash: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    indexing_request_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
     enabled: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, default=True)
     answer: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
     keywords: Mapped[Any] = mapped_column(sa.JSON, nullable=True, default=None)
@@ -666,6 +678,8 @@ class ChildChunk(TypeBase):
     )
     index_node_id: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     index_node_hash: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    vector_route: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
+    vector_route_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True, default=None)
     type: Mapped[SegmentType] = mapped_column(
         EnumText(SegmentType, length=255),
         nullable=False,
@@ -1151,6 +1165,8 @@ class DocumentPipelineExecutionLog(TypeBase):
     datasource_node_id: Mapped[str] = mapped_column(sa.String(255), nullable=False)
     input_data: Mapped[dict[str, Any]] = mapped_column(sa.JSON, nullable=False)
     created_by: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    workflow_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    original_document_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
     created_at: Mapped[datetime] = mapped_column(
         sa.DateTime, nullable=False, server_default=func.current_timestamp(), init=False
     )
@@ -1230,7 +1246,10 @@ class DocumentSegmentSummary(TypeBase):
     summary_content: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
     summary_index_node_id: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
     summary_index_node_hash: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    vector_route: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
+    vector_route_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True, default=None)
     tokens: Mapped[int | None] = mapped_column(sa.Integer, nullable=True, default=None)
+    version: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=1, server_default=sa.text("1"))
     status: Mapped[SummaryStatus] = mapped_column(
         EnumText(SummaryStatus, length=32),
         nullable=False,

@@ -1,17 +1,29 @@
+from collections.abc import Callable
 from datetime import datetime
+from typing import cast
 from unittest.mock import patch
 from uuid import uuid4
 
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.repositories.celery_workflow_execution_repository import CeleryWorkflowExecutionRepository
+from extensions.logstore.aliyun_logstore import AliyunLogStore
 from graphon.enums import WorkflowExecutionStatus, WorkflowType
 from models import Account, CreatorUserRole, WorkflowRun
 from models.enums import WorkflowRunTriggeredFrom
 from repositories.entities.workflow_execution import WorkflowExecution
 from tasks.workflow_execution_tasks import save_workflow_execution_task
+from tasks.workflow_run_history_sync_task import drain_pending_workflow_run_histories
 
 TABLES = (WorkflowRun,)
+
+
+class _RecordingLogstore:
+    def __init__(self) -> None:
+        self.records: list[dict[str, str]] = []
+
+    def put_log(self, _name: str, fields: list[tuple[str, str]]) -> None:
+        self.records.append(dict(fields))
 
 
 def test_legacy_celery_payload_preserves_timestamp_based_duration(
@@ -52,7 +64,14 @@ def test_legacy_celery_payload_preserves_timestamp_based_duration(
 
 def test_celery_roundtrip_preserves_accumulated_duration_on_create_update_and_redelivery(
     sqlite_session_factory: sessionmaker[Session],
+    config_overrides: Callable[..., None],
 ) -> None:
+    config_overrides(
+        CORE_WORKFLOW_EXECUTION_REPOSITORY=(
+            "extensions.logstore.repositories.logstore_workflow_execution_repository."
+            "LogstoreWorkflowExecutionRepository"
+        )
+    )
     account = Account(name="Test", email="test@example.com")
     account.id = str(uuid4())
     repository = CeleryWorkflowExecutionRepository(
@@ -94,3 +113,20 @@ def test_celery_roundtrip_preserves_accumulated_duration_on_create_update_and_re
             assert stored is not None
             assert stored.elapsed_time == duration
             assert stored.created_at == execution.started_at
+
+    logstore = _RecordingLogstore()
+    assert (
+        drain_pending_workflow_run_histories(
+            database_client=sqlite_session_factory,
+            logstore_client=cast(AliyunLogStore, logstore),
+            enable_graph=False,
+        )
+        == 1
+    )
+    assert [record["status"] for record in logstore.records] == [WorkflowExecutionStatus.SUCCEEDED]
+    with sqlite_session_factory() as session:
+        stored = session.get(WorkflowRun, execution.id_)
+        assert stored is not None
+        assert stored.history_revision == 6
+        assert stored.history_published_revision == 6
+        assert stored.history_sync_pending is False

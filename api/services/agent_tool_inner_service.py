@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 from core.agent.entities import AgentToolEntity
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.callback_handler.workflow_tool_callback_handler import DifyWorkflowCallbackHandler
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.tools.entities.tool_entities import ToolProviderType
 from core.tools.errors import (
     ToolInvokeError,
@@ -41,6 +42,9 @@ from services.workflow_run_agg import WorkflowRunAgg
 
 class AgentToolInnerService:
     """Invoke one API-owned Agent tool declaration, including explicit plugin-via-core calls."""
+
+    def __init__(self, *, external_retrieval: ExternalDatasetRetriever) -> None:
+        self._external_retrieval = external_retrieval
 
     def invoke(self, request: AgentToolInvokeRequest, *, session: Session) -> AgentToolInvokeResponse:
         app = session.get(App, request.caller.app_id)
@@ -75,6 +79,7 @@ class AgentToolInnerService:
                 variable_pool=None,
                 allow_file_parameters=True,
                 use_default_for_missing_form_parameters=True,
+                external_retrieval=self._external_retrieval,
             )
             messages = ToolEngine.generic_invoke(
                 session=session,

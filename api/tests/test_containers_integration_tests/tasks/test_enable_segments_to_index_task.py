@@ -1,483 +1,181 @@
-from unittest.mock import MagicMock, patch
+"""Container integration coverage for legacy segment-enable task bridges."""
 
-import pytest
-from faker import Faker
+from collections.abc import Callable
+from unittest.mock import patch
+
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
-from extensions.ext_redis import redis_client
-from models.account import Account, Tenant, TenantAccountJoin, TenantAccountRole
-from models.dataset import ChildChunk, Dataset, DatasetProcessRule, Document, DocumentSegment
-from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus, ProcessRuleMode, SegmentStatus
+from core.rag.index_processor.constant.index_type import IndexTechniqueType
+from models.dataset import DocumentSegment, DocumentSegmentSummary
+from models.model import SegmentStateOutbox
+from tasks.enable_segment_to_index_task import enable_segment_to_index_task
 from tasks.enable_segments_to_index_task import enable_segments_to_index_task
+from tasks.segment_state_outbox_task import process_segment_state_intents
+from tests.test_containers_integration_tests.helpers.segment_state import (
+    RecordingIndexProcessor,
+    RecordingIndexProcessorFactory,
+    create_graph,
+    create_segment,
+    create_summary,
+)
 
 
-class TestEnableSegmentsToIndexTask:
-    """Integration tests for enable_segments_to_index_task using testcontainers."""
-
-    @pytest.fixture
-    def mock_external_service_dependencies(self):
-        """Mock setup for external service dependencies."""
-        with (
-            patch(
-                "tasks.enable_segments_to_index_task.IndexProcessorFactory", autospec=True
-            ) as mock_index_processor_factory,
-        ):
-            # Setup mock index processor
-            mock_processor = MagicMock()
-            mock_index_processor_factory.return_value.init_index_processor.return_value = mock_processor
-
-            yield {
-                "index_processor_factory": mock_index_processor_factory,
-                "index_processor": mock_processor,
-            }
-
-    def _create_test_dataset_and_document(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
+def _capture_published_intents(call: Callable[[], object]) -> list[str]:
+    published: list[list[str]] = []
+    with patch(
+        "tasks.segment_state_legacy.publish_segment_state_intents",
+        side_effect=lambda intent_ids: published.append(list(intent_ids)),
     ):
-        """
-        Helper method to create a test dataset and document for testing.
+        call()
+    return [intent_id for batch in published for intent_id in batch]
 
-        Args:
-            db_session_with_containers: Database session from testcontainers infrastructure
-            mock_external_service_dependencies: Mock dependencies
 
-        Returns:
-            tuple: (dataset, document) - Created dataset and document instances
-        """
-        fake = Faker()
+def test_legacy_batch_enable_creates_owned_intents_and_reconciles_in_one_batch(
+    db_session_with_containers: Session,
+) -> None:
+    graph = create_graph(db_session_with_containers)
+    segments = [
+        create_segment(db_session_with_containers, graph, position=position, enabled=True) for position in range(1, 4)
+    ]
+    foreign = create_graph(db_session_with_containers)
+    foreign_segment = create_segment(db_session_with_containers, foreign, position=1, enabled=True)
 
-        # Create account and tenant
-        account = Account(
-            email=fake.email(),
-            name=fake.name(),
-            interface_language="en-US",
-            status="active",
+    intent_ids = _capture_published_intents(
+        lambda: enable_segments_to_index_task(
+            [*[segment.id for segment in segments], foreign_segment.id],
+            graph.dataset.id,
+            graph.document.id,
         )
-        db_session_with_containers.add(account)
-        db_session_with_containers.commit()
+    )
 
-        tenant = Tenant(
-            name=fake.company(),
-            status="normal",
+    assert len(intent_ids) == len(segments)
+    db_session_with_containers.expire_all()
+    intents = db_session_with_containers.scalars(
+        select(SegmentStateOutbox).where(SegmentStateOutbox.id.in_(intent_ids)).order_by(SegmentStateOutbox.segment_id)
+    ).all()
+    assert {intent.segment_id for intent in intents} == {segment.id for segment in segments}
+    assert all(
+        intent.tenant_id == graph.tenant.id
+        and intent.dataset_id == graph.dataset.id
+        and intent.document_id == graph.document.id
+        and intent.action == "enable"
+        for intent in intents
+    )
+    assert (
+        db_session_with_containers.scalar(
+            select(SegmentStateOutbox).where(SegmentStateOutbox.segment_id == foreign_segment.id)
         )
-        db_session_with_containers.add(tenant)
-        db_session_with_containers.commit()
+        is None
+    )
+    db_session_with_containers.commit()
 
-        # Create tenant-account join
-        join = TenantAccountJoin(
-            tenant_id=tenant.id,
-            account_id=account.id,
-            role=TenantAccountRole.OWNER,
-            current=True,
-        )
-        db_session_with_containers.add(join)
-        db_session_with_containers.commit()
-
-        # Create dataset
-        dataset = Dataset(
-            id=fake.uuid4(),
-            tenant_id=tenant.id,
-            name=fake.company(),
-            description=fake.text(max_nb_chars=100),
-            data_source_type=DataSourceType.UPLOAD_FILE,
-            indexing_technique=IndexTechniqueType.HIGH_QUALITY,
-            created_by=account.id,
-        )
-        db_session_with_containers.add(dataset)
-        db_session_with_containers.commit()
-
-        # Create document
-        document = Document(
-            id=fake.uuid4(),
-            tenant_id=tenant.id,
-            dataset_id=dataset.id,
-            position=1,
-            data_source_type=DataSourceType.UPLOAD_FILE,
-            batch="test_batch",
-            name=fake.file_name(),
-            created_from=DocumentCreatedFrom.WEB,
-            created_by=account.id,
-            indexing_status=IndexingStatus.COMPLETED,
-            enabled=True,
-            doc_form=IndexStructureType.PARAGRAPH_INDEX,
-        )
-        db_session_with_containers.add(document)
-        db_session_with_containers.commit()
-
-        # Refresh dataset to ensure doc_form property works correctly
-        db_session_with_containers.refresh(dataset)
-
-        return dataset, document
-
-    def _create_test_segments(
-        self,
-        db_session_with_containers: Session,
-        document,
-        dataset,
-        count=3,
-        enabled=False,
-        status=SegmentStatus.COMPLETED,
+    processor = RecordingIndexProcessor()
+    with patch(
+        "tasks.segment_state_outbox_task.IndexProcessorFactory",
+        return_value=RecordingIndexProcessorFactory(processor),
     ):
-        """
-        Helper method to create test document segments.
+        results = process_segment_state_intents(intent_ids)
 
-        Args:
-            db_session_with_containers: Database session from testcontainers infrastructure
-            document: Document instance
-            dataset: Dataset instance
-            count: Number of segments to create
-            enabled: Whether segments should be enabled
-            status: Status of the segments
+    assert all(results.values())
+    assert len(processor.loaded_documents) == 1
+    indexed_documents = processor.loaded_documents[0]
+    assert {document.metadata["doc_id"] for document in indexed_documents} == {
+        segment.index_node_id for segment in segments
+    }
+    db_session_with_containers.expire_all()
+    persisted = db_session_with_containers.scalars(
+        select(DocumentSegment).where(DocumentSegment.id.in_([segment.id for segment in segments]))
+    ).all()
+    assert all(segment.indexing_request_id is None for segment in persisted)
+    assert not db_session_with_containers.scalars(
+        select(SegmentStateOutbox).where(SegmentStateOutbox.id.in_(intent_ids))
+    ).all()
 
-        Returns:
-            list: List of created DocumentSegment instances
-        """
-        fake = Faker()
-        segments = []
 
-        for i in range(count):
-            text = fake.text(max_nb_chars=200)
-            segment = DocumentSegment(
-                tenant_id=document.tenant_id,
-                dataset_id=dataset.id,
-                document_id=document.id,
-                position=i,
-                content=text,
-                word_count=len(text.split()),
-                tokens=len(text.split()) * 2,
-                index_node_id=f"node_{i}",
-                index_node_hash=f"hash_{i}",
-                enabled=enabled,
-                status=status,
-                created_by=document.created_by,
-            )
-            db_session_with_containers.add(segment)
-            segments.append(segment)
+def test_legacy_single_enable_resolves_owner_and_reuses_current_intent(
+    db_session_with_containers: Session,
+) -> None:
+    graph = create_graph(db_session_with_containers)
+    segment = create_segment(db_session_with_containers, graph, position=1, enabled=True)
+    current = SegmentStateOutbox(
+        tenant_id=graph.tenant.id,
+        dataset_id=graph.dataset.id,
+        document_id=graph.document.id,
+        segment_id=segment.id,
+        action="enable",
+        actor_id=graph.account.id,
+    )
+    db_session_with_containers.add(current)
+    segment.indexing_request_id = current.id
+    db_session_with_containers.commit()
 
-        db_session_with_containers.commit()
-        return segments
+    intent_ids = _capture_published_intents(lambda: enable_segment_to_index_task(segment.id))
 
-    def test_enable_segments_to_index_with_different_index_type(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
+    assert intent_ids == [current.id]
+    processor = RecordingIndexProcessor()
+    with patch(
+        "tasks.segment_state_outbox_task.IndexProcessorFactory",
+        return_value=RecordingIndexProcessorFactory(processor),
     ):
-        """
-        Test segments indexing with different index types.
+        assert process_segment_state_intents(intent_ids) == {current.id: True}
+    assert len(processor.loaded_documents) == 1
 
-        This test verifies:
-        - Proper handling of different index types
-        - Index processor factory integration
-        - Document processing with various configurations
-        - Redis cache key deletion
-        """
-        # Arrange: Create test data with different index type
-        dataset, document = self._create_test_dataset_and_document(
-            db_session_with_containers, mock_external_service_dependencies
-        )
 
-        # Update document to use different index type
-        document.doc_form = IndexStructureType.QA_INDEX
-        db_session_with_containers.commit()
+def test_stale_legacy_enable_cannot_override_a_current_disable(
+    db_session_with_containers: Session,
+) -> None:
+    graph = create_graph(db_session_with_containers)
+    segment = create_segment(db_session_with_containers, graph, position=1, enabled=False)
+    current = SegmentStateOutbox(
+        tenant_id=graph.tenant.id,
+        dataset_id=graph.dataset.id,
+        document_id=graph.document.id,
+        segment_id=segment.id,
+        action="disable",
+        actor_id=graph.account.id,
+    )
+    db_session_with_containers.add(current)
+    segment.indexing_request_id = current.id
+    db_session_with_containers.commit()
 
-        # Refresh dataset to ensure doc_form property reflects the updated document
-        db_session_with_containers.refresh(dataset)
+    intent_ids = _capture_published_intents(
+        lambda: enable_segments_to_index_task([segment.id], graph.dataset.id, graph.document.id)
+    )
 
-        # Create segments
-        segments = self._create_test_segments(db_session_with_containers, document, dataset)
+    assert intent_ids == []
+    db_session_with_containers.expire_all()
+    persisted = db_session_with_containers.get_one(DocumentSegment, segment.id)
+    assert persisted.enabled is False
+    assert persisted.indexing_request_id == current.id
+    assert db_session_with_containers.get_one(SegmentStateOutbox, current.id).action == "disable"
 
-        # Set up Redis cache keys
-        segment_ids = [segment.id for segment in segments]
-        for segment in segments:
-            indexing_cache_key = f"segment_{segment.id}_indexing"
-            redis_client.set(indexing_cache_key, "processing", ex=300)
 
-        # Act: Execute the task
-        enable_segments_to_index_task(segment_ids, dataset.id, document.id)
+def test_legacy_enable_in_economy_mode_skips_retained_summary_vectors(
+    db_session_with_containers: Session,
+) -> None:
+    graph = create_graph(db_session_with_containers, indexing_technique=IndexTechniqueType.ECONOMY)
+    graph.dataset.embedding_model = None
+    graph.dataset.embedding_model_provider = None
+    segment = create_segment(db_session_with_containers, graph, position=1, enabled=True)
+    summary = create_summary(db_session_with_containers, graph, segment, enabled=False)
+    db_session_with_containers.commit()
+    intent_ids = _capture_published_intents(
+        lambda: enable_segments_to_index_task([segment.id], graph.dataset.id, graph.document.id)
+    )
 
-        # Assert: Verify different index type handling
-        mock_external_service_dependencies["index_processor_factory"].assert_called_once_with(
-            IndexStructureType.QA_INDEX
-        )
-        mock_external_service_dependencies["index_processor"].load.assert_called_once()
-
-        # Verify the load method was called with correct parameters
-        call_args = mock_external_service_dependencies["index_processor"].load.call_args
-        assert call_args is not None
-        documents = call_args[0][1]  # Second argument should be documents list
-        assert len(documents) == 3
-
-        # Verify Redis cache keys were deleted
-        for segment in segments:
-            indexing_cache_key = f"segment_{segment.id}_indexing"
-            assert redis_client.exists(indexing_cache_key) == 0
-
-    def test_enable_segments_to_index_dataset_not_found(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
+    processor = RecordingIndexProcessor()
+    with (
+        patch(
+            "tasks.segment_state_outbox_task.IndexProcessorFactory",
+            return_value=RecordingIndexProcessorFactory(processor),
+        ),
+        patch("tasks.segment_state_outbox_task.Vector") as vector_factory,
     ):
-        """
-        Test handling of non-existent dataset.
+        results = process_segment_state_intents(intent_ids)
 
-        This test verifies:
-        - Proper error handling for missing datasets
-        - Early return without processing
-        - Database session cleanup
-        - No unnecessary index processor calls
-        """
-        # Arrange: Use non-existent dataset ID
-        fake = Faker()
-        non_existent_dataset_id = fake.uuid4()
-        non_existent_document_id = fake.uuid4()
-        segment_ids = [fake.uuid4()]
-
-        # Act: Execute the task with non-existent dataset
-        enable_segments_to_index_task(segment_ids, non_existent_dataset_id, non_existent_document_id)
-
-        # Assert: Verify no processing occurred
-        mock_external_service_dependencies["index_processor_factory"].assert_not_called()
-        mock_external_service_dependencies["index_processor"].load.assert_not_called()
-
-    def test_enable_segments_to_index_document_not_found(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
-    ):
-        """
-        Test handling of non-existent document.
-
-        This test verifies:
-        - Proper error handling for missing documents
-        - Early return without processing
-        - Database session cleanup
-        - No unnecessary index processor calls
-        """
-        # Arrange: Create dataset but use non-existent document ID
-        dataset, _ = self._create_test_dataset_and_document(
-            db_session_with_containers, mock_external_service_dependencies
-        )
-        fake = Faker()
-        non_existent_document_id = fake.uuid4()
-        segment_ids = [fake.uuid4()]
-
-        # Act: Execute the task with non-existent document
-        enable_segments_to_index_task(segment_ids, dataset.id, non_existent_document_id)
-
-        # Assert: Verify no processing occurred
-        mock_external_service_dependencies["index_processor_factory"].assert_not_called()
-        mock_external_service_dependencies["index_processor"].load.assert_not_called()
-
-    def test_enable_segments_to_index_invalid_document_status(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
-    ):
-        """
-        Test handling of document with invalid status.
-
-        This test verifies:
-        - Early return when document is disabled, archived, or not completed
-        - No index processing for documents not ready for indexing
-        - Proper database session cleanup
-        - No unnecessary external service calls
-        """
-        # Arrange: Create test data with invalid document status
-        dataset, document = self._create_test_dataset_and_document(
-            db_session_with_containers, mock_external_service_dependencies
-        )
-
-        # Test different invalid statuses
-        invalid_statuses = [
-            ("disabled", {"enabled": False}),
-            ("archived", {"archived": True}),
-            ("not_completed", {"indexing_status": IndexingStatus.INDEXING}),
-        ]
-
-        for _, status_attrs in invalid_statuses:
-            # Reset document status
-            document.enabled = True
-            document.archived = False
-            document.indexing_status = "completed"
-            db_session_with_containers.commit()
-
-            # Set invalid status
-            for attr, value in status_attrs.items():
-                setattr(document, attr, value)
-            db_session_with_containers.commit()
-
-            # Create segments
-            segments = self._create_test_segments(db_session_with_containers, document, dataset)
-            segment_ids = [segment.id for segment in segments]
-
-            # Act: Execute the task
-            enable_segments_to_index_task(segment_ids, dataset.id, document.id)
-
-            # Assert: Verify no processing occurred
-            mock_external_service_dependencies["index_processor_factory"].assert_not_called()
-            mock_external_service_dependencies["index_processor"].load.assert_not_called()
-
-            # Clean up segments for next iteration
-            for segment in segments:
-                db_session_with_containers.delete(segment)
-            db_session_with_containers.commit()
-
-    def test_enable_segments_to_index_segments_not_found(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
-    ):
-        """
-        Test handling when no segments are found.
-
-        This test verifies:
-        - Proper handling when segments don't exist
-        - Early return without processing
-        - Database session cleanup
-        - Index processor is created but load is not called
-        """
-        # Arrange: Create test data
-        dataset, document = self._create_test_dataset_and_document(
-            db_session_with_containers, mock_external_service_dependencies
-        )
-
-        # Use non-existent segment IDs
-        fake = Faker()
-        non_existent_segment_ids = [fake.uuid4() for _ in range(3)]
-
-        # Act: Execute the task with non-existent segments
-        enable_segments_to_index_task(non_existent_segment_ids, dataset.id, document.id)
-
-        # Assert: Verify index processor was created but load was not called
-        mock_external_service_dependencies["index_processor_factory"].assert_called_once_with(
-            IndexStructureType.PARAGRAPH_INDEX
-        )
-        mock_external_service_dependencies["index_processor"].load.assert_not_called()
-
-    def test_enable_segments_to_index_with_parent_child_structure(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
-    ):
-        """
-        Test segments indexing with parent-child structure.
-
-        This test verifies:
-        - Proper handling of PARENT_CHILD_INDEX type
-        - Child document creation from segments
-        - Correct document structure for parent-child indexing
-        - Index processor receives properly structured documents
-        - Redis cache key deletion
-        """
-        # Arrange: Create test data with parent-child index type
-        dataset, document = self._create_test_dataset_and_document(
-            db_session_with_containers, mock_external_service_dependencies
-        )
-
-        # Update document to use parent-child index type
-        document.doc_form = IndexStructureType.PARENT_CHILD_INDEX
-        db_session_with_containers.commit()
-
-        # Refresh dataset to ensure doc_form property reflects the updated document
-        db_session_with_containers.refresh(dataset)
-
-        # Persist each segment and its own child chunks
-        segments = self._create_test_segments(db_session_with_containers, document, dataset)
-
-        # Set up Redis cache keys
-        segment_ids = [segment.id for segment in segments]
-        for segment in segments:
-            indexing_cache_key = f"segment_{segment.id}_indexing"
-            redis_client.set(indexing_cache_key, "processing", ex=300)
-
-        rule = DatasetProcessRule(
-            dataset_id=dataset.id,
-            mode=ProcessRuleMode.HIERARCHICAL,
-            rules='{"parent_mode": "paragraph"}',
-            created_by=document.created_by,
-        )
-        db_session_with_containers.add(rule)
-        db_session_with_containers.flush()
-        document.dataset_process_rule_id = rule.id
-        for segment in segments:
-            db_session_with_containers.add_all(
-                [
-                    ChildChunk(
-                        tenant_id=dataset.tenant_id,
-                        dataset_id=dataset.id,
-                        document_id=document.id,
-                        segment_id=segment.id,
-                        position=i,
-                        content=f"child_content_{i}",
-                        word_count=1,
-                        created_by=document.created_by,
-                        index_node_id=f"{segment.index_node_id}-child-{i}",
-                        index_node_hash=f"{segment.index_node_id}-hash-{i}",
-                    )
-                    for i in range(2)
-                ]
-            )
-        db_session_with_containers.commit()
-
-        # Act: Execute the task
-        enable_segments_to_index_task(segment_ids, dataset.id, document.id)
-
-        # Assert: Verify parent-child index processing
-        mock_external_service_dependencies["index_processor_factory"].assert_called_once_with(
-            IndexStructureType.PARENT_CHILD_INDEX
-        )
-        mock_external_service_dependencies["index_processor"].load.assert_called_once()
-
-        # Verify the load method was called with correct parameters
-        call_args = mock_external_service_dependencies["index_processor"].load.call_args
-        assert call_args is not None
-        documents = call_args[0][1]  # Second argument should be documents list
-        assert len(documents) == 3  # 3 segments
-
-        # Each parent receives only its own persisted children, in position order.
-        for doc in documents:
-            assert doc.children is not None
-            assert [child.page_content for child in doc.children] == ["child_content_0", "child_content_1"]
-            assert [child.metadata["doc_id"] for child in doc.children] == [
-                f"{doc.metadata['doc_id']}-child-{i}" for i in range(2)
-            ]
-
-        # Verify Redis cache keys were deleted
-        for segment in segments:
-            indexing_cache_key = f"segment_{segment.id}_indexing"
-            assert redis_client.exists(indexing_cache_key) == 0
-
-    def test_enable_segments_to_index_general_exception_handling(
-        self, db_session_with_containers: Session, mock_external_service_dependencies
-    ):
-        """
-        Test general exception handling during indexing process.
-
-        This test verifies:
-        - Exceptions are properly caught and handled
-        - Segment status is set to error
-        - Segments are disabled
-        - Error information is recorded
-        - Redis cache is still cleared
-        - Database session is properly closed
-        """
-        # Arrange: Create test data
-        dataset, document = self._create_test_dataset_and_document(
-            db_session_with_containers, mock_external_service_dependencies
-        )
-        segments = self._create_test_segments(db_session_with_containers, document, dataset)
-
-        # Set up Redis cache keys
-        segment_ids = [segment.id for segment in segments]
-        for segment in segments:
-            indexing_cache_key = f"segment_{segment.id}_indexing"
-            redis_client.set(indexing_cache_key, "processing", ex=300)
-
-        # Mock the index processor to raise an exception
-        mock_external_service_dependencies["index_processor"].load.side_effect = Exception("Index processing failed")
-
-        # Act: Execute the task
-        enable_segments_to_index_task(segment_ids, dataset.id, document.id)
-
-        # Assert: Verify error handling
-        for segment in segments:
-            db_session_with_containers.refresh(segment)
-            assert segment.enabled is False
-            assert segment.status == SegmentStatus.ERROR
-            assert segment.error is not None
-            assert "Index processing failed" in segment.error
-            assert segment.disabled_at is not None
-
-        # Verify Redis cache keys were still cleared despite error
-        for segment in segments:
-            indexing_cache_key = f"segment_{segment.id}_indexing"
-            assert redis_client.exists(indexing_cache_key) == 0
+    assert all(results.values())
+    assert len(processor.loaded_documents) == 1
+    vector_factory.assert_not_called()
+    db_session_with_containers.expire_all()
+    assert db_session_with_containers.get_one(DocumentSegmentSummary, summary.id).enabled is False

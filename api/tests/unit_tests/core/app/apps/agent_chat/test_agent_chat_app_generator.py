@@ -3,6 +3,7 @@ import logging
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
+from unittest.mock import create_autospec
 
 import pytest
 from flask import Flask
@@ -20,6 +21,7 @@ from core.app.entities.app_invoke_entities import (
 from core.app.entities.queue_entities import QueueErrorEvent
 from core.app.file_access import get_current_file_access_scope
 from core.ops.ops_trace_manager import TraceQueueManager
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError
 from models import Account
 from models.model import App, AppMode, AppModelConfig, Conversation, Message
@@ -75,7 +77,10 @@ def generator(
     assert agent_records[0].id == "conv"
     # Keep trace configuration lookup and initialization real, but do not schedule background timers.
     monkeypatch.setattr(TraceQueueManager, "start_timer", lambda _manager: None)
-    return AgentChatAppGenerator(execution_driver=WorkflowRunAgg.run)
+    return AgentChatAppGenerator(
+        execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+    )
 
 
 @pytest.fixture

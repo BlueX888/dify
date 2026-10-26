@@ -12,17 +12,28 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import core.app.apps.pipeline.pipeline_generator as module
 from core.app.apps.exc import GenerateTaskStoppedError
-from core.app.entities.app_invoke_entities import InvokeFrom
+from core.app.apps.pipeline.pipeline_config_manager import PipelineConfig
+from core.app.apps.pipeline.pipeline_queue_manager import PipelineQueueManager
+from core.app.apps.pipeline.pipeline_runner import PipelineRunner
+from core.app.entities.app_invoke_entities import InvokeFrom, RagPipelineGenerateEntity
 from core.datasource.entities.datasource_entities import DatasourceProviderType
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.index_processor.constant.built_in_field import BuiltInField
+from core.workflow.file_reference import build_file_reference
+from core.workflow.nodes.knowledge_index.knowledge_index_node import KnowledgeIndexNode
+from graphon.enums import WorkflowNodeExecutionStatus
+from graphon.variable_loader import DUMMY_VARIABLE_LOADER
 from models.dataset import Dataset, Document, DocumentPipelineExecutionLog, Pipeline
 from models.enums import DataSourceType, EndUserType
-from models.model import EndUser
+from models.model import AppMode, DocumentIndexingOutbox, EndUser, UploadFile
 from models.workflow import Workflow, WorkflowType
+from repositories.knowledge.document_indexing_outbox_repository import create_pipeline_document_indexing_intents
 from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
 from services.data_source.credential_gateway import DatasourceProviderCredentialStore
 from services.data_source.provider_service import DatasourceProviderService
+from services.rag_pipeline.rag_pipeline import RagPipelineService
 from services.workflow_run_agg import WorkflowRunAgg
+from tests.unit_tests.model_factories import make_account, make_upload_file
 
 TENANT_ID = "00000000-0000-0000-0000-000000000001"
 PIPELINE_ID = "00000000-0000-0000-0000-000000000002"
@@ -50,6 +61,8 @@ def generator(mocker: MockerFixture, sqlite_engine: Engine):
         datasource_providers=DatasourceProviderService(
             credentials=create_autospec(DatasourceProviderCredentialStore, instance=True)
         ),
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        indexing_requests=create_pipeline_document_indexing_intents,
     )
 
     _patch_sqlite_engine(mocker, sqlite_engine)
@@ -226,7 +239,16 @@ def test_generate_published_pipeline_creates_documents_and_delay(
 ):
     pipeline, _, workflow = _persist_pipeline_scope(sqlite_session)
 
-    datasource_info_list = [{"name": "file1"}, {"name": "file2"}]
+    upload_files = [
+        make_upload_file(tenant_id=TENANT_ID, created_by=USER_ID, name="file1"),
+        make_upload_file(tenant_id=TENANT_ID, created_by=USER_ID, name="file2"),
+    ]
+    sqlite_session.add_all(upload_files)
+    sqlite_session.commit()
+    datasource_info_list = [
+        {"name": "file1", "reference": build_file_reference(record_id=upload_files[0].id)},
+        {"name": "file2", "related_id": upload_files[1].id},
+    ]
 
     mocker.patch.object(
         generator,
@@ -241,7 +263,7 @@ def test_generate_published_pipeline_creates_documents_and_delay(
     mocker.patch.object(generator, "_prepare_user_inputs", return_value={"k": "v"})
 
     mocker.patch("services.knowledge.dataset_service.DocumentService.get_documents_position", return_value=1)
-    features = SimpleNamespace()
+    features = object()
     get_features = mocker.patch("services.feature_service.FeatureService.get_features", return_value=features)
     check_limits = mocker.patch("services.knowledge.dataset_service.DocumentService.check_document_creation_limits")
 
@@ -257,13 +279,13 @@ def test_generate_published_pipeline_creates_documents_and_delay(
     )
 
     task_proxy = MagicMock()
-    mocker.patch.object(module, "RagPipelineTaskProxy", return_value=task_proxy)
+    task_proxy_factory = mocker.patch.object(module, "RagPipelineTaskProxy", return_value=task_proxy)
 
     result = generator.generate(
         session=sqlite_session,
         pipeline=pipeline,
         workflow=workflow,
-        user=_build_user(),
+        user=make_account(account_id=USER_ID),
         args=_build_args(),
         invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
         streaming=False,
@@ -280,8 +302,91 @@ def test_generate_published_pipeline_creates_documents_and_delay(
         select(DocumentPipelineExecutionLog).where(DocumentPipelineExecutionLog.pipeline_id == PIPELINE_ID)
     ).all()
     assert {log.document_id for log in persisted_logs} == {document.id for document in persisted_documents}
+    assert {log.workflow_id for log in persisted_logs} == {workflow.id}
+    assert {log.original_document_id for log in persisted_logs} == {None}
+    intents = sqlite_session.scalars(
+        select(DocumentIndexingOutbox).where(DocumentIndexingOutbox.dataset_id == DATASET_ID)
+    ).all()
+    assert len(intents) == 2
+    assert {intent.action for intent in intents} == {"retry"}
+    assert {intent.actor_id for intent in intents} == {USER_ID}
+    assert {intent.pipeline_execution_log_id for intent in intents} == {log.id for log in persisted_logs}
+    assert {document.indexing_request_id for document in persisted_documents} == {intent.id for intent in intents}
+    invoke_entities = task_proxy_factory.call_args.args[2]
+    assert {entity["application_generate_entity"]["indexing_request_id"] for entity in invoke_entities} == {
+        intent.id for intent in intents
+    }
+    assert all(entity["application_generate_entity"]["indexing_claim_id"] is None for entity in invoke_entities)
+    assert all(entity["application_generate_entity"]["enforce_projected_capacity"] for entity in invoke_entities)
     task_proxy.delay.assert_called_once()
     get_features.assert_called_once_with(TENANT_ID)
+
+    task_proxy.delay.side_effect = RuntimeError("broker unavailable")
+    with pytest.raises(RuntimeError, match="broker unavailable"):
+        generator.generate(
+            session=sqlite_session,
+            pipeline=pipeline,
+            workflow=workflow,
+            user=make_account(account_id=USER_ID),
+            args=_build_args(),
+            invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
+            streaming=False,
+        )
+    sqlite_session.expire_all()
+    committed_documents = sqlite_session.scalars(select(Document).where(Document.dataset_id == DATASET_ID)).all()
+    committed_logs = sqlite_session.scalars(
+        select(DocumentPipelineExecutionLog).where(DocumentPipelineExecutionLog.pipeline_id == PIPELINE_ID)
+    ).all()
+    committed_intents = sqlite_session.scalars(
+        select(DocumentIndexingOutbox).where(DocumentIndexingOutbox.dataset_id == DATASET_ID)
+    ).all()
+    assert len(committed_documents) == 4
+    assert len(committed_logs) == 4
+    assert len(committed_intents) == 4
+    assert {document.indexing_request_id for document in committed_documents} == {
+        intent.id for intent in committed_intents
+    }
+
+
+def test_generate_published_pipeline_rejects_foreign_local_file(
+    generator, mocker: MockerFixture, sqlite_session: Session
+) -> None:
+    pipeline, _, workflow = _persist_pipeline_scope(sqlite_session)
+    foreign_upload = make_upload_file(tenant_id="00000000-0000-0000-0000-000000000099", created_by=USER_ID)
+    sqlite_session.add(foreign_upload)
+    sqlite_session.commit()
+    datasource_info_list = [
+        {"name": "foreign", "reference": build_file_reference(record_id=foreign_upload.id)},
+    ]
+    mocker.patch.object(generator, "_format_datasource_info_list", return_value=datasource_info_list)
+    mocker.patch.object(
+        module.PipelineConfigManager,
+        "get_pipeline_config",
+        return_value=PipelineConfig(
+            tenant_id=TENANT_ID,
+            app_id=PIPELINE_ID,
+            app_mode=AppMode.RAG_PIPELINE,
+            workflow_id=WORKFLOW_ID,
+            rag_pipeline_variables=[],
+        ),
+    )
+    features = object()
+    mocker.patch("services.feature_service.FeatureService.get_features", return_value=features)
+    mocker.patch("services.knowledge.dataset_service.DocumentService.check_document_creation_limits")
+
+    with pytest.raises(ValueError, match="Local file does not exist"):
+        generator.generate(
+            session=sqlite_session,
+            pipeline=pipeline,
+            workflow=workflow,
+            user=_build_user(),
+            args=_build_args(),
+            invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
+            streaming=False,
+        )
+
+    assert sqlite_session.scalars(select(Document)).all() == []
+    assert sqlite_session.get(UploadFile, foreign_upload.id) is not None
 
 
 def test_generate_published_pipeline_rejects_when_document_creation_limits_exceeded(
@@ -323,20 +428,96 @@ def test_generate_published_pipeline_rejects_when_document_creation_limits_excee
     assert sqlite_session.scalars(select(Document)).all() == []
 
 
-def test_generate_is_retry_calls_generate(generator, mocker: MockerFixture, sqlite_session: Session):
-    pipeline, _, workflow = _persist_pipeline_scope(sqlite_session)
-
-    mocker.patch.object(
-        generator,
-        "_format_datasource_info_list",
-        return_value=[{"name": "file"}],
+def test_first_durable_retry_reaches_knowledge_index_with_separate_target_and_cleanup(
+    generator,
+    monkeypatch: pytest.MonkeyPatch,
+    mocker: MockerFixture,
+    sqlite_session: Session,
+):
+    sqlite_session.expire_on_commit = False
+    workflow = _build_workflow(
+        graph={
+            "nodes": [
+                {
+                    "id": "start",
+                    "data": {"type": "start", "title": "Start", "variables": []},
+                },
+                {
+                    "id": "index",
+                    "data": {
+                        "type": "knowledge-index",
+                        "title": "Knowledge Index",
+                        "chunk_structure": "general_structure",
+                        "index_chunk_variable_selector": ["start", "chunks"],
+                        "indexing_technique": "high_quality",
+                        "summary_index_setting": None,
+                    },
+                },
+            ],
+            "edges": [{"id": "start-index", "source": "start", "target": "index"}],
+        }
     )
+    workflow.version = "v1"
+    pipeline, dataset, workflow = _persist_pipeline_scope(sqlite_session, workflow=workflow)
+    document = Document(
+        id="document-1",
+        tenant_id=TENANT_ID,
+        dataset_id=DATASET_ID,
+        position=1,
+        data_source_type="upload_file",
+        batch="batch",
+        name="document",
+        created_from="rag-pipeline",
+        created_by=USER_ID,
+        doc_form="text_model",
+    )
+    execution_log = DocumentPipelineExecutionLog(
+        pipeline_id=pipeline.id,
+        document_id=document.id,
+        datasource_type=DatasourceProviderType.LOCAL_FILE.value,
+        datasource_info=json.dumps({"name": "file"}),
+        datasource_node_id="start",
+        input_data={"k": "v"},
+        created_by=USER_ID,
+        workflow_id=workflow.id,
+        original_document_id=None,
+    )
+    sqlite_session.add_all([document, execution_log])
+    sqlite_session.flush()
+    request = DocumentIndexingOutbox(
+        tenant_id=TENANT_ID,
+        dataset_id=DATASET_ID,
+        action="retry",
+        document_ids=json.dumps([document.id]),
+        actor_id=USER_ID,
+        pipeline_execution_log_id=execution_log.id,
+    )
+    sqlite_session.add(request)
+    sqlite_session.flush()
+    document.indexing_request_id = request.id
+    document.indexing_claim_id = "claim-1"
+    sqlite_session.commit()
+    request_id = request.id
+    with Session(sqlite_session.get_bind()) as observer:
+        document_count = observer.query(Document).count()
+
+    def format_after_read_transaction_closes(*_args: object, **_kwargs: object) -> list[dict[str, str]]:
+        assert not sqlite_session.in_transaction()
+        return [{"name": "file"}]
+
+    mocker.patch.object(generator, "_format_datasource_info_list", side_effect=format_after_read_transaction_closes)
     mocker.patch.object(
         module.PipelineConfigManager,
         "get_pipeline_config",
-        return_value=SimpleNamespace(app_id="pipe", rag_pipeline_variables=[]),
+        return_value=PipelineConfig(
+            app_id=PIPELINE_ID,
+            workflow_id=WORKFLOW_ID,
+            tenant_id=TENANT_ID,
+            app_mode=AppMode.RAG_PIPELINE,
+        ),
     )
-    mocker.patch.object(generator, "_prepare_user_inputs", return_value={"k": "v"})
+    chunks = {"general_chunks": ["content"], "data_source_info": {"file_id": "file-1"}}
+    mocker.patch.object(generator, "_prepare_user_inputs", return_value={"chunks": chunks})
 
     mocker.patch.object(
         module.DifyCoreRepositoryFactory,
@@ -349,26 +530,92 @@ def test_generate_is_retry_calls_generate(generator, mocker: MockerFixture, sqli
         return_value=MagicMock(),
     )
 
-    generate = mocker.patch.object(generator, "_generate", return_value={"result": "ok"})
+    monkeypatch.setattr(module, "RagPipelineGenerateEntity", RagPipelineGenerateEntity)
+    captured: dict[str, object] = {}
 
-    args = _build_args()
-    args["original_document_id"] = "document-1"
+    def invoke_knowledge_index(
+        _node: KnowledgeIndexNode,
+        dataset_id: str,
+        document_id: str,
+        original_document_id: str,
+        is_preview: bool,
+        batch: object,
+        chunks: dict[str, object],
+        summary_index_setting: object = None,
+        indexing_request_id: str | None = None,
+        claim_id: str | None = None,
+        enforce_projected_capacity: bool | None = None,
+        *,
+        session: Session,
+    ) -> dict[str, str]:
+        captured.update(
+            dataset_id=dataset_id,
+            document_id=document_id,
+            original_document_id=original_document_id,
+            is_preview=is_preview,
+            batch=batch,
+            chunks=chunks,
+            summary_index_setting=summary_index_setting,
+            indexing_request_id=indexing_request_id,
+            claim_id=claim_id,
+            enforce_projected_capacity=enforce_projected_capacity,
+            session=session,
+        )
+        return {"status": "indexed"}
 
-    result = generator.generate(
-        session=sqlite_session,
-        pipeline=pipeline,
-        workflow=workflow,
-        user=_build_user(),
-        args=args,
-        invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
-        streaming=True,
-        is_retry=True,
+    monkeypatch.setattr(KnowledgeIndexNode, "_invoke_knowledge_index", invoke_knowledge_index)
+
+    def generate_at_real_boundary(**kwargs: object) -> dict[str, str]:
+        entity = kwargs["application_generate_entity"]
+        source_workflow = kwargs["workflow"]
+        assert isinstance(entity, RagPipelineGenerateEntity)
+        assert isinstance(source_workflow, Workflow)
+        runner = PipelineRunner(
+            application_generate_entity=entity,
+            queue_manager=PipelineQueueManager(
+                task_id=entity.task_id,
+                user_id=entity.user_id,
+                invoke_from=entity.invoke_from,
+                app_mode=AppMode.RAG_PIPELINE,
+            ),
+            variable_loader=DUMMY_VARIABLE_LOADER,
+            workflow=source_workflow,
+            system_user_id=entity.user_id,
+            documents=generator._documents,
+            external_retrieval=generator._external_retrieval,
+            execution_driver=WorkflowRunAgg.run,
+        )
+        prepared = runner.prepare()
+        node = prepared.entry.graph_engine.graph.nodes["index"]
+        assert isinstance(node, KnowledgeIndexNode)
+        result = node._run()
+        assert result.status == WorkflowNodeExecutionStatus.SUCCEEDED
+        return {"result": "ok"}
+
+    monkeypatch.setattr(generator, "_generate", generate_at_real_boundary)
+
+    RagPipelineService(
+        sqlite_session,
+        session_maker=sessionmaker(bind=sqlite_session.get_bind()),
+    ).retry_error_document(
+        dataset,
+        document,
+        _build_user(),
+        generator=generator,
+        indexing_request_id=request_id,
+        claim_id="claim-1",
+        recovery_required=False,
     )
 
-    assert result == {"result": "ok"}
-    application_generate_entity = generate.call_args.kwargs["application_generate_entity"]
-    assert application_generate_entity.document_id == "document-1"
-    assert application_generate_entity.original_document_id is None
+    assert not sqlite_session.in_transaction()
+    with Session(sqlite_session.get_bind()) as observer:
+        assert observer.query(Document).count() == document_count
+    assert captured["dataset_id"] == DATASET_ID
+    assert captured["document_id"] == "document-1"
+    assert captured["original_document_id"] == ""
+    assert captured["enforce_projected_capacity"] is True
+    assert captured["indexing_request_id"] == request_id
+    assert captured["claim_id"] == "claim-1"
 
 
 def test_generate_worker_handles_errors(

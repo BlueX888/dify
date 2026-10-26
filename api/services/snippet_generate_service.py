@@ -29,6 +29,7 @@ from core.app.app_config.features.file_upload.manager import FileUploadConfigMan
 from core.app.apps.workflow.app_generator import WorkflowAppGenerator
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.app.file_access import DatabaseFileAccessController
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.snippet_start import SNIPPET_VIRTUAL_START_NODE_ID
 from factories import file_factory
 from graphon.file.models import File
@@ -138,6 +139,8 @@ class SnippetGenerateService:
         invoke_from: InvokeFrom,
         streaming: bool = True,
         session_maker: sessionmaker[Session] | None = None,
+        *,
+        external_retrieval: ExternalDatasetRetriever,
     ) -> Mapping[str, Any] | Generator[str]:
         """
         Run a snippet's draft workflow.
@@ -169,7 +172,9 @@ class SnippetGenerateService:
         # Adapt snippet to App-like interface for WorkflowAppGenerator
         app_proxy = cast(App, _SnippetAsApp(snippet))
 
-        response = WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
+        response = WorkflowAppGenerator(
+            execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+        ).generate(
             app_model=app_proxy,
             workflow=workflow,
             user=user,
@@ -180,50 +185,6 @@ class SnippetGenerateService:
         )
 
         return WorkflowAppGenerator.convert_to_event_stream(cls._filter_virtual_start_events(response))
-
-    @classmethod
-    def run_published(
-        cls,
-        snippet: CustomizedSnippet,
-        user: Account | EndUser,
-        args: Mapping[str, Any],
-        invoke_from: InvokeFrom,
-        session_maker: sessionmaker[Session] | None = None,
-    ) -> Mapping[str, Any]:
-        """
-        Run a snippet's published workflow in non-streaming (blocking) mode.
-
-        Similar to :meth:`generate` but targets the published workflow instead
-        of the draft, and returns the raw blocking response without SSE
-        wrapping. Designed for programmatic callers that need direct workflow outputs.
-
-        :param snippet: CustomizedSnippet instance (must be published)
-        :param user: Account or EndUser initiating the run
-        :param args: Workflow inputs (must include "inputs" key)
-        :param invoke_from: Source of invocation
-        :return: Blocking response mapping with workflow outputs
-        :raises ValueError: If the snippet has no published workflow
-        """
-        snippet_service = SnippetService(session_maker)
-        workflow = snippet_service.get_published_workflow(snippet)
-        if not workflow:
-            raise ValueError("No published workflow found for snippet")
-
-        # Inject a virtual Start node when the graph doesn't have one.
-        workflow = cls._ensure_start_node(workflow, snippet)
-
-        app_proxy = cast(App, _SnippetAsApp(snippet))
-
-        response = WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
-            app_model=app_proxy,
-            workflow=workflow,
-            user=user,
-            args=args,
-            invoke_from=invoke_from,
-            streaming=False,
-            call_depth=0,
-        )
-        return response
 
     @classmethod
     def ensure_start_node_for_worker(cls, workflow: Workflow, snippet: CustomizedSnippet) -> Workflow:
@@ -341,6 +302,8 @@ class SnippetGenerateService:
         query: str = "",
         files: Sequence[File] | None = None,
         session_maker: sessionmaker[Session] | None = None,
+        *,
+        external_retrieval: ExternalDatasetRetriever,
     ) -> WorkflowNodeExecutionModel:
         """
         Run a single node in a snippet's draft workflow (single-step debugging).
@@ -366,6 +329,7 @@ class SnippetGenerateService:
 
         workflow_service = WorkflowService()
         return workflow_service.run_draft_workflow_node(
+            external_retrieval=external_retrieval,
             app_model=app_proxy,
             draft_workflow=draft_workflow,
             node_id=node_id,
@@ -384,6 +348,7 @@ class SnippetGenerateService:
         args: Mapping[str, Any],
         streaming: bool = True,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session_maker: sessionmaker[Session],
     ) -> Mapping[str, Any] | Generator[str]:
         """
@@ -411,7 +376,9 @@ class SnippetGenerateService:
 
         with session_maker() as session:
             return WorkflowAppGenerator.convert_to_event_stream(
-                WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).single_iteration_generate(
+                WorkflowAppGenerator(
+                    execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                ).single_iteration_generate(
                     app_model=app_proxy,
                     workflow=workflow,
                     node_id=node_id,
@@ -431,6 +398,7 @@ class SnippetGenerateService:
         args: Any,
         streaming: bool = True,
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session_maker: sessionmaker[Session],
     ) -> Mapping[str, Any] | Generator[str]:
         """
@@ -458,7 +426,9 @@ class SnippetGenerateService:
 
         with session_maker() as session:
             return WorkflowAppGenerator.convert_to_event_stream(
-                WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run).single_loop_generate(
+                WorkflowAppGenerator(
+                    execution_driver=WorkflowRunAgg.run, external_retrieval=external_retrieval
+                ).single_loop_generate(
                     app_model=app_proxy,
                     workflow=workflow,
                     node_id=node_id,

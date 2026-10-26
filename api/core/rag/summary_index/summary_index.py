@@ -27,6 +27,7 @@ class SummaryIndex:
                 dataset = session.scalar(select(Dataset).where(Dataset.id == dataset_id).limit(1))
                 if not dataset or dataset.indexing_technique != IndexTechniqueType.HIGH_QUALITY:
                     return
+                parent_generation_id = dataset.indexing_request_id
 
                 if summary_index_setting is None:
                     summary_index_setting = dataset.summary_index_setting
@@ -83,7 +84,11 @@ class SummaryIndex:
                         return
                     try:
                         SummaryIndexAdapter.generate_and_vectorize_summary(
-                            segment, dataset, summary_index_setting, session=session
+                            segment,
+                            dataset,
+                            summary_index_setting,
+                            session=session,
+                            indexing_request_id=parent_generation_id,
                         )
                     except Exception:
                         logger.exception(
@@ -99,4 +104,9 @@ class SummaryIndex:
                 ]
                 concurrent.futures.wait(futures)
         else:
-            generate_summary_index_task.delay(dataset_id, document_id, None)
+            with session_factory.create_session() as session:
+                dataset = session.scalar(select(Dataset).where(Dataset.id == dataset_id).limit(1))
+                if dataset is None:
+                    return
+                parent_generation_id = dataset.indexing_request_id
+            generate_summary_index_task.delay(dataset_id, document_id, None, parent_generation_id)

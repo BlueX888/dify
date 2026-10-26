@@ -142,7 +142,6 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         with (
             patch("services.knowledge.dataset_service.redis_client") as redis_client,
             patch("services.knowledge.dataset_service.add_document_to_index_task") as add_task,
-            patch("services.knowledge.dataset_service.remove_document_from_index_task") as remove_task,
             patch("services.knowledge.dataset_service.naive_utc_now") as naive_utc_now,
         ):
             naive_utc_now.return_value = FIXED_TIME
@@ -150,7 +149,6 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
             yield {
                 "redis_client": redis_client,
                 "add_task": add_task,
-                "remove_task": remove_task,
                 "naive_utc_now": naive_utc_now,
             }
 
@@ -209,10 +207,9 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
             self._assert_document_enabled(document, FIXED_TIME)
 
         expected_get_calls = [call(f"document_{doc_id}_indexing") for doc_id in document_ids]
-        expected_setex_calls = [call(f"document_{doc_id}_indexing", 600, 1) for doc_id in document_ids]
         expected_add_calls = [call(doc_id) for doc_id in document_ids]
         patched_dependencies["redis_client"].get.assert_has_calls(expected_get_calls)
-        patched_dependencies["redis_client"].setex.assert_has_calls(expected_setex_calls)
+        patched_dependencies["redis_client"].setex.assert_not_called()
         patched_dependencies["add_task"].delay.assert_has_calls(expected_add_calls)
 
     def test_batch_update_enable_already_enabled_document_skipped(
@@ -270,11 +267,8 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
             self._assert_document_disabled(document, user.id, FIXED_TIME)
 
         expected_get_calls = [call(f"document_{doc_id}_indexing") for doc_id in document_ids]
-        expected_setex_calls = [call(f"document_{doc_id}_indexing", 600, 1) for doc_id in document_ids]
-        expected_remove_calls = [call(doc_id) for doc_id in document_ids]
         patched_dependencies["redis_client"].get.assert_has_calls(expected_get_calls)
-        patched_dependencies["redis_client"].setex.assert_has_calls(expected_setex_calls)
-        patched_dependencies["remove_task"].delay.assert_has_calls(expected_remove_calls)
+        patched_dependencies["redis_client"].setex.assert_not_called()
 
     def test_batch_update_disable_already_disabled_document_skipped(
         self, db_session_with_containers: Session, patched_dependencies
@@ -304,7 +298,6 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         db_session_with_containers.refresh(disabled_doc)
         assert disabled_doc.enabled is False
         patched_dependencies["redis_client"].setex.assert_not_called()
-        patched_dependencies["remove_task"].delay.assert_not_called()
 
     def test_batch_update_disable_non_completed_document_error(
         self, db_session_with_containers: Session, patched_dependencies
@@ -353,8 +346,7 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         db_session_with_containers.refresh(document)
         self._assert_document_archived(document, user.id, FIXED_TIME)
         patched_dependencies["redis_client"].get.assert_called_once_with(f"document_{document.id}_indexing")
-        patched_dependencies["redis_client"].setex.assert_called_once_with(f"document_{document.id}_indexing", 600, 1)
-        patched_dependencies["remove_task"].delay.assert_called_once_with(document.id)
+        patched_dependencies["redis_client"].setex.assert_not_called()
 
     def test_batch_update_archive_already_archived_document_skipped(
         self, db_session_with_containers: Session, patched_dependencies
@@ -380,7 +372,6 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         db_session_with_containers.refresh(document)
         assert document.archived is True
         patched_dependencies["redis_client"].setex.assert_not_called()
-        patched_dependencies["remove_task"].delay.assert_not_called()
 
     def test_batch_update_archive_disabled_document_no_index_removal(
         self, db_session_with_containers: Session, patched_dependencies
@@ -406,7 +397,6 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         db_session_with_containers.refresh(document)
         self._assert_document_archived(document, user.id, FIXED_TIME)
         patched_dependencies["redis_client"].setex.assert_not_called()
-        patched_dependencies["remove_task"].delay.assert_not_called()
 
     def test_batch_update_unarchive_documents_success(self, db_session_with_containers: Session, patched_dependencies):
         """Unarchive enabled documents and trigger add-index task."""
@@ -431,7 +421,7 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         self._assert_document_unarchived(document)
         assert document.updated_at == FIXED_TIME
         patched_dependencies["redis_client"].get.assert_called_once_with(f"document_{document.id}_indexing")
-        patched_dependencies["redis_client"].setex.assert_called_once_with(f"document_{document.id}_indexing", 600, 1)
+        patched_dependencies["redis_client"].setex.assert_not_called()
         patched_dependencies["add_task"].delay.assert_called_once_with(document.id)
 
     def test_batch_update_unarchive_already_unarchived_document_skipped(
@@ -537,7 +527,7 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
 
         db_session_with_containers.refresh(document)
         self._assert_document_enabled(document, FIXED_TIME)
-        patched_dependencies["redis_client"].setex.assert_called_once_with(f"document_{document.id}_indexing", 600, 1)
+        patched_dependencies["redis_client"].setex.assert_not_called()
 
     def test_batch_update_empty_document_list(self, db_session_with_containers: Session, patched_dependencies):
         """Return early when document_ids is empty."""
@@ -622,11 +612,7 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         assert enabled_doc.enabled is True
         assert archived_doc.enabled is True
 
-        patched_dependencies["redis_client"].setex.assert_called_once_with(
-            f"document_{disabled_doc.id}_indexing",
-            600,
-            1,
-        )
+        patched_dependencies["redis_client"].setex.assert_not_called()
         patched_dependencies["add_task"].delay.assert_called_once_with(disabled_doc.id)
 
     def test_batch_update_large_document_list_performance(
@@ -658,12 +644,10 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
             db_session_with_containers.refresh(document)
             self._assert_document_enabled(document, FIXED_TIME)
 
-        assert patched_dependencies["redis_client"].setex.call_count == len(document_ids)
+        patched_dependencies["redis_client"].setex.assert_not_called()
         assert patched_dependencies["add_task"].delay.call_count == len(document_ids)
 
-        expected_setex_calls = [call(f"document_{doc_id}_indexing", 600, 1) for doc_id in document_ids]
         expected_task_calls = [call(doc_id) for doc_id in document_ids]
-        patched_dependencies["redis_client"].setex.assert_has_calls(expected_setex_calls)
         patched_dependencies["add_task"].delay.assert_has_calls(expected_task_calls)
 
     def test_batch_update_mixed_document_states_complex_scenario(
@@ -717,7 +701,7 @@ class TestDatasetServiceBatchUpdateDocumentStatus:
         assert doc4.enabled is True
         assert doc5.enabled is True
 
-        patched_dependencies["redis_client"].setex.assert_called_once_with(f"document_{doc1.id}_indexing", 600, 1)
+        patched_dependencies["redis_client"].setex.assert_not_called()
         patched_dependencies["add_task"].delay.assert_called_once_with(doc1.id)
 
     def test_batch_update_invalid_action_raises_value_error(

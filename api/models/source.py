@@ -89,3 +89,40 @@ class DataSourceApiKeyAuthBinding(TypeBase):
             "disabled": self.disabled,
         }
         return result
+
+
+class WebsiteCrawlJob(TypeBase):
+    """Durable ownership record for an asynchronous website crawl job."""
+
+    __tablename__ = "website_crawl_jobs"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="website_crawl_job_pkey"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "provider",
+            "provider_instance_id",
+            "job_id",
+            name="website_crawl_job_owner_job_key",
+        ),
+        sa.UniqueConstraint(
+            "provider",
+            "provider_instance_id",
+            "exclusive_job_id",
+            name="website_crawl_job_exclusive_job_key",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        StringUUID, insert_default=lambda: str(uuid4()), default_factory=lambda: str(uuid4()), init=False
+    )
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    job_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # Firecrawl and Watercrawl jobs are credential-owned and therefore have one
+    # claimant per provider instance. Jina task IDs are deterministic from
+    # crawl input, so several tenants may legitimately receive the same ID.
+    exclusive_job_id: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, server_default=func.current_timestamp(), init=False
+    )

@@ -5,10 +5,9 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 
-from libs.datetime_utils import naive_utc_now
 from machinery.context import RequestContext
 from services.knowledge.dataset_access import DatasetAccess
-from services.knowledge.resource_scope import DatasetRef, DocumentRef
+from services.knowledge.entities.resource_scope import DatasetRef, DocumentRef
 
 
 @dataclass(frozen=True)
@@ -87,7 +86,7 @@ class DocumentOperations(Protocol):
     def initialize_dataset(self, context: RequestContext, settings: Mapping[str, Any]) -> dict[str, Any]: ...
     def delete_document(self, ref: DocumentRef) -> None: ...
     def delete_documents(self, ref: DatasetRef, document_ids: Sequence[str]) -> None: ...
-    def update_document(self, ref: DocumentRef, values: Mapping[str, object]) -> None: ...
+    def update_metadata(self, ref: DocumentRef, *, doc_type: str, doc_metadata: Mapping[str, object]) -> None: ...
     def rename_document(self, ref: DocumentRef, name: str) -> dict[str, Any]: ...
     def pause_document(self, ref: DocumentRef, *, actor_id: str) -> None: ...
     def recover_document(self, ref: DocumentRef) -> None: ...
@@ -196,31 +195,6 @@ class DatasetDocumentApplicationService:
     def delete_documents(self, context: RequestContext, *, dataset_id: str, document_ids: Sequence[str]) -> None:
         self._operations.delete_documents(self._dataset(context, dataset_id), document_ids)
 
-    def update_processing(
-        self,
-        context: RequestContext,
-        *,
-        dataset_id: str,
-        document_id: str,
-        action: Literal["pause", "resume"],
-    ) -> None:
-        ref, state = self._document(context, dataset_id, document_id)
-        if action == "pause":
-            if state.indexing_status != "indexing":
-                raise DocumentInvalidActionError("Document not in indexing state.")
-            values: dict[str, object] = {
-                "paused_by": context.account_id,
-                "paused_at": naive_utc_now(),
-                "is_paused": True,
-            }
-        elif action == "resume":
-            if state.indexing_status not in {"paused", "error"}:
-                raise DocumentInvalidActionError("Document not in paused or error state.")
-            values = {"paused_by": None, "paused_at": None, "is_paused": False}
-        else:
-            raise DocumentInvalidActionError("Invalid action.")
-        self._operations.update_document(ref, values)
-
     def update_metadata(
         self,
         context: RequestContext,
@@ -244,9 +218,7 @@ class DatasetDocumentApplicationService:
                 if doc_metadata.get(key) is not None and isinstance(doc_metadata[key], value_type)
             }
         )
-        self._operations.update_document(
-            ref, {"doc_type": doc_type, "doc_metadata": metadata, "updated_at": naive_utc_now()}
-        )
+        self._operations.update_metadata(ref, doc_type=doc_type, doc_metadata=metadata)
 
     def change_status(
         self,

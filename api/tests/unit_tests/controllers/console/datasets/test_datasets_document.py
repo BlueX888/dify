@@ -5,10 +5,12 @@ from unittest.mock import MagicMock, create_autospec, patch
 from uuid import UUID
 
 import pytest
+from flask import Flask
 from werkzeug.exceptions import Forbidden, NotFound
 
 from controllers.common.errors import InvalidArgumentError, NotFoundError
 from controllers.common.rbac import DatasetByDocument, DatasetId, RBACPermission
+from controllers.console import bp as console_blueprint
 from controllers.console.app.error import ProviderNotInitializeError
 from controllers.console.datasets import datasets_document as controller
 from controllers.console.datasets.datasets_document import (
@@ -26,7 +28,6 @@ from controllers.console.datasets.datasets_document import (
     DocumentMetadataUpdatePayload,
     DocumentPauseApi,
     DocumentPipelineExecutionLogApi,
-    DocumentProcessingApi,
     DocumentRecoverApi,
     DocumentRenameApi,
     DocumentRenamePayload,
@@ -48,7 +49,7 @@ from controllers.console.datasets.error import (
     InvalidMetadataError,
 )
 from machinery.context import RequestContext
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
 from services.knowledge.documents.application import (
     DatasetDocumentApplicationService,
     DocumentArchivedError,
@@ -82,6 +83,24 @@ def documents(monkeypatch):
     )
     monkeypatch.setattr(controller, "check_knowledge_rate_limit", lambda: None)
     return documents
+
+
+def test_document_processing_routes_only_match_the_static_pause_and_resume_handlers() -> None:
+    route_app = Flask(__name__)
+    route_app.register_blueprint(console_blueprint)
+    adapter = route_app.url_map.bind("")
+    base_path = f"/console/api/datasets/{DS}/documents/{DOC}/processing"
+
+    for action, expected_endpoint in (
+        ("pause", "console.console_document_pause_api"),
+        ("resume", "console.console_document_recover_api"),
+    ):
+        endpoint, values = adapter.match(f"{base_path}/{action}", method="PATCH")
+        assert endpoint == expected_endpoint
+        assert values == {"dataset_id": DS, "document_id": DOC}
+
+    with pytest.raises(NotFound):
+        adapter.match(f"{base_path}/invalid", method="PATCH")
 
 
 def test_process_rule_authorizes_document_dataset_before_read(app, documents):
@@ -168,12 +187,6 @@ def test_default_process_rule_does_not_require_dataset_permission(app, documents
             DocumentBatchDownloadZipApi.post,
             lambda service: service.build_download_zip,
             {"dataset_id": DS},
-        ),
-        (
-            DocumentProcessingApi,
-            DocumentProcessingApi.patch,
-            lambda service: service.update_processing,
-            {"dataset_id": DS, "document_id": DOC, "action": "pause"},
         ),
         (
             DocumentMetadataApi,
@@ -321,12 +334,6 @@ def test_no_content_mutations_return_empty_204(app, resource, verb, kwargs):
 @pytest.mark.parametrize(
     ("resource", "verb", "operation", "kwargs"),
     [
-        (
-            DocumentProcessingApi,
-            DocumentProcessingApi.patch,
-            lambda service: service.update_processing,
-            {"document_id": DOC, "action": "resume"},
-        ),
         (DocumentStatusApi, DocumentStatusApi.patch, lambda service: service.change_status, {"action": "disable"}),
         (
             WebsiteDocumentSyncApi,
@@ -425,7 +432,6 @@ def test_indexing_status_keeps_timestamps_counts_and_error_fields(app, documents
             DocumentProviderError("provider", kind="uninitialized"),
             ProviderNotInitializeError,
         ),
-        (controller._raise_document_action_error, DocumentInvalidActionError("invalid"), InvalidActionError),
         (controller._raise_document_status_error, DocumentInvalidActionError("invalid"), InvalidActionError),
         (controller._raise_document_status_error, DocumentIndexingStateError("indexing"), DocumentIndexingError),
         (controller._raise_document_archive_error, DocumentArchivedError(), ArchivedDocumentImmutableError),

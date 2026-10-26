@@ -6,10 +6,11 @@ import threading
 import time
 import uuid
 from collections.abc import Generator, Mapping
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, Protocol, cast, overload
 
 from flask import Flask, current_app
 from pydantic import ValidationError
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -42,6 +43,7 @@ from core.repositories.factory import (
     WorkflowExecutionRepository,
     WorkflowNodeExecutionRepository,
 )
+from core.workflow.file_reference import resolve_local_file_record_id
 from extensions.ext_database import db
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError
 from graphon.variable_loader import DUMMY_VARIABLE_LOADER, VariableLoader
@@ -50,15 +52,32 @@ from libs.flask_utils import preserve_flask_contexts
 from models import Account, EndUser, Workflow, WorkflowNodeExecutionTriggeredFrom
 from models.dataset import Document, DocumentPipelineExecutionLog, Pipeline, build_built_in_field_values
 from models.enums import WorkflowRunTriggeredFrom
-from models.model import AppMode
+from models.model import AppMode, UploadFile
 from services.data_source.provider_service import DatasourceProviderService
 from services.rag_pipeline.rag_pipeline_task_proxy import RagPipelineTaskProxy
 from services.workflow_draft_variable_service import DraftVarLoader, WorkflowDraftVariableService
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 logger = logging.getLogger(__name__)
+
+
+class PipelineIndexingRequestWriter(Protocol):
+    """Persist request identities owned by published pipeline documents."""
+
+    def __call__(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        pipeline_id: str,
+        pipeline_execution_log_ids: Mapping[str, str],
+        actor_id: str,
+        source_actor_id: str | None = None,
+    ) -> Mapping[str, str]: ...
 
 
 class PipelineGenerator(BaseAppGenerator):
@@ -68,10 +87,14 @@ class PipelineGenerator(BaseAppGenerator):
         execution_driver: "WorkflowRunDriver",
         documents: PipelineDocumentStore,
         datasource_providers: DatasourceProviderService,
+        external_retrieval: "ExternalDatasetRetriever",
+        indexing_requests: PipelineIndexingRequestWriter,
     ) -> None:
         self._execution_driver = execution_driver
         self._documents = documents
         self._datasource_providers = datasource_providers
+        self._external_retrieval = external_retrieval
+        self._indexing_requests = indexing_requests
 
     @overload
     def generate(
@@ -85,8 +108,11 @@ class PipelineGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: Literal[True],
         call_depth: int,
-        workflow_thread_pool_id: str | None,
         is_retry: bool = False,
+        indexing_request_id: str | None = None,
+        indexing_claim_id: str | None = None,
+        target_document_id: str | None = None,
+        enforce_projected_capacity: bool | None = None,
     ) -> Generator[Mapping | str]: ...
 
     @overload
@@ -101,8 +127,11 @@ class PipelineGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: Literal[False],
         call_depth: int,
-        workflow_thread_pool_id: str | None,
         is_retry: bool = False,
+        indexing_request_id: str | None = None,
+        indexing_claim_id: str | None = None,
+        target_document_id: str | None = None,
+        enforce_projected_capacity: bool | None = None,
     ) -> Mapping[str, Any]: ...
 
     @overload
@@ -117,8 +146,11 @@ class PipelineGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: bool,
         call_depth: int,
-        workflow_thread_pool_id: str | None,
         is_retry: bool = False,
+        indexing_request_id: str | None = None,
+        indexing_claim_id: str | None = None,
+        target_document_id: str | None = None,
+        enforce_projected_capacity: bool | None = None,
     ) -> Mapping[str, Any] | Generator[Mapping | str]: ...
 
     def generate(
@@ -132,14 +164,30 @@ class PipelineGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: bool = True,
         call_depth: int = 0,
-        workflow_thread_pool_id: str | None = None,
         is_retry: bool = False,
+        indexing_request_id: str | None = None,
+        indexing_claim_id: str | None = None,
+        target_document_id: str | None = None,
+        enforce_projected_capacity: bool | None = None,
     ) -> Mapping[str, Any] | Generator[Mapping | str] | None:
         # Add null check for dataset
 
-        dataset = self._documents.get_pipeline_dataset(pipeline, session=session)
+        dataset = self._documents.get_pipeline_dataset(
+            pipeline,
+            session=session,
+            lock=False,
+        )
         if not dataset:
             raise ValueError("Pipeline dataset is required")
+        if is_retry:
+            # The retry execution Session is dedicated to this call. Its only
+            # transaction so far is the Dataset lookup above; detach every ORM
+            # value used below and end that transaction before datasource
+            # plugins or the workflow worker can perform external I/O.
+            for snapshot in (dataset, pipeline, workflow, user):
+                if sa_inspect(snapshot).session is session:
+                    session.expunge(snapshot)
+            session.rollback()
         inputs: Mapping[str, Any] = args["inputs"]
         start_node_id: str = args["start_node_id"]
         datasource_type = DatasourceProviderType(args["datasource_type"])
@@ -151,6 +199,16 @@ class PipelineGenerator(BaseAppGenerator):
         pipeline_config = PipelineConfigManager.get_pipeline_config(
             pipeline=pipeline, workflow=workflow, start_node_id=start_node_id
         )
+        prepared_inputs = self._prepare_user_inputs(
+            user_inputs=inputs,
+            variables=pipeline_config.rag_pipeline_variables,
+            tenant_id=pipeline.tenant_id,
+            strict_type_validation=invoke_from == InvokeFrom.SERVICE_API,
+        )
+        if enforce_projected_capacity is None:
+            enforce_projected_capacity = not bool(args.get("original_document_id"))
+        if is_retry and target_document_id is None:
+            raise ValueError("Pipeline retry target document is required")
         documents: list[Document] = []
         if invoke_from == InvokeFrom.PUBLISHED_PIPELINE and not is_retry and not args.get("original_document_id"):
             from services.feature_service import FeatureService
@@ -158,6 +216,30 @@ class PipelineGenerator(BaseAppGenerator):
 
             features = FeatureService.get_features(pipeline.tenant_id)
             DocumentService.check_document_creation_limits(len(datasource_info_list), features)
+
+            locked_dataset = self._documents.get_pipeline_dataset(pipeline, session=session, lock=True)
+            if locked_dataset is None or locked_dataset.id != dataset.id:
+                raise ValueError("Pipeline dataset is required")
+            dataset = locked_dataset
+
+            if datasource_type == DatasourceProviderType.LOCAL_FILE:
+                upload_file_ids = [resolve_local_file_record_id(info) for info in datasource_info_list]
+                if any(file_id is None for file_id in upload_file_ids):
+                    raise ValueError("Local file reference is required")
+                normalized_file_ids = sorted({cast(str, file_id) for file_id in upload_file_ids})
+                owned_file_ids = set(
+                    session.scalars(
+                        select(UploadFile.id)
+                        .where(
+                            UploadFile.tenant_id == pipeline.tenant_id,
+                            UploadFile.id.in_(normalized_file_ids),
+                        )
+                        .order_by(UploadFile.id)
+                        .with_for_update(read=True)
+                    )
+                )
+                if owned_file_ids != set(normalized_file_ids):
+                    raise ValueError("Local file does not exist")
 
             for datasource_info in datasource_info_list:
                 position = DocumentService.get_documents_position(dataset.id, session)
@@ -177,13 +259,30 @@ class PipelineGenerator(BaseAppGenerator):
                 documents.append(document)
             session.flush()
 
-        # run in child thread
-        rag_pipeline_invoke_entities = []
-        for i, datasource_info in enumerate(datasource_info_list):
-            workflow_run_id = str(uuid.uuid4())
-            document_id = args.get("original_document_id") or None
-            if invoke_from == InvokeFrom.PUBLISHED_PIPELINE and not is_retry:
-                document_id = document_id or documents[i].id
+        if (
+            invoke_from == InvokeFrom.PUBLISHED_PIPELINE
+            and not is_retry
+            and args.get("original_document_id") is not None
+        ):
+            locked_dataset = self._documents.get_pipeline_dataset(pipeline, session=session, lock=True)
+            if locked_dataset is None or locked_dataset.id != dataset.id:
+                raise ValueError("Pipeline dataset is required")
+            dataset = locked_dataset
+
+        pipeline_request_ids: Mapping[str, str] = {}
+        if invoke_from == InvokeFrom.PUBLISHED_PIPELINE and not is_retry:
+            if not isinstance(user, Account):
+                raise ValueError("Published pipeline indexing requires an account actor")
+            original_document_id = args.get("original_document_id")
+            document_ids = (
+                (str(original_document_id),)
+                if original_document_id is not None
+                else tuple(document.id for document in documents)
+            )
+            if len(document_ids) != len(datasource_info_list):
+                raise ValueError("Pipeline datasource does not match document")
+            pipeline_execution_log_ids: dict[str, str] = {}
+            for document_id, datasource_info in zip(document_ids, datasource_info_list, strict=True):
                 document_pipeline_execution_log = DocumentPipelineExecutionLog(
                     document_id=document_id,
                     datasource_type=datasource_type,
@@ -192,8 +291,34 @@ class PipelineGenerator(BaseAppGenerator):
                     input_data=dict(inputs),
                     pipeline_id=pipeline.id,
                     created_by=user.id,
+                    workflow_id=workflow.id,
+                    original_document_id=str(original_document_id) if original_document_id is not None else None,
                 )
                 session.add(document_pipeline_execution_log)
+                session.flush()
+                pipeline_execution_log_ids[document_id] = document_pipeline_execution_log.id
+            pipeline_request_ids = self._indexing_requests(
+                session,
+                tenant_id=pipeline.tenant_id,
+                dataset_id=dataset.id,
+                pipeline_id=pipeline.id,
+                pipeline_execution_log_ids=pipeline_execution_log_ids,
+                actor_id=user.id,
+                source_actor_id=user.id,
+            )
+
+        # run in child thread
+        rag_pipeline_invoke_entities = []
+        for i, datasource_info in enumerate(datasource_info_list):
+            workflow_run_id = str(uuid.uuid4())
+            document_id = target_document_id if is_retry else args.get("original_document_id") or None
+            if invoke_from == InvokeFrom.PUBLISHED_PIPELINE and not is_retry:
+                document_id = document_id or documents[i].id
+            entity_request_id = indexing_request_id
+            if invoke_from == InvokeFrom.PUBLISHED_PIPELINE and not is_retry:
+                if document_id is None:
+                    raise ValueError("Published pipeline document is required")
+                entity_request_id = pipeline_request_ids[document_id]
             application_generate_entity = RagPipelineGenerateEntity(
                 task_id=str(uuid.uuid4()),
                 app_config=pipeline_config,
@@ -201,16 +326,16 @@ class PipelineGenerator(BaseAppGenerator):
                 datasource_type=datasource_type,
                 datasource_info=datasource_info,
                 dataset_id=dataset.id,
-                original_document_id=None if is_retry else args.get("original_document_id"),
+                original_document_id=(
+                    args.get("original_document_id") if not is_retry or indexing_claim_id is not None else None
+                ),
+                enforce_projected_capacity=enforce_projected_capacity,
+                indexing_request_id=entity_request_id,
+                indexing_claim_id=indexing_claim_id,
                 start_node_id=start_node_id,
                 batch=batch,
                 document_id=document_id,
-                inputs=self._prepare_user_inputs(
-                    user_inputs=inputs,
-                    variables=pipeline_config.rag_pipeline_variables,
-                    tenant_id=pipeline.tenant_id,
-                    strict_type_validation=invoke_from == InvokeFrom.SERVICE_API,
-                ),
+                inputs=prepared_inputs,
                 files=[],
                 user_id=user.id,
                 stream=streaming,
@@ -249,13 +374,13 @@ class PipelineGenerator(BaseAppGenerator):
                     context=contextvars.copy_context(),
                     pipeline=pipeline,
                     workflow_id=workflow.id,
+                    workflow=workflow if is_retry else None,
                     user=user,
                     application_generate_entity=application_generate_entity,
                     invoke_from=invoke_from,
                     workflow_execution_repository=workflow_execution_repository,
                     workflow_node_execution_repository=workflow_node_execution_repository,
                     streaming=streaming,
-                    workflow_thread_pool_id=workflow_thread_pool_id,
                 )
             else:
                 rag_pipeline_invoke_entities.append(
@@ -266,7 +391,6 @@ class PipelineGenerator(BaseAppGenerator):
                         workflow_id=workflow.id,
                         streaming=streaming,
                         workflow_execution_id=workflow_run_id,
-                        workflow_thread_pool_id=workflow_thread_pool_id,
                         application_generate_entity=application_generate_entity.model_dump(),
                     )
                 )
@@ -307,6 +431,7 @@ class PipelineGenerator(BaseAppGenerator):
         context: contextvars.Context,
         pipeline: Pipeline,
         workflow_id: str,
+        workflow: Workflow | None = None,
         user: Account | EndUser,
         application_generate_entity: RagPipelineGenerateEntity,
         invoke_from: InvokeFrom,
@@ -314,7 +439,6 @@ class PipelineGenerator(BaseAppGenerator):
         workflow_node_execution_repository: WorkflowNodeExecutionRepository,
         streaming: bool = True,
         variable_loader: VariableLoader = DUMMY_VARIABLE_LOADER,
-        workflow_thread_pool_id: str | None = None,
     ) -> Mapping[str, Any] | Generator[str | Mapping[str, Any]]:
         """
         Generate App response.
@@ -327,11 +451,15 @@ class PipelineGenerator(BaseAppGenerator):
         :param workflow_execution_repository: repository for workflow execution
         :param workflow_node_execution_repository: repository for workflow node execution
         :param streaming: is stream
-        :param workflow_thread_pool_id: workflow thread pool id
         """
         with preserve_flask_contexts(flask_app, context_vars=context):
             # init queue manager
-            workflow = session.get(Workflow, workflow_id)
+            if workflow is not None and (
+                workflow.id != workflow_id or workflow.tenant_id != pipeline.tenant_id or workflow.app_id != pipeline.id
+            ):
+                raise ValueError(f"Workflow not found: {workflow_id}")
+            if workflow is None:
+                workflow = session.get(Workflow, workflow_id)
             if not workflow:
                 raise ValueError(f"Workflow not found: {workflow_id}")
             queue_manager = PipelineQueueManager(
@@ -350,7 +478,6 @@ class PipelineGenerator(BaseAppGenerator):
                     "context": context,
                     "queue_manager": queue_manager,
                     "application_generate_entity": application_generate_entity,
-                    "workflow_thread_pool_id": workflow_thread_pool_id,
                     "variable_loader": variable_loader,
                     "workflow_execution_repository": workflow_execution_repository,
                     "workflow_node_execution_repository": workflow_node_execution_repository,
@@ -420,7 +547,7 @@ class PipelineGenerator(BaseAppGenerator):
             pipeline=pipeline, workflow=workflow, start_node_id=args.get("start_node_id", "shared")
         )
 
-        dataset = self._documents.get_pipeline_dataset(pipeline, session=session)
+        dataset = self._documents.get_pipeline_dataset(pipeline, session=session, lock=False)
         if not dataset:
             raise ValueError("Pipeline dataset is required")
 
@@ -517,7 +644,7 @@ class PipelineGenerator(BaseAppGenerator):
         if args.get("inputs") is None:
             raise ValueError("inputs is required")
 
-        dataset = self._documents.get_pipeline_dataset(pipeline, session=session)
+        dataset = self._documents.get_pipeline_dataset(pipeline, session=session, lock=False)
         if not dataset:
             raise ValueError("Pipeline dataset is required")
 
@@ -599,14 +726,12 @@ class PipelineGenerator(BaseAppGenerator):
         variable_loader: VariableLoader,
         workflow_execution_repository: WorkflowExecutionRepository,
         workflow_node_execution_repository: WorkflowNodeExecutionRepository,
-        workflow_thread_pool_id: str | None = None,
     ) -> None:
         """
         Generate worker in a new thread.
         :param flask_app: Flask app
         :param application_generate_entity: application generate entity
         :param queue_manager: queue manager
-        :param workflow_thread_pool_id: workflow thread pool id
         :return:
         """
 
@@ -643,11 +768,11 @@ class PipelineGenerator(BaseAppGenerator):
                         execution_driver=self._execution_driver,
                         application_generate_entity=application_generate_entity,
                         queue_manager=queue_manager,
-                        workflow_thread_pool_id=workflow_thread_pool_id,
                         variable_loader=variable_loader,
                         workflow=workflow,
                         system_user_id=system_user_id,
                         documents=self._documents,
+                        external_retrieval=self._external_retrieval,
                     )
 
                     self._execution_driver(

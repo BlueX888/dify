@@ -1,10 +1,12 @@
 from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom, build_dify_run_context
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from graphon.engine import Engine
 from graphon.engine.command import InMemoryChannel
 from graphon.engine_events import GraphRunSucceededEvent, NodeEvent
 from graphon.graph import Graph
 from graphon.runtime import InitParams, RuntimeState, VariablePool
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 
 
 def test_unconfigured_disconnected_agent_does_not_block_workflow() -> None:
@@ -30,7 +32,12 @@ def test_unconfigured_disconnected_agent_does_not_block_workflow() -> None:
     )
     graph = Graph.init(
         graph_config=graph_config,
-        node_factory=DifyNodeFactory(graph_init_params, graph_runtime_state),
+        node_factory=DifyNodeFactory(
+            graph_init_params,
+            graph_runtime_state,
+            external_retrieval=make_external_dataset_retriever(),
+            knowledge_index_runtime=build_knowledge_index_runtime(),
+        ),
         root_node_id="start",
     )
     engine = Engine(

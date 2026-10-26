@@ -175,7 +175,11 @@ function setup({
 
 beforeEach(() => {
   api.replace.mockReset()
-  api.crawl.mockReset().mockResolvedValue({ job_id: 'crawl-job' })
+  api.crawl.mockReset().mockResolvedValue({
+    status: 'active',
+    job_id: 'crawl-job',
+    source_handle: 'crawl-source-handle',
+  })
   api.crawlStatus.mockReset().mockResolvedValue({
     status: 'completed',
     total: 1,
@@ -457,6 +461,7 @@ it('carries the selected crawl provider, job, pages and edited options into docu
     url: 'https://example.com/handbook',
     options: expect.objectContaining({ limit: 20 }),
   })
+  expect(api.crawlStatus).toHaveBeenCalledWith('crawl-job', 'crawl-source-handle')
   await openConfiguration(user)
   await user.click(screen.getByRole('button', { name: 'datasetCreation.stepTwo.previousStep' }))
   await user.click(screen.getByRole('radio', { name: /Firecrawl/ }))
@@ -472,6 +477,7 @@ it('carries the selected crawl provider, job, pages and edited options into docu
           website_info_list: expect.objectContaining({
             provider: 'firecrawl',
             job_id: 'crawl-job',
+            source_handle: 'crawl-source-handle',
             urls: ['https://example.com/handbook'],
             only_main_content: true,
           }),
@@ -482,4 +488,70 @@ it('carries the selected crawl provider, job, pages and edited options into docu
   expect(
     await screen.findByRole('heading', { name: 'datasetCreation.stepThree.creationTitle' }),
   ).toBeInTheDocument()
+})
+
+it('keeps the server-issued source handle paired with its crawl when job ids are identical', async () => {
+  api.sources.mockResolvedValue({ result: [source('firecrawl')] })
+  api.crawl
+    .mockResolvedValueOnce({
+      status: 'active',
+      job_id: 'shared-job',
+      source_handle: 'source-a',
+    })
+    .mockResolvedValueOnce({
+      status: 'active',
+      job_id: 'shared-job',
+      source_handle: 'source-b',
+    })
+  api.crawlStatus.mockImplementation(async (_jobId, sourceHandle) => ({
+    status: 'completed',
+    total: 1,
+    data: [
+      {
+        title: `Page ${sourceHandle}`,
+        markdown: `Content ${sourceHandle}`,
+        description: sourceHandle,
+        source_url: `https://${sourceHandle}.example.com`,
+      },
+    ],
+  }))
+
+  const { user } = setup()
+  await user.click(
+    await screen.findByRole('radio', { name: 'datasetCreation.stepOne.dataSourceType.web' }),
+  )
+  await user.click(screen.getByRole('radio', { name: /Firecrawl/ }))
+  const urlInput = screen.getByPlaceholderText(/^https:\/\//)
+  const runButton = screen.getByRole('button', { name: 'datasetCreation.stepOne.website.run' })
+
+  await user.type(urlInput, 'https://source-a.example.com')
+  await user.click(runButton)
+  expect(await screen.findByText('Page source-a')).toBeInTheDocument()
+
+  await user.clear(urlInput)
+  await user.type(urlInput, 'https://source-b.example.com')
+  await user.click(runButton)
+  expect(await screen.findByText('Page source-b')).toBeInTheDocument()
+
+  expect(api.crawlStatus).toHaveBeenNthCalledWith(1, 'shared-job', 'source-a')
+  expect(api.crawlStatus).toHaveBeenNthCalledWith(2, 'shared-job', 'source-b')
+
+  await openConfiguration(user)
+  await user.click(screen.getByRole('button', { name: 'datasetCreation.stepTwo.nextStep' }))
+  expect(api.create).toHaveBeenCalledWith({
+    body: expect.objectContaining({
+      data_source: {
+        type: 'website_crawl',
+        info_list: {
+          data_source_type: 'website_crawl',
+          website_info_list: expect.objectContaining({
+            provider: 'firecrawl',
+            job_id: 'shared-job',
+            source_handle: 'source-b',
+            urls: ['https://source-b.example.com'],
+          }),
+        },
+      },
+    }),
+  })
 })

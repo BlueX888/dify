@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import inspect
-from unittest.mock import MagicMock, patch
+from dataclasses import dataclass
+from unittest.mock import MagicMock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
@@ -11,6 +12,7 @@ from flask import Flask
 from werkzeug.exceptions import NotFound
 
 from controllers.common.controller_schemas import MessageFeedbackPayload
+from controllers.web import message as message_module
 from controllers.web.error import (
     AppMoreLikeThisDisabledError,
     NotChatAppError,
@@ -22,10 +24,29 @@ from controllers.web.message import (
     MessageMoreLikeThisQuery,
     MessageSuggestedQuestionApi,
 )
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models.model import App, AppMode, EndUser
 from services.errors.app import MoreLikeThisDisabledError
 from services.errors.message import MessageNotExistsError
 from tests.unit_tests.model_factories import make_end_user
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeServicesStub:
+    external_retrieval: ExternalDatasetRetriever
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationServicesStub:
+    knowledge: _KnowledgeServicesStub
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> ExternalDatasetRetriever:
+    port = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = _ApplicationServicesStub(knowledge=_KnowledgeServicesStub(external_retrieval=port))
+    monkeypatch.setattr(message_module, "application_services", lambda: services)
+    return port
 
 
 def _chat_app() -> App:
@@ -99,7 +120,13 @@ class TestMessageMoreLikeThisApi:
 
     @patch("controllers.web.message.helper.compact_generate_response", return_value={"answer": "similar"})
     @patch("controllers.web.message.AppGenerateService.generate_more_like_this")
-    def test_happy_path(self, mock_gen: MagicMock, mock_compact: MagicMock, app: Flask) -> None:
+    def test_happy_path(
+        self,
+        mock_gen: MagicMock,
+        mock_compact: MagicMock,
+        app: Flask,
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         msg_id = uuid4()
         mock_gen.return_value = "response"
         query = MessageMoreLikeThisQuery.model_validate({"response_mode": "blocking"})
@@ -111,6 +138,7 @@ class TestMessageMoreLikeThisApi:
             )
 
         assert result == {"answer": "similar"}
+        assert mock_gen.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch(
         "controllers.web.message.AppGenerateService.generate_more_like_this",

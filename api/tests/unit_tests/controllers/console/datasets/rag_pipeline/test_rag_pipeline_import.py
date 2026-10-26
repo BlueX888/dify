@@ -343,6 +343,7 @@ def test_creator_binding_only_after_successful_new_dataset_commit(
     service.import_rag_pipeline.return_value = result
     service.confirm_import.return_value = result
     events: list[str] = []
+    service.finalize_committed_import.side_effect = lambda: events.append("finalize")
     session = Session(db.engine, expire_on_commit=False)
     commit = session.commit
     close = session.close
@@ -391,8 +392,10 @@ def test_creator_binding_only_after_successful_new_dataset_commit(
             response, _ = invoke()
             assert "dataset_created" not in response
         assert sync.call_count == expected_calls
+        expected_finalize_calls = int(not commit_fails and import_status != ImportStatus.FAILED)
+        assert service.finalize_committed_import.call_count == expected_finalize_calls
         if expected_calls:
-            assert events == ["commit", "close", "sync"]
+            assert events == ["commit", "finalize", "close", "sync"]
             sync.assert_called_once_with(
                 "tenant-1",
                 "creator-1",

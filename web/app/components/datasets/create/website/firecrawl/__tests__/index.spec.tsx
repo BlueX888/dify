@@ -175,7 +175,10 @@ describe('FireCrawl', () => {
 
     it('accepts an http URL and selects the returned results', async () => {
       const user = userEvent.setup()
-      mockCreateFirecrawlTask.mockResolvedValueOnce({ job_id: 'test-job-id' })
+      mockCreateFirecrawlTask.mockResolvedValueOnce({
+        job_id: 'test-job-id',
+        source_handle: 'firecrawl-source-handle',
+      })
       mockCheckFirecrawlTaskStatus.mockResolvedValueOnce({
         status: 'completed',
         data: [],
@@ -202,7 +205,10 @@ describe('FireCrawl', () => {
   describe('Crawl Execution', () => {
     it('should call createFirecrawlTask with correct parameters', async () => {
       const user = userEvent.setup()
-      mockCreateFirecrawlTask.mockResolvedValueOnce({ job_id: 'test-job-id' })
+      mockCreateFirecrawlTask.mockResolvedValueOnce({
+        job_id: 'test-job-id',
+        source_handle: 'firecrawl-source-handle',
+      })
       mockCheckFirecrawlTaskStatus.mockResolvedValueOnce({
         status: 'completed',
         data: [],
@@ -220,8 +226,11 @@ describe('FireCrawl', () => {
       await user.click(runButton)
 
       await waitFor(() => {
-        expect(mockOnJobIdChange).toHaveBeenCalledWith('test-job-id')
-        expect(mockCheckFirecrawlTaskStatus).toHaveBeenCalledWith('test-job-id')
+        expect(mockOnJobIdChange).toHaveBeenCalledWith('test-job-id', 'firecrawl-source-handle')
+        expect(mockCheckFirecrawlTaskStatus).toHaveBeenCalledWith(
+          'test-job-id',
+          'firecrawl-source-handle',
+        )
         expect(mockCreateFirecrawlTask).toHaveBeenCalledWith({
           url: 'https://example.com',
           options: createMockCrawlOptions(),
@@ -312,7 +321,10 @@ describe('FireCrawl', () => {
   describe('Crawl Status Polling', () => {
     it('should handle missing status as error', async () => {
       const user = userEvent.setup()
-      mockCreateFirecrawlTask.mockResolvedValueOnce({ job_id: 'test-job' })
+      mockCreateFirecrawlTask.mockResolvedValueOnce({
+        job_id: 'test-job',
+        source_handle: 'firecrawl-polling-source-handle',
+      })
       mockCheckFirecrawlTaskStatus.mockResolvedValueOnce({
         status: undefined,
         message: 'No status',
@@ -334,7 +346,10 @@ describe('FireCrawl', () => {
 
     it('shows capped progress before polling the same job to completion', async () => {
       const user = userEvent.setup()
-      mockCreateFirecrawlTask.mockResolvedValueOnce({ job_id: 'test-job' })
+      mockCreateFirecrawlTask.mockResolvedValueOnce({
+        job_id: 'test-job',
+        source_handle: 'firecrawl-polling-source-handle',
+      })
       const pollDelay = createDeferred<void>()
       vi.mocked(sleep).mockReturnValueOnce(pollDelay.promise)
       mockCheckFirecrawlTaskStatus
@@ -364,7 +379,11 @@ describe('FireCrawl', () => {
       expect(mockCheckFirecrawlTaskStatus).toHaveBeenCalledTimes(1)
       await act(async () => pollDelay.resolve())
       await waitFor(() => expect(mockCheckFirecrawlTaskStatus).toHaveBeenCalledTimes(2))
-      expect(mockCheckFirecrawlTaskStatus).toHaveBeenNthCalledWith(2, 'test-job')
+      expect(mockCheckFirecrawlTaskStatus).toHaveBeenNthCalledWith(
+        2,
+        'test-job',
+        'firecrawl-polling-source-handle',
+      )
       expect(await screen.findByText('Page 1')).toBeInTheDocument()
     })
   })

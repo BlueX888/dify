@@ -2,6 +2,12 @@ name: DB Migration Test
 
 on:
   workflow_call:
+    inputs:
+      run_postgres_migration:
+        description: Run the PostgreSQL migration job in addition to the always-required MySQL job.
+        required: false
+        type: boolean
+        default: true
 
 concurrency:
   group: db-migration-test-${{ github.ref }}
@@ -9,6 +15,7 @@ concurrency:
 
 jobs:
   db-migration-test-postgres:
+    if: inputs.run_postgres_migration
     runs-on: depot-ubuntu-24.04
 
     steps:
@@ -26,7 +33,7 @@ jobs:
           cache-dependency-glob: api/uv.lock
 
       - name: Install dependencies
-        run: uv sync --project api
+        run: uv sync --project api --dev
       - name: Ensure Offline migration are supported
         run: |
           # upgrade
@@ -58,6 +65,14 @@ jobs:
           DEBUG: true
         run: uv run --directory api flask upgrade-db
 
+      - name: Run PostgreSQL query plan regressions
+        env:
+          DEBUG: true
+        run: >-
+          uv run --directory api pytest
+          tests/database_integration_tests/test_workflow_trigger_quota_query_plan.py
+          -q --no-cov
+
   db-migration-test-mysql:
     runs-on: depot-ubuntu-24.04
 
@@ -76,7 +91,7 @@ jobs:
           cache-dependency-glob: api/uv.lock
 
       - name: Install dependencies
-        run: uv sync --project api
+        run: uv sync --project api --dev
       - name: Ensure Offline migration are supported
         run: |
           # upgrade
@@ -136,3 +151,12 @@ jobs:
         env:
           DEBUG: true
         run: uv run --directory api flask upgrade-db
+
+      - name: Run MySQL regression tests
+        env:
+          DEBUG: true
+        run: >-
+          uv run --directory api pytest
+          tests/mysql_integration_tests/
+          tests/database_integration_tests/test_workflow_trigger_quota_query_plan.py
+          -q --no-cov

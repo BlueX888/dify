@@ -22,6 +22,7 @@ from sqlalchemy.orm import Session
 
 from configs import dify_config
 from core.file import remote_fetcher
+from core.rag.extractor.entity.extract_setting import CreatedUploadArtifact
 from core.rag.extractor.extractor_base import BaseExtractor
 from core.rag.models.document import Document
 from extensions.ext_database import db
@@ -44,14 +45,26 @@ class WordExtractor(BaseExtractor):
 
     _closed: bool
     _session: Session | None
+    _persist_images: bool
+    _created_upload_files: list[UploadFile]
 
-    def __init__(self, file_path: str, tenant_id: str, user_id: str, *, session: Session | None = None):
+    def __init__(
+        self,
+        file_path: str,
+        tenant_id: str,
+        user_id: str,
+        *,
+        session: Session | None = None,
+        persist_images: bool = True,
+    ):
         """Initialize with file path."""
         self._closed = False
         self.file_path = file_path
         self.tenant_id = tenant_id
         self.user_id = user_id
         self._session = session
+        self._persist_images = persist_images
+        self._created_upload_files = []
 
         if "~" in self.file_path:
             self.file_path = os.path.expanduser(self.file_path)
@@ -101,6 +114,7 @@ class WordExtractor(BaseExtractor):
     @override
     def extract(self) -> list[Document]:
         """Load given path as single page."""
+        self._created_upload_files = []
         content = self.parse_docx(self.file_path)
         return [
             Document(
@@ -109,6 +123,11 @@ class WordExtractor(BaseExtractor):
             )
         ]
 
+    @property
+    @override
+    def created_upload_artifacts(self) -> tuple[CreatedUploadArtifact, ...]:
+        return tuple(CreatedUploadArtifact(id=upload.id, key=upload.key) for upload in self._created_upload_files)
+
     @staticmethod
     def _is_valid_url(url: str) -> bool:
         """Check if the url is valid."""
@@ -116,6 +135,7 @@ class WordExtractor(BaseExtractor):
         return bool(parsed.netloc) and bool(parsed.scheme)
 
     def _extract_images_from_docx(self, doc):
+        self._created_upload_files = []
         session = self._session or db.session
         image_count = 0
         image_map = {}
@@ -141,8 +161,6 @@ class WordExtractor(BaseExtractor):
                         file_uuid = str(uuid.uuid4())
                         file_key = "image_files/" + self.tenant_id + "/" + file_uuid + image_ext
                         mime_type, _ = mimetypes.guess_type(file_key)
-                        storage.save(file_key, response.content)
-                        # save file to db
                         upload_file = UploadFile(
                             tenant_id=self.tenant_id,
                             storage_type=StorageType(dify_config.STORAGE_TYPE),
@@ -158,6 +176,11 @@ class WordExtractor(BaseExtractor):
                             used_by=self.user_id,
                             used_at=naive_utc_now(),
                         )
+                        self._created_upload_files.append(upload_file)
+                        self.register_created_upload_artifact(
+                            CreatedUploadArtifact(id=upload_file.id, key=upload_file.key)
+                        )
+                        storage.save(file_key, response.content)
                         upload_files.append(upload_file)
                         image_map[r_id] = f"![image]({base_url}/files/{upload_file.id}/file-preview)"
                 else:
@@ -169,8 +192,6 @@ class WordExtractor(BaseExtractor):
                     file_key = "image_files/" + self.tenant_id + "/" + file_uuid + "." + image_ext
                     mime_type, _ = mimetypes.guess_type(file_key)
 
-                    storage.save(file_key, rel.target_part.blob)
-                    # save file to db
                     upload_file = UploadFile(
                         tenant_id=self.tenant_id,
                         storage_type=StorageType(dify_config.STORAGE_TYPE),
@@ -186,6 +207,9 @@ class WordExtractor(BaseExtractor):
                         used_by=self.user_id,
                         used_at=naive_utc_now(),
                     )
+                    self._created_upload_files.append(upload_file)
+                    self.register_created_upload_artifact(CreatedUploadArtifact(id=upload_file.id, key=upload_file.key))
+                    storage.save(file_key, rel.target_part.blob)
                     upload_files.append(upload_file)
                     image_map[rel.target_part] = f"![image]({base_url}/files/{upload_file.id}/file-preview)"
         if upload_files:
@@ -301,7 +325,7 @@ class WordExtractor(BaseExtractor):
 
         content: list[str] = []
 
-        image_map = self._extract_images_from_docx(doc)
+        image_map = self._extract_images_from_docx(doc) if self._persist_images else {}
 
         def parse_paragraph(paragraph):
             def append_image_link(image_id, has_drawing, target_buffer):

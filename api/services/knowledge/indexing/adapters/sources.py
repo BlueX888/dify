@@ -11,6 +11,7 @@ from core.rag.extractor.entity.extract_setting import (
     StoredDocumentExtractionInput,
     UploadFileExtractionInput,
     WebsiteInfo,
+    WebsiteJobRef,
 )
 from services.data_source.credential_gateway import (
     ActorDatasourceCredentialResolver,
@@ -28,6 +29,8 @@ from services.knowledge.indexing.estimate import StoredSource
 
 _NOTION_PROVIDER = "notion_datasource"
 _NOTION_PLUGIN = "langgenius/notion_datasource"
+_WEBSITE_PROVIDERS = frozenset({"firecrawl", "watercrawl", "jinareader"})
+_WEBSITE_MODES = frozenset({"crawl", "scrape"})
 
 
 class StoredSourceAdapter(Protocol):
@@ -38,6 +41,26 @@ class StoredSourceAdapter(Protocol):
 
 class KnowledgeUploadCatalog(Protocol):
     def get_by_ids(self, *, workspace_id: str, file_ids: Sequence[str]) -> Mapping[str, UploadFileExtractionInput]: ...
+
+
+class WebsiteJobResolver(Protocol):
+    def resolve_job_ref(
+        self, *, tenant_id: str, provider: str, job_id: str, source_handle: str | None = None
+    ) -> WebsiteJobRef: ...
+
+    def resolve_stored_job_ref(self, *, tenant_id: str, provider: str, job_id: str) -> WebsiteJobRef: ...
+
+
+class WebsiteSourceMigrationStore(Protocol):
+    def persist_legacy_job_ref(
+        self,
+        *,
+        workspace_id: str,
+        dataset_id: str,
+        document_id: str,
+        expected_source_info: Mapping[str, object],
+        job_ref: WebsiteJobRef,
+    ) -> None: ...
 
 
 class FileSourceAdapter:
@@ -82,15 +105,54 @@ class FileSourceAdapter:
 
 
 class WebsiteSourceAdapter:
+    def __init__(
+        self,
+        *,
+        jobs: WebsiteJobResolver | None = None,
+        migrations: WebsiteSourceMigrationStore | None = None,
+    ) -> None:
+        self._jobs = jobs
+        self._migrations = migrations
+
     def resolve(self, source: StoredSource) -> ExtractSetting:
         info = _required_info(source, "no website crawl info found")
-        return self.resolve_selection(
-            workspace_id=source.document_ref.dataset.tenant_id,
-            provider=_required_string(info, "provider"),
-            job_id=_required_string(info, "job_id"),
-            url=_required_string(info, "url"),
-            mode=_required_string(info, "mode"),
-            only_main_content=bool(info.get("only_main_content", False)),
+        provider = _required_string(info, "provider")
+        mode = _required_string(info, "mode")
+        workspace_id = source.document_ref.dataset.tenant_id
+        job_id = _website_job_id(info, provider=provider, mode=mode)
+        provider_instance_id = _string_value(info, "provider_instance_id")
+        if provider_instance_id is None:
+            job_ref = self._resolve_stored_job_ref(workspace_id=workspace_id, provider=provider, job_id=job_id)
+            if self._migrations is not None:
+                ref = source.document_ref
+                try:
+                    self._migrations.persist_legacy_job_ref(
+                        workspace_id=ref.dataset.tenant_id,
+                        dataset_id=ref.dataset.dataset_id,
+                        document_id=ref.document_id,
+                        expected_source_info=info,
+                        job_ref=job_ref,
+                    )
+                except ValueError as error:
+                    raise IndexingInputSourceError(str(error)) from error
+        else:
+            try:
+                job_ref = WebsiteJobRef(
+                    tenant_id=workspace_id,
+                    provider=provider,
+                    provider_instance_id=provider_instance_id,
+                    job_id=job_id,
+                )
+            except ValueError as error:
+                raise IndexingInputSourceError("invalid data source field: provider_instance_id") from error
+        return ExtractSetting(
+            datasource_type=DatasourceType.WEBSITE,
+            website_info=WebsiteInfo(
+                job_ref=job_ref,
+                url=_required_string(info, "url"),
+                mode=mode,
+                only_main_content=bool(info.get("only_main_content", False)),
+            ),
             document_model=source.document_model,
         )
 
@@ -100,23 +162,52 @@ class WebsiteSourceAdapter:
         workspace_id: str,
         provider: str,
         job_id: str,
+        source_handle: str | None,
         url: str,
         mode: str,
         only_main_content: bool,
         document_model: str,
     ) -> ExtractSetting:
+        job_id = _website_job_id({"job_id": job_id}, provider=provider, mode=mode)
+        job_ref = self._resolve_job_ref(
+            workspace_id=workspace_id,
+            provider=provider,
+            job_id=job_id,
+            source_handle=source_handle,
+        )
         return ExtractSetting(
             datasource_type=DatasourceType.WEBSITE,
             website_info=WebsiteInfo(
-                provider=provider,
-                job_id=job_id,
+                job_ref=job_ref,
                 url=url,
                 mode=mode,
-                tenant_id=workspace_id,
                 only_main_content=only_main_content,
             ),
             document_model=document_model,
         )
+
+    def _resolve_job_ref(
+        self, *, workspace_id: str, provider: str, job_id: str, source_handle: str | None
+    ) -> WebsiteJobRef:
+        if self._jobs is None:
+            raise IndexingInputSourceError("website source is missing a stable provider instance")
+        try:
+            return self._jobs.resolve_job_ref(
+                tenant_id=workspace_id,
+                provider=provider,
+                job_id=job_id,
+                source_handle=source_handle,
+            )
+        except ValueError as error:
+            raise IndexingInputSourceError(str(error)) from error
+
+    def _resolve_stored_job_ref(self, *, workspace_id: str, provider: str, job_id: str) -> WebsiteJobRef:
+        if self._jobs is None:
+            raise IndexingInputSourceError("website source is missing a stable provider instance")
+        try:
+            return self._jobs.resolve_stored_job_ref(tenant_id=workspace_id, provider=provider, job_id=job_id)
+        except ValueError as error:
+            raise IndexingInputSourceError(str(error)) from error
 
 
 class NotionSourceResolver:
@@ -136,7 +227,12 @@ class NotionSourceResolver:
     def resolve(self, source: StoredSource) -> ExtractSetting:
         info = _required_info(source, "no notion import info found")
         document_ref = source.document_ref
-        credential_id = _string_value(info, "credential_id")
+        credential_id: str | None = None
+        if "credential_id" in info:
+            raw_credential_id = info["credential_id"]
+            if not isinstance(raw_credential_id, str):
+                raise SourceCredentialUnavailableError("Notion credential is unavailable")
+            credential_id = raw_credential_id
         token = self._stored_token(source, credential_id)
         return self._prepared(
             tenant_id=document_ref.dataset.tenant_id,
@@ -243,9 +339,14 @@ class CompositeStoredSourceResolver:
             raise UnsupportedStoredSourceError(source.source_type)
         return adapter.resolve(source)
 
-    def resolve_for_indexing(self, source: StoredSource) -> ExtractSetting:
+    def resolve_for_indexing(
+        self,
+        source: StoredSource,
+        *,
+        attach_document_for_updates: bool = True,
+    ) -> ExtractSetting:
         setting = self.resolve(source)
-        if setting.notion_info is not None:
+        if setting.notion_info is not None and attach_document_for_updates:
             ref = source.document_ref
             setting.notion_info.document = StoredDocumentExtractionInput(
                 id=ref.document_id,
@@ -272,6 +373,22 @@ def _required_string(info: Mapping[str, object], key: str, message: str | None =
     if value is None:
         raise IndexingInputSourceError(message or f"invalid data source field: {key}")
     return value
+
+
+def _website_job_id(info: Mapping[str, object], *, provider: str, mode: str) -> str:
+    if provider not in _WEBSITE_PROVIDERS:
+        raise IndexingInputSourceError("invalid data source field: provider")
+    if mode not in _WEBSITE_MODES:
+        raise IndexingInputSourceError("invalid data source field: mode")
+    raw_job_id = info.get("job_id", "")
+    if not isinstance(raw_job_id, str):
+        raise IndexingInputSourceError("invalid data source field: job_id")
+    # Firecrawl and WaterCrawl use asynchronous jobs for initial crawl mode.
+    # Jina single-page imports have no job, and scrape mode performs a fresh
+    # provider request, so those two cases intentionally accept an empty ID.
+    if mode == "crawl" and provider != "jinareader" and not raw_job_id:
+        raise IndexingInputSourceError("invalid data source field: job_id")
+    return raw_job_id
 
 
 def _notion_page_type(info: Mapping[str, object]) -> NotionPageType:

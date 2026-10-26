@@ -12,14 +12,19 @@ from typing import Any
 from celery import shared_task
 from sqlalchemy import select
 
+from configs import dify_config
 from core.db.session_factory import session_factory
 from graphon.enums import WorkflowExecutionStatus
 from graphon.workflow_type_encoder import WorkflowRuntimeTypeConverter
 from models import CreatorUserRole, WorkflowRun
 from models.enums import WorkflowRunTriggeredFrom
 from repositories.entities.workflow_execution import WorkflowExecution
+from repositories.workflow_run_history import advance_workflow_run_history
 
 logger = logging.getLogger(__name__)
+_LOGSTORE_EXECUTION_REPOSITORY = (
+    "extensions.logstore.repositories.logstore_workflow_execution_repository.LogstoreWorkflowExecutionRepository"
+)
 
 
 @shared_task(queue="workflow_storage", bind=True, max_retries=3, default_retry_delay=60)
@@ -56,7 +61,12 @@ def save_workflow_execution_task(
 
             if existing_run:
                 # Update existing workflow run
-                _update_workflow_run_from_execution(existing_run, execution)
+                updated = _update_workflow_run_from_execution(existing_run, execution)
+                if updated and (
+                    existing_run.history_revision > 0
+                    or dify_config.CORE_WORKFLOW_EXECUTION_REPOSITORY == _LOGSTORE_EXECUTION_REPOSITORY
+                ):
+                    advance_workflow_run_history(existing_run)
                 logger.debug("Updated existing workflow run: %s", execution.id_)
             else:
                 # Create new workflow run
@@ -68,6 +78,8 @@ def save_workflow_execution_task(
                     creator_user_id=creator_user_id,
                     creator_user_role=CreatorUserRole(creator_user_role),
                 )
+                if dify_config.CORE_WORKFLOW_EXECUTION_REPOSITORY == _LOGSTORE_EXECUTION_REPOSITORY:
+                    advance_workflow_run_history(workflow_run)
                 session.add(workflow_run)
                 logger.debug("Created new workflow run: %s", execution.id_)
 
@@ -122,12 +134,12 @@ def _create_workflow_run_from_execution(
     return workflow_run
 
 
-def _update_workflow_run_from_execution(workflow_run: WorkflowRun, execution: WorkflowExecution):
+def _update_workflow_run_from_execution(workflow_run: WorkflowRun, execution: WorkflowExecution) -> bool:
     """
     Update a WorkflowRun database model from a WorkflowExecution domain entity.
     """
     if workflow_run.stop_requested_at is not None and workflow_run.status == WorkflowExecutionStatus.STOPPED:
-        return
+        return False
     json_converter = WorkflowRuntimeTypeConverter()
     workflow_run.status = execution.status
     workflow_run.outputs = (
@@ -138,3 +150,4 @@ def _update_workflow_run_from_execution(workflow_run: WorkflowRun, execution: Wo
     workflow_run.total_tokens = execution.total_tokens
     workflow_run.total_steps = execution.total_steps
     workflow_run.finished_at = execution.finished_at
+    return True

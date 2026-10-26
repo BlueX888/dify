@@ -12,7 +12,7 @@ from models.model import Account, App, EndUser
 from models.workflow import Workflow
 from repositories.knowledge.dataset_read_repository import get_pipeline_dataset
 from services.knowledge.dataset_service import DocumentService
-from services.knowledge.resource_scope import DatasetRef, DocumentRef
+from services.knowledge.entities.resource_scope import DatasetRef, DocumentRef
 from services.rag_pipeline.rag_pipeline import RagPipelineService
 
 
@@ -46,7 +46,19 @@ class PipelineGenerateService:
                     raise ValueError("Pipeline dataset is required")
                 dataset_ref = DatasetRef(tenant_id=dataset.tenant_id, dataset_id=dataset.id)
                 document_ref = dataset_ref.document(original_document_id)
-                cls.update_document_status(document_ref, session=session)
+                if invoke_from == InvokeFrom.PUBLISHED_PIPELINE:
+                    document = next(
+                        iter(
+                            DocumentService.get_documents_by_ids(
+                                document_ref.dataset, [document_ref.document_id], session
+                            )
+                        ),
+                        None,
+                    )
+                    if document is None:
+                        raise ValueError("Pipeline document not found")
+                else:
+                    cls.update_document_status(document_ref, session=session)
             return PipelineGenerator.convert_to_event_stream(
                 generator.generate(
                     session=session,
@@ -57,7 +69,6 @@ class PipelineGenerateService:
                     invoke_from=invoke_from,
                     streaming=streaming,
                     call_depth=0,
-                    workflow_thread_pool_id=None,
                 ),
             )
 

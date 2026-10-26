@@ -3,7 +3,7 @@ import logging
 import threading
 import uuid
 from collections.abc import Generator, Mapping
-from typing import Any, Literal, overload
+from typing import TYPE_CHECKING, Any, Literal, overload
 
 from flask import Flask, copy_current_request_context, current_app
 from pydantic import ValidationError
@@ -24,6 +24,7 @@ from core.app.entities.app_invoke_entities import CompletionAppGenerateEntity, I
 from core.db.session_factory import session_factory
 from core.helper.trace_id_helper import extract_trace_session_id_from_args
 from core.ops.ops_trace_manager import TraceQueueManager
+from core.workflow.node_runtime import build_retrieval_finalizer
 from extensions.ext_database import db
 from factories import file_factory
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError
@@ -32,10 +33,17 @@ from models.model import load_annotation_reply_config
 from services.errors.app import MoreLikeThisDisabledError
 from services.errors.message import MessageNotExistsError
 
+if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+
 logger = logging.getLogger(__name__)
 
 
 class CompletionAppGenerator(MessageBasedAppGenerator):
+    def __init__(self, *, external_retrieval: "ExternalDatasetRetriever") -> None:
+        self._external_retrieval = external_retrieval
+        self._retrieval_finalizer = build_retrieval_finalizer()
+
     @overload
     def generate(
         self,
@@ -244,7 +252,10 @@ class CompletionAppGenerator(MessageBasedAppGenerator):
                 message = self._get_message(message_id)
 
                 # chatbot app
-                runner = CompletionAppRunner()
+                runner = CompletionAppRunner(
+                    external_retrieval=self._external_retrieval,
+                    retrieval_finalizer=self._retrieval_finalizer,
+                )
                 with session_factory.create_session() as session:
                     runner.run(
                         application_generate_entity=application_generate_entity,

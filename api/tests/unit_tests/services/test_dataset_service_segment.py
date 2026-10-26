@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, create_autospec, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from sqlalchemy.orm import Session, sessionmaker
@@ -22,8 +22,15 @@ from models.dataset import (
 from models.enums import DataSourceType, DocumentCreatedFrom, SegmentStatus
 from repositories.knowledge.segment_repository import SQLAlchemySegmentRepository
 from services.knowledge.dataset_service import SegmentService
-from services.knowledge.resource_scope import DatasetRef, DocumentRef, SegmentRef
-from services.knowledge.segments.application import SegmentIndex, SegmentIndexingState, SegmentMutationService
+from services.knowledge.entities.resource_scope import DatasetRef, DocumentRef, SegmentRef
+from services.knowledge.segments.application import (
+    SegmentIndex,
+    SegmentIndexingState,
+    SegmentMutationService,
+    SegmentStateDispatcher,
+    SegmentStateTransitions,
+    SegmentUploadCatalog,
+)
 
 
 def _account(*, account_id: str = "user-1", tenant_id: str = "tenant-1") -> Account:
@@ -306,7 +313,7 @@ class TestSegmentServiceMutations:
 
         mutations.delete_segment.assert_not_called()
 
-    def test_multi_create_segment_marks_each_real_row_error_on_vector_failure(
+    def test_multi_create_segment_does_not_guess_failure_versions_from_an_untyped_index_error(
         self, sqlite_session: Session, sqlite_session_factory: sessionmaker[Session]
     ) -> None:
         dataset = _dataset()
@@ -324,8 +331,11 @@ class TestSegmentServiceMutations:
         mutations = SegmentMutationService(
             store=SQLAlchemySegmentRepository(session_factory=sqlite_session_factory),
             index=index,
+            uploads=create_autospec(SegmentUploadCatalog, instance=True, spec_set=True),
             text_hash=lambda text: text,
             indexing_state=create_autospec(SegmentIndexingState, instance=True, spec_set=True),
+            state_transitions=create_autospec(SegmentStateTransitions, instance=True, spec_set=True),
+            state_dispatcher=create_autospec(SegmentStateDispatcher, instance=True, spec_set=True),
         )
 
         with (
@@ -343,23 +353,34 @@ class TestSegmentServiceMutations:
 
         assert segments is not None
         assert len(segments) == 2
-        assert all(segment.status == SegmentStatus.ERROR and not segment.enabled for segment in segments)
+        assert all(segment.status == SegmentStatus.COMPLETED and segment.enabled for segment in segments)
+        assert all(segment.error is None for segment in segments)
         assert document.word_count == 6
 
-    def test_multi_create_segment_persists_qa_counts_positions_and_tokens(self, sqlite_session: Session) -> None:
+    def test_multi_create_segment_persists_qa_counts_positions_and_tokens(
+        self, sqlite_session: Session, sqlite_session_factory: sessionmaker[Session]
+    ) -> None:
         dataset = _dataset()
         document = _document(doc_form=IndexStructureType.QA_INDEX, word_count=5)
         sqlite_session.add_all([dataset, document, _segment(segment_id="existing")])
         sqlite_session.commit()
-        embedding_model = MagicMock()
-        embedding_model.get_text_embedding_num_tokens.side_effect = [[11], [13]]
-        mutations = create_autospec(SegmentMutationService, instance=True, spec_set=True)
+        index = create_autospec(SegmentIndex, instance=True, spec_set=True)
+        mutations = SegmentMutationService(
+            store=SQLAlchemySegmentRepository(session_factory=sqlite_session_factory),
+            index=index,
+            uploads=create_autospec(SegmentUploadCatalog, instance=True, spec_set=True),
+            text_hash=lambda text: text,
+            indexing_state=create_autospec(SegmentIndexingState, instance=True, spec_set=True),
+            state_transitions=create_autospec(SegmentStateTransitions, instance=True, spec_set=True),
+            state_dispatcher=create_autospec(SegmentStateDispatcher, instance=True, spec_set=True),
+        )
 
         with (
             patch("services.knowledge.dataset_service.current_user", _account()),
             patch("services.knowledge.dataset_service.ModelManager") as manager_cls,
         ):
-            manager_cls.for_tenant.return_value.get_model_instance.return_value = embedding_model
+            embedding_model = manager_cls.for_tenant.return_value.get_model_instance.return_value
+            embedding_model.get_text_embedding_num_tokens.side_effect = [[11], [13]]
             segments = SegmentService.multi_create_segment(
                 [
                     {"content": "question-1", "answer": "answer-1", "keywords": ["key"]},
@@ -383,7 +404,7 @@ class TestSegmentServiceMutations:
         assert embedding_model.get_text_embedding_num_tokens.call_args_list[1].kwargs == {
             "texts": ["question-2answer-2"]
         }
-        mutations.index_segments.assert_called_once_with(
+        index.create_many.assert_called_once_with(
             DatasetRef("tenant-1", "dataset-1").document("document-1"),
             segment_ids=[segment.id for segment in segments],
             keywords_list=[["key"], None],

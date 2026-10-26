@@ -1,9 +1,11 @@
 import json
 import uuid
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from datetime import datetime
 from io import BytesIO
 from typing import Protocol, cast
+from unittest.mock import create_autospec
 
 import pytest
 from flask import Flask
@@ -48,6 +50,7 @@ from controllers.openapi.app_workflow import (
 from controllers.openapi.auth.context import Context
 from controllers.openapi.auth.subjects import AccountSubject
 from core.helper import encrypter
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from extensions.ext_application_services import ApplicationServices
 from graphon.variables import SecretVariable, StringVariable, VariableBase
 from libs.oauth_bearer import AuthContext
@@ -75,6 +78,20 @@ def _identity_secret_encryption(monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep secret variables readable without the workspace key provider."""
     monkeypatch.setattr(encrypter, "encrypt_token", lambda **kwargs: kwargs["token"])
     monkeypatch.setattr(encrypter, "decrypt_token", lambda **kwargs: kwargs["token"])
+
+
+@pytest.fixture
+def external_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    account_application_services: ApplicationServices,
+) -> ExternalDatasetRetriever:
+    port = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = replace(
+        account_application_services,
+        knowledge=replace(account_application_services.knowledge, external_retrieval=port),
+    )
+    monkeypatch.setattr(app_workflow, "application_services", lambda: services)
+    return port
 
 
 def _app_context(session: Session, **view_args: str) -> Context:
@@ -398,7 +415,10 @@ def _upload_part() -> FileStorage:
 
 
 def test_run_draft_node_merges_local_files_into_the_inputs(
-    monkeypatch: pytest.MonkeyPatch, sqlite_session: Session, sqlite_session_factory: sessionmaker[Session]
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     service = _workflow_service(monkeypatch, sqlite_session_factory)
     ctx = _app_context(sqlite_session)
@@ -419,6 +439,7 @@ def test_run_draft_node_merges_local_files_into_the_inputs(
 
     assert merges == [({"x": 1}, parts, ctx.caller)]
     assert [run["user_inputs"] for run in node_runs] == [{"x": 1, "doc": {"id": "file-1"}}]
+    assert node_runs[0]["external_retrieval"] is external_retrieval
 
 
 def test_node_run_payloads_take_files_as_multipart_parts() -> None:
@@ -433,6 +454,7 @@ def test_run_draft_node_ends_the_read_transaction_before_uploading(
     sqlite_session_factory: sessionmaker[Session],
     with_files: bool,
     ends_transaction: bool,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     service = _workflow_service(monkeypatch, sqlite_session_factory)
     ctx = _app_context(sqlite_session)
@@ -445,13 +467,15 @@ def test_run_draft_node_ends_the_read_transaction_before_uploading(
         return inputs
 
     monkeypatch.setattr(app_workflow, "merge_files", merge_files)
-    monkeypatch.setattr(service, "run_draft_workflow_node", lambda **_kwargs: None)
+    node_runs: list[dict[str, object]] = []
+    monkeypatch.setattr(service, "run_draft_workflow_node", lambda **kwargs: node_runs.append(kwargs))
     monkeypatch.setattr(app_workflow, "node_execution_response_source", lambda *_args, **_kwargs: {"id": "e-1"})
     files: UploadParts | None = {"doc": _upload_part()} if with_files else None
 
     run_draft_node(ctx, "n1", inputs={}, query="", files=files)
 
     assert names == (["end", "merge"] if ends_transaction else ["merge"])
+    assert node_runs[0]["external_retrieval"] is external_retrieval
 
 
 def _branch_skipping_graph() -> str:

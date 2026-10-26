@@ -515,7 +515,7 @@ class DatasetListApi(DatasetApiResource):
         "Dataset created successfully",
         service_api_ns.models[DatasetDetailResponse.__name__],
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(DatasetCreatePayload)
     def post(self, payload: DatasetCreatePayload, session: Session, tenant_id):
@@ -542,6 +542,7 @@ class DatasetListApi(DatasetApiResource):
             assert isinstance(current_user, Account)
             dataset = DatasetService.create_empty_dataset(
                 session=session,
+                external_templates=application_services().knowledge.external_templates,
                 tenant_id=tenant_id,
                 name=payload.name,
                 description=payload.description,
@@ -678,8 +679,8 @@ class DatasetApi(DatasetApiResource):
         "Dataset updated successfully",
         service_api_ns.models[DatasetDetailWithPartialMembersResponse.__name__],
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
-    @with_session
+    @cloud_edition_billing_rate_limit_check("knowledge")
+    @with_session(write=False)
     @model_validate(DatasetUpdatePayload)
     def patch(self, payload: DatasetUpdatePayload, session: Session, _, dataset_id: UUID):
         dataset_id_str = str(dataset_id)
@@ -724,27 +725,30 @@ class DatasetApi(DatasetApiResource):
                 payload.partial_member_list,
                 session=session,
             )
-        dataset = DatasetService.update_dataset(dataset_id_str, update_data, current_user, session=session)
+        with DatasetService.update_dataset(
+            dataset_id_str,
+            update_data,
+            current_user,
+            session=session,
+            external_templates=application_services().knowledge.external_templates,
+        ) as dataset:
+            result_data = _dump_service_dataset_detail(load_dataset_detail(dataset, session=session))
+            assert isinstance(current_user, Account)
+            tenant_id = current_user.current_tenant_id
 
-        if dataset is None:
-            raise NotFound("Dataset not found.")
+            if payload.partial_member_list and payload.permission == DatasetPermissionEnum.PARTIAL_TEAM:
+                DatasetPermissionService.update_partial_member_list(
+                    tenant_id, dataset_id_str, payload.partial_member_list, session
+                )
+            # clear partial member list when permission is only_me or all_team_members
+            elif payload.permission in {DatasetPermissionEnum.ONLY_ME, DatasetPermissionEnum.ALL_TEAM}:
+                DatasetPermissionService.clear_partial_member_list(dataset_id_str, session)
 
-        result_data = _dump_service_dataset_detail(load_dataset_detail(dataset, session=session))
-        assert isinstance(current_user, Account)
-        tenant_id = current_user.current_tenant_id
+            partial_member_list = DatasetPermissionService.get_dataset_partial_member_list(dataset_id_str, session)
+            result_data.update({"partial_member_list": partial_member_list})
+            response = _dump_service_dataset_with_partial_members(result_data)
 
-        if payload.partial_member_list and payload.permission == DatasetPermissionEnum.PARTIAL_TEAM:
-            DatasetPermissionService.update_partial_member_list(
-                tenant_id, dataset_id_str, payload.partial_member_list, session
-            )
-        # clear partial member list when permission is only_me or all_team_members
-        elif payload.permission in {DatasetPermissionEnum.ONLY_ME, DatasetPermissionEnum.ALL_TEAM}:
-            DatasetPermissionService.clear_partial_member_list(dataset_id_str, session)
-
-        partial_member_list = DatasetPermissionService.get_dataset_partial_member_list(dataset_id_str, session)
-        result_data.update({"partial_member_list": partial_member_list})
-
-        return _dump_service_dataset_with_partial_members(result_data), 200
+        return response, 200
 
     @service_api_ns.doc(
         summary="Delete Knowledge Base",
@@ -765,8 +769,10 @@ class DatasetApi(DatasetApiResource):
             404: "Dataset not found",
         }
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
-    @with_session
+    @cloud_edition_billing_rate_limit_check("knowledge")
+    # DatasetService owns this command's single commit so cache invalidation and
+    # durable-cleanup publication only happen after the deletion is committed.
+    @with_session(write=False)
     def delete(self, session: Session, _, dataset_id: UUID):
         """
         Deletes a dataset given its ID.
@@ -788,7 +794,6 @@ class DatasetApi(DatasetApiResource):
 
         try:
             if DatasetService.delete_dataset(dataset_id_str, current_user, session):
-                DatasetPermissionService.clear_partial_member_list(dataset_id_str, session)
                 return "", 204
             else:
                 raise NotFound("Dataset not found.")
@@ -871,9 +876,6 @@ class DocumentStatusApi(DatasetApiResource):
             DatasetService.check_dataset_permission(dataset, current_user, session)
         except services.errors.base.NoPermissionError as e:
             raise Forbidden(str(e)) from e
-
-        # Check dataset model setting
-        DatasetService.check_dataset_model_setting(dataset)
 
         # Get document IDs from request body
         data = request.get_json()

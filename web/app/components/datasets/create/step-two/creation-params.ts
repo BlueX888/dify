@@ -46,13 +46,21 @@ export const getNotionInfo = (
 export const getWebsiteInfo = (opts: {
   websiteCrawlProvider: DataSourceProvider
   websiteCrawlJobId: string
+  websiteCrawlSourceHandle?: string
   websitePages: CrawlResultItem[]
   crawlOptions?: CrawlOptions
 }) => {
-  const { websiteCrawlProvider, websiteCrawlJobId, websitePages, crawlOptions } = opts
+  const {
+    websiteCrawlProvider,
+    websiteCrawlJobId,
+    websiteCrawlSourceHandle,
+    websitePages,
+    crawlOptions,
+  } = opts
   return {
     provider: websiteCrawlProvider,
     job_id: websiteCrawlJobId,
+    ...(websiteCrawlSourceHandle && { source_handle: websiteCrawlSourceHandle }),
     urls: websitePages.map((page) => page.source_url),
     only_main_content: crawlOptions?.only_main_content,
   }
@@ -132,6 +140,7 @@ type GetFileIndexingEstimateParamsOptionWeb = GetFileIndexingEstimateParamsOptio
   crawlOptions?: CrawlOptions
   websiteCrawlProvider: DataSourceProvider
   websiteCrawlJobId: string
+  websiteCrawlSourceHandle?: string
 }
 
 export const getFileIndexingEstimateParamsForWeb = ({
@@ -142,6 +151,7 @@ export const getFileIndexingEstimateParamsForWeb = ({
   crawlOptions,
   websiteCrawlProvider,
   websiteCrawlJobId,
+  websiteCrawlSourceHandle,
   indexingTechnique,
   processRule,
   dataset_id,
@@ -152,6 +162,7 @@ export const getFileIndexingEstimateParamsForWeb = ({
       website_info_list: getWebsiteInfo({
         websiteCrawlProvider,
         websiteCrawlJobId,
+        websiteCrawlSourceHandle,
         websitePages,
         crawlOptions,
       }),

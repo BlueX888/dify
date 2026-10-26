@@ -14,7 +14,15 @@ export const zWebsiteCrawlPayload = z.object({
 /**
  * WebsiteCrawlResponse
  */
-export const zWebsiteCrawlResponse = z.record(z.string(), z.unknown())
+export const zWebsiteCrawlResponse = z.object({
+  current: z.int().nullish(),
+  data: z.unknown().optional(),
+  job_id: z.string().nullish(),
+  source_handle: z.string().nullish(),
+  status: z.string(),
+  time_consuming: z.union([z.string(), z.number()]).nullish(),
+  total: z.int().nullish(),
+})
 
 /**
  * ErrorResponse
@@ -57,6 +65,7 @@ export const zGetWebsiteCrawlStatusByJobIdPath = z.object({
 
 export const zGetWebsiteCrawlStatusByJobIdQuery = z.object({
   provider: z.enum(['firecrawl', 'jinareader', 'watercrawl']),
+  source_handle: z.string().min(1),
 })
 
 /**

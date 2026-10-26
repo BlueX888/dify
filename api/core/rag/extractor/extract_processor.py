@@ -1,5 +1,6 @@
 import re
 import tempfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal, overload
 from urllib.parse import unquote
@@ -11,7 +12,12 @@ from core.db.session_factory import get_session_maker
 from core.file import remote_fetcher
 from core.rag.extractor.csv_extractor import CSVExtractor
 from core.rag.extractor.entity.datasource_type import DatasourceType
-from core.rag.extractor.entity.extract_setting import ExtractSetting, UploadFileExtractionInput
+from core.rag.extractor.entity.extract_setting import (
+    CreatedUploadArtifact,
+    ExtractionResult,
+    ExtractSetting,
+    UploadFileExtractionInput,
+)
 from core.rag.extractor.excel_extractor import ExcelExtractor
 from core.rag.extractor.extractor_base import BaseExtractor
 from core.rag.extractor.firecrawl.firecrawl_web_extractor import FirecrawlWebExtractor
@@ -46,18 +52,33 @@ class ExtractProcessor:
     @overload
     @classmethod
     def load_from_upload_file(
-        cls, upload_file: UploadFile, return_text: Literal[True], is_automatic: bool = False
+        cls,
+        upload_file: UploadFile,
+        return_text: Literal[True],
+        is_automatic: bool = False,
+        *,
+        persist_images: bool = True,
     ) -> str: ...
 
     @overload
     @classmethod
     def load_from_upload_file(
-        cls, upload_file: UploadFile, return_text: Literal[False] = False, is_automatic: bool = False
+        cls,
+        upload_file: UploadFile,
+        return_text: Literal[False] = False,
+        is_automatic: bool = False,
+        *,
+        persist_images: bool = True,
     ) -> list[Document]: ...
 
     @classmethod
     def load_from_upload_file(
-        cls, upload_file: UploadFile, return_text: bool = False, is_automatic: bool = False
+        cls,
+        upload_file: UploadFile,
+        return_text: bool = False,
+        is_automatic: bool = False,
+        *,
+        persist_images: bool = True,
     ) -> list[Document] | str:
         extract_setting = ExtractSetting(
             datasource_type=DatasourceType.FILE,
@@ -66,9 +87,10 @@ class ExtractProcessor:
         )
         if return_text:
             delimiter = "\n"
-            return delimiter.join([document.page_content for document in cls.extract(extract_setting, is_automatic)])
+            result = cls.extract(extract_setting, is_automatic, persist_images=persist_images)
+            return delimiter.join(document.page_content for document in result.documents)
         else:
-            return cls.extract(extract_setting, is_automatic)
+            return cls.extract(extract_setting, is_automatic, persist_images=persist_images).documents
 
     @overload
     @classmethod
@@ -104,14 +126,10 @@ class ExtractProcessor:
             extract_setting = ExtractSetting(datasource_type=DatasourceType.FILE, document_model="text_model")
             if return_text:
                 delimiter = "\n"
-                return delimiter.join(
-                    [
-                        document.page_content
-                        for document in cls.extract(extract_setting=extract_setting, file_path=file_path)
-                    ]
-                )
+                result = cls.extract(extract_setting=extract_setting, file_path=file_path)
+                return delimiter.join(document.page_content for document in result.documents)
             else:
-                return cls.extract(extract_setting=extract_setting, file_path=file_path)
+                return cls.extract(extract_setting=extract_setting, file_path=file_path).documents
 
     @classmethod
     def extract(
@@ -121,7 +139,9 @@ class ExtractProcessor:
         file_path: str | None = None,
         *,
         session: Session | None = None,
-    ) -> list[Document]:
+        persist_images: bool = True,
+        on_upload_artifact_created: Callable[[CreatedUploadArtifact], None] | None = None,
+    ) -> ExtractionResult:
         if extract_setting.datasource_type == DatasourceType.FILE:
             upload_file = extract_setting.upload_file
             with tempfile.TemporaryDirectory() as temp_dir:
@@ -147,6 +167,7 @@ class ExtractProcessor:
                             upload_file.tenant_id,
                             upload_file.created_by,
                             upload_file.id,
+                            persist_images=persist_images,
                         )
                     elif file_extension == ".pdf":
                         extractor = PdfExtractor(
@@ -154,6 +175,7 @@ class ExtractProcessor:
                             upload_file.tenant_id if upload_file else None,
                             upload_file.created_by if upload_file else None,
                             session=session,
+                            persist_images=persist_images,
                         )
                     elif file_extension in {".md", ".markdown", ".mdx"}:
                         extractor = (
@@ -166,7 +188,11 @@ class ExtractProcessor:
                     elif file_extension == ".docx":
                         assert upload_file is not None
                         extractor = WordExtractor(
-                            file_path, upload_file.tenant_id, upload_file.created_by, session=session
+                            file_path,
+                            upload_file.tenant_id,
+                            upload_file.created_by,
+                            session=session,
+                            persist_images=persist_images,
                         )
                     elif file_extension == ".doc":
                         extractor = UnstructuredWordExtractor(file_path, unstructured_api_url, unstructured_api_key)
@@ -197,6 +223,7 @@ class ExtractProcessor:
                             upload_file.tenant_id,
                             upload_file.created_by,
                             upload_file.id,
+                            persist_images=persist_images,
                         )
                     elif file_extension == ".pdf":
                         extractor = PdfExtractor(
@@ -204,6 +231,7 @@ class ExtractProcessor:
                             upload_file.tenant_id if upload_file else None,
                             upload_file.created_by if upload_file else None,
                             session=session,
+                            persist_images=persist_images,
                         )
                     elif file_extension in {".md", ".markdown", ".mdx"}:
                         extractor = MarkdownExtractor(file_path, autodetect_encoding=True)
@@ -212,7 +240,11 @@ class ExtractProcessor:
                     elif file_extension == ".docx":
                         assert upload_file is not None
                         extractor = WordExtractor(
-                            file_path, upload_file.tenant_id, upload_file.created_by, session=session
+                            file_path,
+                            upload_file.tenant_id,
+                            upload_file.created_by,
+                            session=session,
+                            persist_images=persist_images,
                         )
                     elif file_extension == ".csv":
                         extractor = CSVExtractor(file_path, autodetect_encoding=True)
@@ -221,7 +253,12 @@ class ExtractProcessor:
                     else:
                         # txt
                         extractor = TextExtractor(file_path, autodetect_encoding=True)
-                return extractor.extract()
+                extractor.on_upload_artifact_created = on_upload_artifact_created
+                documents = extractor.extract()
+                return ExtractionResult(
+                    documents=documents,
+                    created_upload_artifacts=extractor.created_upload_artifacts,
+                )
         elif extract_setting.datasource_type == DatasourceType.NOTION:
             from extensions.application_services.data_sources import build_data_source_credentials
 
@@ -241,7 +278,8 @@ class ExtractProcessor:
                     tenant_id=notion_info.tenant_id, credential_id=notion_info.credential_id
                 ),
             )
-            return extractor.extract()
+            documents = extractor.extract()
+            return ExtractionResult(documents=documents, source_version=extractor.last_edited_time)
         elif extract_setting.datasource_type == DatasourceType.WEBSITE:
             from extensions.application_services.data_sources import build_website_service
 
@@ -251,33 +289,30 @@ class ExtractProcessor:
                 case "firecrawl":
                     extractor = FirecrawlWebExtractor(
                         url=extract_setting.website_info.url,
-                        job_id=extract_setting.website_info.job_id,
-                        tenant_id=extract_setting.website_info.tenant_id,
+                        job_ref=extract_setting.website_info.job_ref,
                         mode=extract_setting.website_info.mode,
                         only_main_content=extract_setting.website_info.only_main_content,
                         website_service=website_service,
                     )
-                    return extractor.extract()
+                    return ExtractionResult(documents=extractor.extract())
                 case "watercrawl":
                     extractor = WaterCrawlWebExtractor(
                         url=extract_setting.website_info.url,
-                        job_id=extract_setting.website_info.job_id,
-                        tenant_id=extract_setting.website_info.tenant_id,
+                        job_ref=extract_setting.website_info.job_ref,
                         mode=extract_setting.website_info.mode,
                         only_main_content=extract_setting.website_info.only_main_content,
                         website_service=website_service,
                     )
-                    return extractor.extract()
+                    return ExtractionResult(documents=extractor.extract())
                 case "jinareader":
                     extractor = JinaReaderWebExtractor(
                         url=extract_setting.website_info.url,
-                        job_id=extract_setting.website_info.job_id,
-                        tenant_id=extract_setting.website_info.tenant_id,
+                        job_ref=extract_setting.website_info.job_ref,
                         mode=extract_setting.website_info.mode,
                         only_main_content=extract_setting.website_info.only_main_content,
                         website_service=website_service,
                     )
-                    return extractor.extract()
+                    return ExtractionResult(documents=extractor.extract())
                 case _:
                     raise ValueError(f"Unsupported website provider: {extract_setting.website_info.provider}")
         else:

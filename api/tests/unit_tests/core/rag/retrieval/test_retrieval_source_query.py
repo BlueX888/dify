@@ -1,6 +1,6 @@
 """Exercise the SQL emitted when workflow retrieval assembles source citations."""
 
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 from uuid import uuid4
 
 import pytest
@@ -9,11 +9,20 @@ from sqlalchemy.exc import InvalidRequestError
 from sqlalchemy.orm import Session
 
 from core.rag.embedding.retrieval import RetrievalSegments
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.models.document import Document as RetrievedDocument
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from models.dataset import Dataset, Document, DocumentSegment
 from repositories.knowledge.retrieval_source_repository import get_retrieval_source_documents
+
+
+def _dataset_retrieval() -> DatasetRetrieval:
+    return DatasetRetrieval(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
 
 
 def test_source_citations_do_not_fetch_unused_document_fields(sqlite_session: Session) -> None:
@@ -31,6 +40,7 @@ def test_source_citations_do_not_fetch_unused_document_fields(sqlite_session: Se
         created_by=creator_id,
         enabled=True,
         archived=False,
+        indexing_status="completed",
         doc_metadata={"category": "transport"},
         data_source_info="x" * 1_000_000,
         error="y" * 1_000_000,
@@ -46,6 +56,7 @@ def test_source_citations_do_not_fetch_unused_document_fields(sqlite_session: Se
             tokens=3,
             created_by=creator_id,
             enabled=True,
+            status="completed",
             index_node_id=f"node-{position}",
             index_node_hash=f"hash-{position}",
         )
@@ -74,7 +85,7 @@ def test_source_citations_do_not_fetch_unused_document_fields(sqlite_session: Se
             queries.append(statement)
 
     engine = sqlite_session.get_bind()
-    retrieval = DatasetRetrieval()
+    retrieval = _dataset_retrieval()
     event.listen(engine, "before_cursor_execute", capture_query)
     try:
         with (
@@ -98,10 +109,15 @@ def test_source_citations_do_not_fetch_unused_document_fields(sqlite_session: Se
         assert source.metadata.dataset_name == "Knowledge"
         assert source.metadata.data_source_type == "upload_file"
         assert source.metadata.doc_metadata == {"category": "transport"}
-    assert len(queries) == 1, "Citation fields must not cause additional lazy SQL queries"
-    assert "documents.data_source_info" not in queries[0]
-    assert "documents.error" not in queries[0]
-    assert "documents.indexing_latency" not in queries[0]
+    # Finalization also checks current document ownership under row locks.
+    # Those id-only reads must not change the single batched citation read or
+    # load large, unused fields through an expired ORM object.
+    citation_queries = [query for query in queries if "documents.name" in query]
+    assert len(citation_queries) == 1, "Citation fields must not cause additional lazy SQL queries"
+    for query in queries:
+        assert "documents.data_source_info" not in query
+        assert "documents.error" not in query
+        assert "documents.indexing_latency" not in query
 
 
 def test_source_document_read_is_scoped_and_has_no_lazy_queries(sqlite_session: Session) -> None:

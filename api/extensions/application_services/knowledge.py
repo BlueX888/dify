@@ -7,12 +7,20 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from configs import dify_config
 from core.app.apps.pipeline.pipeline_generator import PipelineGenerator
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.extractor.entity.datasource_type import DatasourceType
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from libs.helper import generate_text_hash
 from repositories.app.console_repository import ConsoleAppRepository
+from repositories.data_source.website_crawl_job_repository import SQLAlchemyWebsiteCrawlJobRepository
+from repositories.data_source.website_source_repository import SQLAlchemyWebsiteSourceRepository
+from repositories.knowledge.attachment_vector_repository import SQLAlchemyAttachmentVectorStore
+from repositories.knowledge.child_vector_cleanup_repository import SQLAlchemyChildVectorCleanupRepository
 from repositories.knowledge.dataset_api_key_repository import DatasetApiKeyRepository
 from repositories.knowledge.dataset_repository import SQLAlchemyDatasetRepository
+from repositories.knowledge.document_indexing_outbox_repository import create_pipeline_document_indexing_intents
 from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
+from repositories.knowledge.external_repository import SQLAlchemyExternalKnowledgeRepository
 from repositories.knowledge.metadata_repository import SQLAlchemyMetadataRepository
 from repositories.knowledge.segment_repository import SQLAlchemySegmentRepository
 from repositories.knowledge.upload_file_repository import SQLAlchemyKnowledgeUploadRepository
@@ -22,17 +30,24 @@ from services.data_source.credential_gateway import (
     TrustedStoredDatasourceCredentialGateway,
 )
 from services.data_source.provider_service import DatasourceProviderService
+from services.data_source.website_service import WebsiteService
 from services.knowledge.api_key_service import DatasetApiKeyService
 from services.knowledge.dataset_access import DatasetAccessService
-from services.knowledge.dataset_service import DocumentService
+from services.knowledge.dataset_service import DocumentService, ExternalKnowledgeTemplateLookup
 from services.knowledge.datasets.adapters import SQLAlchemyDatasetOperations
 from services.knowledge.datasets.application import DatasetApplicationService
 from services.knowledge.document_sync import DocumentSyncApplicationService
 from services.knowledge.document_sync_adapters import CeleryDocumentSyncDispatcher
 from services.knowledge.documents.adapters import SQLAlchemyDocumentOperations
 from services.knowledge.documents.application import DatasetDocumentApplicationService
-from services.knowledge.external.adapters import SQLAlchemyExternalKnowledgeOperations
+from services.knowledge.external.adapters import (
+    ExternalDatasetRetrievalAdapter,
+    ExternalKnowledgeGateway,
+    sync_external_dataset_creator_access,
+)
 from services.knowledge.external.application import ExternalKnowledgeApplicationService
+from services.knowledge.hit_testing.adapters import DatasetHitTestingGateway
+from services.knowledge.hit_testing.application import HitTestingApplicationService
 from services.knowledge.indexing.adapters.estimate import IndexingEstimateAdapter, SQLAlchemyProcessRuleReader
 from services.knowledge.indexing.adapters.sources import (
     CompositeStoredSourceResolver,
@@ -42,11 +57,16 @@ from services.knowledge.indexing.adapters.sources import (
 )
 from services.knowledge.indexing.estimate import IndexingEstimateApplicationService
 from services.knowledge.metadata.application import MetadataService
+from services.knowledge.retrieval.adapters import WorkflowKnowledgeRetrievalGateway
+from services.knowledge.retrieval.application import InnerKnowledgeRetrievalService
 from services.knowledge.segments.adapters import (
     CelerySegmentBatchImportDispatcher,
+    CelerySegmentStateDispatcher,
     ModelManagerSegmentGuard,
     RedisSegmentClient,
     RedisSegmentIndexingState,
+    SegmentPresentationAdapter,
+    SQLAlchemySegmentStateTransitions,
 )
 from services.knowledge.segments.application import DatasetSegmentApplicationService
 from services.knowledge.segments.indexing import SegmentIndexingGateway
@@ -54,10 +74,8 @@ from services.rbac.members import MemberService
 from services.tag_application_service import TagTargetQuery
 from services.workflow_run_agg import WorkflowRunAgg
 from tasks.batch_create_segment_to_index_task import batch_create_segment_to_index_task
-from tasks.delete_segment_from_index_task import delete_segment_from_index_task
-from tasks.disable_segments_from_index_task import disable_segments_from_index_task
 from tasks.document_indexing_sync_task import document_indexing_sync_task
-from tasks.enable_segments_to_index_task import enable_segments_to_index_task
+from tasks.segment_state_outbox_task import reconcile_segment_state_batch_task
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +83,10 @@ class KnowledgeServices:
     metadata: MetadataService
     datasets: DatasetApplicationService
     external: ExternalKnowledgeApplicationService
+    external_retrieval: ExternalDatasetRetriever
+    external_templates: ExternalKnowledgeTemplateLookup
+    hit_testing: HitTestingApplicationService
+    inner_retrieval: InnerKnowledgeRetrievalService
     documents: DatasetDocumentApplicationService
     document_sync: DocumentSyncApplicationService
     indexing_estimates: IndexingEstimateApplicationService
@@ -104,7 +126,14 @@ def build_knowledge_services(
         stored_credentials=stored_credentials,
     )
     file_sources = FileSourceAdapter(uploads=uploads)
-    website_sources = WebsiteSourceAdapter()
+    website_jobs = WebsiteService(
+        providers=providers,
+        crawl_jobs=SQLAlchemyWebsiteCrawlJobRepository(session_factory=database_client),
+    )
+    website_sources = WebsiteSourceAdapter(
+        jobs=website_jobs,
+        migrations=SQLAlchemyWebsiteSourceRepository(session_factory=database_client),
+    )
     stored_sources = CompositeStoredSourceResolver(
         adapters={
             DatasourceType.FILE.value: file_sources,
@@ -116,11 +145,20 @@ def build_knowledge_services(
     segment_index = SegmentIndexingGateway(
         segments=segments,
         uploads=uploads,
+        attachment_vectors=SQLAlchemyAttachmentVectorStore(session_factory=database_client),
+        child_vector_cleanups=SQLAlchemyChildVectorCleanupRepository(session_factory=database_client),
         redis=redis,
         new_session=database_client,
-        delete_task=delete_segment_from_index_task.delay,
-        enable_task=enable_segments_to_index_task.delay,
-        disable_task=disable_segments_from_index_task.delay,
+    )
+    external_repository = SQLAlchemyExternalKnowledgeRepository(session_factory=database_client)
+    external_gateway = ExternalKnowledgeGateway()
+    external_retrieval = ExternalDatasetRetrievalAdapter(repository=external_repository, gateway=external_gateway)
+    dataset_operations = SQLAlchemyDatasetOperations(
+        session_factory=database_client,
+        tags=tags,
+        app_queries=ConsoleAppRepository(session_factory=database_client),
+        external_templates=external_repository,
+        members=rbac_members,
     )
     return KnowledgeServices(
         metadata=MetadataService(
@@ -128,12 +166,7 @@ def build_knowledge_services(
         ),
         datasets=DatasetApplicationService(
             dataset_access=dataset_access,
-            operations=SQLAlchemyDatasetOperations(
-                session_factory=database_client,
-                tags=tags,
-                app_queries=ConsoleAppRepository(session_factory=database_client),
-                members=rbac_members,
-            ),
+            operations=dataset_operations,
             rbac_enabled=dify_config.RBAC_ENABLED,
             service_api_url=dify_config.SERVICE_API_URL,
             vector_store=dify_config.VECTOR_STORE,
@@ -141,15 +174,47 @@ def build_knowledge_services(
         ),
         external=ExternalKnowledgeApplicationService(
             dataset_access=dataset_access,
-            operations=SQLAlchemyExternalKnowledgeOperations(session_factory=database_client, members=rbac_members),
+            repository=external_repository,
+            retrieval=external_gateway,
+            queries=datasets,
+            dataset_details=dataset_operations,
+            sync_creator_access=sync_external_dataset_creator_access,
+        ),
+        external_retrieval=external_retrieval,
+        external_templates=external_repository,
+        hit_testing=HitTestingApplicationService(
+            dataset_access=dataset_access,
+            retrieval=DatasetHitTestingGateway(
+                datasets=datasets,
+                documents=documents,
+                segments=segments,
+                session_factory=database_client,
+            ),
+            queries=datasets,
+        ),
+        inner_retrieval=InnerKnowledgeRetrievalService(
+            scope=datasets,
+            retrieval=WorkflowKnowledgeRetrievalGateway(
+                session_factory=database_client,
+                external_retrieval=external_retrieval,
+                retrieval_finalizer=build_retrieval_finalizer(),
+            ),
         ),
         documents=DatasetDocumentApplicationService(
             dataset_access=dataset_access,
-            operations=SQLAlchemyDocumentOperations(session_factory=database_client),
+            operations=SQLAlchemyDocumentOperations(
+                session_factory=database_client,
+                actor_credentials=actor_credentials,
+                website_jobs=website_jobs,
+            ),
             metadata_schema=DocumentService.DOCUMENT_METADATA_SCHEMA,
         ),
         pipeline_generator=PipelineGenerator(
-            execution_driver=WorkflowRunAgg.run, documents=documents, datasource_providers=providers
+            execution_driver=WorkflowRunAgg.run,
+            documents=documents,
+            datasource_providers=providers,
+            external_retrieval=external_retrieval,
+            indexing_requests=create_pipeline_document_indexing_intents,
         ),
         document_sync=DocumentSyncApplicationService(
             dataset_access=dataset_access,
@@ -171,6 +236,7 @@ def build_knowledge_services(
             dataset_access=dataset_access,
             scopes=datasets,
             store=segments,
+            presenter=SegmentPresentationAdapter(),
             index=segment_index,
             limits=dify_config,
             text_hash=generate_text_hash,
@@ -178,6 +244,8 @@ def build_knowledge_services(
             model_guard=ModelManagerSegmentGuard(),
             indexing_state=RedisSegmentIndexingState(redis),
             batch_dispatcher=CelerySegmentBatchImportDispatcher(delay=batch_create_segment_to_index_task.delay),
+            state_transitions=SQLAlchemySegmentStateTransitions(session_factory=database_client),
+            state_dispatcher=CelerySegmentStateDispatcher(delay=reconcile_segment_state_batch_task.delay),
             job_id_factory=lambda: str(uuid4()),
         ),
     )

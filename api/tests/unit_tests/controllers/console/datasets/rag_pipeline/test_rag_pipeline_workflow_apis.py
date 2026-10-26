@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from inspect import unwrap
 from typing import TypedDict, Unpack
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
@@ -46,6 +46,8 @@ from controllers.console.datasets.rag_pipeline.rag_pipeline_workflow import (
     WorkflowListQuery,
     WorkflowUpdatePayload,
 )
+from core.rag.retrieval.dataset_retrieval import ExternalDatasetRetriever
+from extensions.ext_application_services import ApplicationServices
 from fields.workflow_run_fields import node_execution_response_source
 from graphon.enums import WorkflowNodeExecutionStatus
 from libs.datetime_utils import naive_utc_now
@@ -96,6 +98,15 @@ def sqlite_database(
         yield database_session
     finally:
         database_session.remove()
+
+
+@pytest.fixture
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    retriever = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    services.knowledge.external_retrieval = retriever
+    monkeypatch.setattr(workflow_controller, "application_services", lambda: services)
+    return retriever
 
 
 def empty_mapping() -> dict[str, object]:
@@ -475,7 +486,7 @@ class TestDraftRunNodes:
 
 
 class TestDraftNodeRun:
-    def test_execution_not_found(self, app: Flask) -> None:
+    def test_execution_not_found(self, app: Flask, external_retrieval: MagicMock) -> None:
         api = RagPipelineDraftNodeRunApi()
         method = unwrap(api.post)
 
@@ -494,6 +505,8 @@ class TestDraftNodeRun:
         ):
             with pytest.raises(ValueError, match="Workflow node execution not found"):
                 method(api, NodeRunRequiredPayload(inputs={}), user, pipeline, "node")
+
+        assert service.run_draft_workflow_node.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
 class TestPublishedPipelineApis:
@@ -532,7 +545,7 @@ class TestPublishedPipelineApis:
 
         assert result is None
 
-    def test_publish_success(self, app: Flask) -> None:
+    def test_publish_success(self, app: Flask, sqlite_database: scoped_session[Session]) -> None:
         api = PublishedRagPipelineApi()
         method = unwrap(api.post)
 
@@ -549,9 +562,17 @@ class TestPublishedPipelineApis:
 
         service = MagicMock()
         service.publish_workflow.return_value = workflow
+        service.pending_dataset_indexing_intent_ids = ("intent-1",)
+        events: list[str] = []
 
         with (
             app.test_request_context("/"),
+            patch.object(sqlite_database, "commit", side_effect=lambda: events.append("commit")),
+            patch.object(
+                workflow_controller.DatasetService,
+                "dispatch_dataset_indexing",
+                side_effect=lambda intent_ids: events.append(f"dispatch:{','.join(intent_ids)}"),
+            ),
             patch(
                 "controllers.console.datasets.rag_pipeline.rag_pipeline_workflow.RagPipelineService",
                 return_value=service,
@@ -561,6 +582,7 @@ class TestPublishedPipelineApis:
 
         assert result["result"] == "success"
         assert "created_at" in result
+        assert events == ["commit", "dispatch:intent-1"]
 
 
 class TestMiscApis:
@@ -893,7 +915,7 @@ class TestRagPipelineWorkflowRunNodeExecutionListApi:
 
 
 class TestRagPipelineDatasourceVariableApi:
-    def test_set_datasource_variables_success(self, app: Flask) -> None:
+    def test_set_datasource_variables_success(self, app: Flask, external_retrieval: MagicMock) -> None:
         api = RagPipelineDatasourceVariableApi()
         method = unwrap(api.post)
 
@@ -920,3 +942,5 @@ class TestRagPipelineDatasourceVariableApi:
             result = method(api, DatasourceVariablesPayload.model_validate(payload), user, pipeline)
             assert result["node_id"] == "n1"
             assert result["process_data"] == {}
+
+        assert service.set_datasource_variables.call_args.kwargs["external_retrieval"] is external_retrieval

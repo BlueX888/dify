@@ -2,14 +2,36 @@
 
 from collections.abc import Generator
 from contextlib import contextmanager
-from unittest.mock import patch
+from dataclasses import dataclass
+from unittest.mock import create_autospec, patch
 
+import pytest
 from flask import Flask
 
 from controllers.inner_api import bp as inner_api_bp
+from controllers.inner_api.agent import tools as tools_module
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from services.entities.agent_tool_inner import AgentToolInvokeResponse
 from services.errors.agent_tool_inner import AgentToolInnerServiceError
 from tests.unit_tests.config_override import config_overrides_context
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeServicesStub:
+    external_retrieval: ExternalDatasetRetriever
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationServicesStub:
+    knowledge: _KnowledgeServicesStub
+
+
+@pytest.fixture
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> ExternalDatasetRetriever:
+    port = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = _ApplicationServicesStub(knowledge=_KnowledgeServicesStub(external_retrieval=port))
+    monkeypatch.setattr(tools_module, "application_services", lambda: services)
+    return port
 
 
 def _headers(api_key: str | None = "inner-key") -> dict[str, str]:
@@ -54,16 +76,16 @@ def _agent_inner_auth() -> Generator[None]:
         yield
 
 
-def test_post_returns_service_response() -> None:
+def test_post_returns_service_response(external_retrieval: ExternalDatasetRetriever) -> None:
     app = Flask(__name__)
     app.config["TESTING"] = True
     app.register_blueprint(inner_api_bp)
 
     with (
         _agent_inner_auth(),
-        patch("controllers.inner_api.agent.tools.AgentToolInnerService.invoke") as mock_invoke,
+        patch.object(tools_module, "AgentToolInnerService", autospec=True) as service_class,
     ):
-        mock_invoke.return_value = AgentToolInvokeResponse(
+        service_class.return_value.invoke.return_value = AgentToolInvokeResponse(
             messages=[{"type": "text", "message": {"text": "ok"}}],
             observation="ok",
             metadata={"provider_type": "plugin", "tool_name": "search"},
@@ -79,6 +101,7 @@ def test_post_returns_service_response() -> None:
     body = response.get_json()
     assert body["observation"] == "ok"
     assert body["metadata"]["provider_type"] == "plugin"
+    service_class.assert_called_once_with(external_retrieval=external_retrieval)
 
 
 def test_post_returns_400_for_invalid_body() -> None:
@@ -98,16 +121,18 @@ def test_post_returns_400_for_invalid_body() -> None:
     assert body["code"] == "invalid_request"
 
 
-def test_post_preserves_service_error_status_code_and_description() -> None:
+def test_post_preserves_service_error_status_code_and_description(
+    external_retrieval: ExternalDatasetRetriever,
+) -> None:
     app = Flask(__name__)
     app.config["TESTING"] = True
     app.register_blueprint(inner_api_bp)
 
     with (
         _agent_inner_auth(),
-        patch("controllers.inner_api.agent.tools.AgentToolInnerService.invoke") as mock_invoke,
+        patch.object(tools_module, "AgentToolInnerService", autospec=True) as service_class,
     ):
-        mock_invoke.side_effect = AgentToolInnerServiceError(
+        service_class.return_value.invoke.side_effect = AgentToolInnerServiceError(
             error_code="app_tenant_mismatch",
             description="App does not belong to the caller tenant.",
             status_code=403,
@@ -122,3 +147,4 @@ def test_post_preserves_service_error_status_code_and_description() -> None:
     body = response.get_json()
     assert body["code"] == "app_tenant_mismatch"
     assert body["message"] == "App does not belong to the caller tenant."
+    service_class.assert_called_once_with(external_retrieval=external_retrieval)

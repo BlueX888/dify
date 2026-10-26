@@ -1,4 +1,22 @@
+from typing import Any, Protocol
+
 from pydantic import BaseModel, ConfigDict, Field
+
+
+class ExternalDatasetRetriever(Protocol):
+    """Retrieve records from an external dataset without exposing persistence to the kernel."""
+
+    def retrieve(
+        self,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        query: str,
+        retrieval_model: dict[str, Any] | None,
+        metadata_filters: dict[str, Any] | None,
+    ) -> list[dict[str, Any]]:
+        """Use the dataset's effective settings when retrieval_model is None or empty."""
+        ...
 
 
 class RerankingModelConfig(BaseModel):

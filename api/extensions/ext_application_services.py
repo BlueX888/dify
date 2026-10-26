@@ -599,6 +599,7 @@ def build_application_services(
             webapp_access=webapp_access,
             get_workspace_role=workspace_repository.get_account_role,
             webapp_auth_enabled=webapp_auth_enabled,
+            external_retrieval=knowledge.external_retrieval,
         ),
         web_app_runtime=WebAppRuntimeQueryService(
             runtime=app_definition_repository,
@@ -690,7 +691,11 @@ def build_application_services(
         ),
         app_tasks=AppTaskControlService(redis_client=redis),
         app_audio=AppAudioRuntime(session_factory=database_client),
-        trial_apps=build_trial_app_services(database_client=database_client, trial_apps=trial_apps),
+        trial_apps=build_trial_app_services(
+            database_client=database_client,
+            trial_apps=trial_apps,
+            external_retrieval=knowledge.external_retrieval,
+        ),
         workflow_run_archives=WorkflowRunArchiveService(
             bundles=WorkflowRunArchiveBundleQueryRepository(session_factory=database_client),
             tasks=WorkflowRunArchiveDownloadTaskCache(redis=redis),

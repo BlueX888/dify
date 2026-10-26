@@ -460,6 +460,18 @@ export const zCompletionRequestError = zErrorResponse.and(
 )
 
 /**
+ * DatasetNotInitializedError
+ *
+ * The dataset is still being initialized or indexing. Please wait a moment.
+ */
+export const zDatasetNotInitializedError = zErrorResponse.and(
+  z.object({
+    code: z.literal('dataset_not_initialized'),
+    status: z.literal(400),
+  }),
+)
+
+/**
  * MetadataArgs
  */
 export const zMetadataArgs = z.object({
@@ -1090,7 +1102,7 @@ export const zHitTestingChildChunk = z.object({
 export const zHitTestingFile = z.object({
   extension: z.string(),
   id: z.string(),
-  mime_type: z.string(),
+  mime_type: z.string().nullable(),
   name: z.string(),
   size: z.int(),
   source_url: z.string(),
@@ -1374,6 +1386,7 @@ export const zWebsiteInfo = z.object({
   job_id: z.string(),
   only_main_content: z.boolean().optional().default(true),
   provider: z.string(),
+  source_handle: z.string().nullish(),
   urls: z.array(z.string()),
 })
 
@@ -1462,13 +1475,6 @@ export const zRetrievalModel = z.object({
  */
 export const zHitTestingPayload = z.object({
   attachment_ids: z.array(z.string()).nullish(),
-  external_retrieval_model: z
-    .object({
-      score_threshold: z.number().optional(),
-      score_threshold_enabled: z.boolean().optional(),
-      top_k: z.int().optional(),
-    })
-    .nullish(),
   query: z.string().max(250),
   retrieval_model: zRetrievalModel.nullish(),
 })
@@ -2288,18 +2294,6 @@ export const zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumePath 
  * Document resumed successfully
  */
 export const zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingResumeResponse = z.void()
-
-export const zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionPath = z.object({
-  action: z.string(),
-  dataset_id: z.uuid(),
-  document_id: z.uuid(),
-})
-
-/**
- * Processing status updated successfully
- */
-export const zPatchDatasetsByDatasetIdDocumentsByDocumentIdProcessingByActionResponse =
-  zSimpleResultResponse
 
 export const zPostDatasetsByDatasetIdDocumentsByDocumentIdRenameBody = zDocumentRenamePayload
 

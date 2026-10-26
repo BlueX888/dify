@@ -2,16 +2,16 @@
 
 import json
 from collections.abc import Mapping
-from unittest.mock import MagicMock, create_autospec
+from unittest.mock import MagicMock
 
 import pytest
 from pytest_mock import MockerFixture
 
 import core.rag.extractor.firecrawl.firecrawl_app as firecrawl_module
+from core.rag.extractor.entity.extract_setting import WebsiteJobRef
 from core.rag.extractor.firecrawl.firecrawl_app import FirecrawlApp
 from core.rag.extractor.firecrawl.firecrawl_web_extractor import FirecrawlWebExtractor
-from services.data_source.provider_service import DatasourceProviderService
-from services.data_source.website_service import WebsiteService
+from tests.unit_tests.core.rag.extractor.website_test_fakes import unused_website_service
 
 
 def _response(status_code: int, json_data: Mapping[str, object] | None = None, text: str = "") -> MagicMock:
@@ -151,24 +151,12 @@ class TestFirecrawlApp:
         }
         mocker.patch("core.helper.ssrf_proxy.get", return_value=_response(200, payload))
 
-        save_calls: list[tuple[str, bytes]] = []
-        delete_calls: list[str] = []
-
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = True
-        mock_storage.delete.side_effect = lambda key: delete_calls.append(key)
-        mock_storage.save.side_effect = lambda key, data: save_calls.append((key, data))
-        mocker.patch.object(firecrawl_module, "storage", mock_storage)
-
         result = app.check_crawl_status("job-42")
 
         assert result["status"] == "completed"
         assert result["total"] == 2
         assert result["current"] == 2
         assert len(result["data"]) == 2
-        assert delete_calls == ["website_files/job-42.txt"]
-        assert len(save_calls) == 1
-        assert save_calls[0][0] == "website_files/job-42.txt"
 
     def test_check_crawl_status_completed_with_zero_total_raises(self, mocker: MockerFixture) -> None:
         app = FirecrawlApp(api_key="fc-key", base_url="https://custom.firecrawl.dev")
@@ -210,24 +198,6 @@ class TestFirecrawlApp:
             app.check_crawl_status("job-1")
         mock_handle.assert_called_once()
 
-    def test_check_crawl_status_save_failure_raises(self, mocker: MockerFixture) -> None:
-        app = FirecrawlApp(api_key="fc-key", base_url="https://custom.firecrawl.dev")
-        payload = {
-            "status": "completed",
-            "total": 1,
-            "completed": 1,
-            "data": [{"metadata": {"title": "a", "sourceURL": "https://a"}, "markdown": "m-a"}],
-        }
-        mocker.patch("core.helper.ssrf_proxy.get", return_value=_response(200, payload))
-
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = False
-        mock_storage.save.side_effect = RuntimeError("save failed")
-        mocker.patch.object(firecrawl_module, "storage", mock_storage)
-
-        with pytest.raises(Exception, match="Error saving crawl data"):
-            app.check_crawl_status("job-err")
-
     def test_check_crawl_status_follows_pagination(self, mocker: MockerFixture) -> None:
         """When status is completed and next is present, follow pagination to collect all pages."""
         app = FirecrawlApp(api_key="fc-key", base_url="https://custom.firecrawl.dev")
@@ -255,10 +225,6 @@ class TestFirecrawlApp:
             "core.helper.ssrf_proxy.get",
             side_effect=[_response(200, page1), _response(200, page2), _response(200, page3)],
         )
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = False
-        mocker.patch.object(firecrawl_module, "storage", mock_storage)
-
         result = app.check_crawl_status("job-42")
 
         assert result["status"] == "completed"
@@ -295,10 +261,6 @@ class TestFirecrawlApp:
             "data": [{"metadata": {"title": "p1", "description": "", "sourceURL": "https://p1"}, "markdown": "m1"}],
         }
         mock_get = mocker.patch("core.helper.ssrf_proxy.get", return_value=_response(200, page1))
-        mock_storage = MagicMock()
-        mock_storage.exists.return_value = False
-        mocker.patch.object(firecrawl_module, "storage", mock_storage)
-
         result = app.check_crawl_status("job-cap")
 
         assert len(result["data"]) == 1
@@ -395,7 +357,7 @@ class TestFirecrawlApp:
 class TestFirecrawlWebExtractor:
     def test_extract_crawl_mode_returns_document(self, mocker: MockerFixture) -> None:
         mocker.patch(
-            "core.rag.extractor.firecrawl.firecrawl_web_extractor.WebsiteService.get_crawl_url_data",
+            "core.rag.extractor.firecrawl.firecrawl_web_extractor.WebsiteService.get_crawl_url_data_by_ref",
             return_value={
                 "markdown": "crawl content",
                 "source_url": "https://example.com",
@@ -406,10 +368,9 @@ class TestFirecrawlWebExtractor:
 
         extractor = FirecrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="firecrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="crawl",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
         docs = extractor.extract()
 
@@ -419,22 +380,21 @@ class TestFirecrawlWebExtractor:
 
     def test_extract_crawl_mode_with_missing_data_returns_empty(self, mocker: MockerFixture) -> None:
         mocker.patch(
-            "core.rag.extractor.firecrawl.firecrawl_web_extractor.WebsiteService.get_crawl_url_data",
+            "core.rag.extractor.firecrawl.firecrawl_web_extractor.WebsiteService.get_crawl_url_data_by_ref",
             return_value=None,
         )
 
         extractor = FirecrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="firecrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="crawl",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
         assert extractor.extract() == []
 
     def test_extract_scrape_mode_returns_document(self, mocker: MockerFixture) -> None:
         mock_scrape = mocker.patch(
-            "core.rag.extractor.firecrawl.firecrawl_web_extractor.WebsiteService.get_scrape_url_data",
+            "core.rag.extractor.firecrawl.firecrawl_web_extractor.WebsiteService.get_scrape_url_data_by_ref",
             return_value={
                 "markdown": "scrape content",
                 "source_url": "https://example.com",
@@ -445,24 +405,22 @@ class TestFirecrawlWebExtractor:
 
         extractor = FirecrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="firecrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="scrape",
             only_main_content=False,
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
         docs = extractor.extract()
 
         assert len(docs) == 1
         assert docs[0].page_content == "scrape content"
-        mock_scrape.assert_called_once_with("firecrawl", "https://example.com", "tenant-1", False)
+        mock_scrape.assert_called_once_with(extractor.job_ref, "https://example.com", False)
 
     def test_extract_unknown_mode_returns_empty(self) -> None:
         extractor = FirecrawlWebExtractor(
             "https://example.com",
-            "job-1",
-            "tenant-1",
+            WebsiteJobRef(tenant_id="tenant-1", provider="firecrawl", provider_instance_id="0" * 64, job_id="job-1"),
             mode="unknown",
-            website_service=WebsiteService(providers=create_autospec(DatasourceProviderService, instance=True)),
+            website_service=unused_website_service(),
         )
         assert extractor.extract() == []

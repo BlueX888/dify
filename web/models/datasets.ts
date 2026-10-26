@@ -66,6 +66,11 @@ export type CrawlResultItem = {
   source_url: string
 }
 
+export type WebsiteCrawlReference = {
+  jobId: string
+  sourceHandle?: string
+}
+
 export type CrawlResult = {
   data: CrawlResultItem[]
   time_consuming: number | string
@@ -223,6 +228,7 @@ type DataSource = {
     website_info_list?: {
       provider: string
       job_id: string
+      source_handle?: string
       urls: string[]
     }
   }

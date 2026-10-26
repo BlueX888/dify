@@ -1,3 +1,5 @@
+from typing import TYPE_CHECKING
+
 from core.plugin.backwards_invocation.base import BaseBackwardsInvocation
 from graphon.enums import BuiltinNodeTypes
 from graphon.nodes.llm.entities import ModelConfig as LLMModelConfig
@@ -11,6 +13,9 @@ from graphon.nodes.question_classifier.entities import (
 )
 from services.workflow_service import WorkflowService
 
+if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+
 
 class PluginNodeBackwardsInvocation(BaseBackwardsInvocation):
     @classmethod
@@ -22,6 +27,8 @@ class PluginNodeBackwardsInvocation(BaseBackwardsInvocation):
         model_config: LLMModelConfig,
         instruction: str,
         query: str,
+        *,
+        external_retrieval: "ExternalDatasetRetriever",
     ):
         """
         Invoke parameter extractor node.
@@ -56,6 +63,7 @@ class PluginNodeBackwardsInvocation(BaseBackwardsInvocation):
             user_inputs={
                 f"{node_id}.query": query,
             },
+            external_retrieval=external_retrieval,
         )
 
         return {
@@ -73,6 +81,8 @@ class PluginNodeBackwardsInvocation(BaseBackwardsInvocation):
         classes: list[ClassConfig],
         instruction: str,
         query: str,
+        *,
+        external_retrieval: "ExternalDatasetRetriever",
     ):
         """
         Invoke question classifier node.
@@ -105,6 +115,7 @@ class PluginNodeBackwardsInvocation(BaseBackwardsInvocation):
             user_inputs={
                 f"{node_id}.query": query,
             },
+            external_retrieval=external_retrieval,
         )
 
         return {

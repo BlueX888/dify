@@ -795,6 +795,26 @@ class WorkflowRun(Base):
         sa.Index("workflow_run_triggerd_from_idx", "tenant_id", "app_id", "triggered_from"),
         sa.Index("workflow_run_created_at_id_idx", "created_at", "id"),
         sa.Index("workflow_run_task_id_idx", "task_id", postgresql_where=sa.text("task_id IS NOT NULL")),
+        sa.Index(
+            "workflow_run_history_claim_idx",
+            "history_sync_pending",
+            "history_claim_expires_at",
+            "history_last_attempted_at",
+        ),
+        sa.CheckConstraint(
+            "history_revision >= 0 AND history_published_revision >= 0 "
+            "AND history_published_revision <= history_revision",
+            name="workflow_run_history_revision_check",
+        ),
+        sa.CheckConstraint(
+            "(history_claim_id IS NULL AND history_claim_expires_at IS NULL) "
+            "OR (history_claim_id IS NOT NULL AND history_claim_expires_at IS NOT NULL)",
+            name="workflow_run_history_claim_check",
+        ),
+        sa.CheckConstraint(
+            "history_sync_pending OR (history_published_revision = history_revision AND history_claim_id IS NULL)",
+            name="workflow_run_history_pending_check",
+        ),
     )
 
     id: Mapped[str] = mapped_column(StringUUID, default=lambda: str(uuid4()))
@@ -805,6 +825,15 @@ class WorkflowRun(Base):
     # Nullable for historical runs whose task ID is recovered on pause replay.
     task_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
     stop_requested_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Durable ordering and retry receipt for append-only history backends.
+    # Revisions are allocated while this row is locked, so they do not depend
+    # on worker clocks or remote upload completion order.
+    history_revision: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, server_default=sa.text("0"))
+    history_published_revision: Mapped[int] = mapped_column(sa.BigInteger, nullable=False, server_default=sa.text("0"))
+    history_claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True)
+    history_claim_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    history_last_attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    history_sync_pending: Mapped[bool] = mapped_column(sa.Boolean, nullable=False, server_default=sa.false())
 
     workflow_id: Mapped[str] = mapped_column(StringUUID)
     type: Mapped[WorkflowType] = mapped_column(EnumText(WorkflowType, length=255))

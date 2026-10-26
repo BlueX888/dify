@@ -6,13 +6,14 @@ which provides document storage and retrieval functionality for datasets in the 
 """
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import event, func, select
 from sqlalchemy.orm import Session
 
 from core.rag.docstore.dataset_docstore import DatasetDocumentStore, DocumentSegment
 from core.rag.models.document import AttachmentDocument, ChildDocument, Document
 from models.dataset import ChildChunk, Dataset, SegmentAttachmentBinding
-from tests.unit_tests.model_factories import make_dataset
+from models.dataset import Document as DatasetDocument
+from tests.unit_tests.model_factories import make_dataset, make_document, make_upload_file
 
 TENANT_ID = "00000000-0000-0000-0000-000000000001"
 DATASET_ID = "00000000-0000-0000-0000-000000000002"
@@ -71,6 +72,18 @@ class _UsesSQLiteSession:
     @pytest.fixture(autouse=True)
     def _inject_sqlite_session(self, sqlite_session: Session) -> None:
         self.session = sqlite_session
+
+
+class _UsesPersistedAttachmentOwner(_UsesSQLiteSession):
+    @pytest.fixture(autouse=True)
+    def _persist_attachment_owner(self, sqlite_session: Session) -> None:
+        sqlite_session.add_all(
+            [
+                _dataset(),
+                make_document(document_id=DOCUMENT_ID, tenant_id=TENANT_ID, dataset_id=DATASET_ID),
+            ]
+        )
+        sqlite_session.flush()
 
 
 class TestDatasetDocumentStoreInit(_UsesSQLiteSession):
@@ -186,7 +199,7 @@ class TestDatasetDocumentStoreDocs(_UsesSQLiteSession):
         assert result == {}
 
 
-class TestDatasetDocumentStoreAddDocuments(_UsesSQLiteSession):
+class TestDatasetDocumentStoreAddDocuments(_UsesPersistedAttachmentOwner):
     """Tests for add_documents method."""
 
     def test_add_documents_new_document_with_token_count(self, sqlite_session: Session) -> None:
@@ -211,6 +224,38 @@ class TestDatasetDocumentStoreAddDocuments(_UsesSQLiteSession):
         assert segment.content == "Test content"
         assert segment.tokens == 10
         assert segment.position == 1
+
+    def test_add_documents_locks_owner_before_flushing_dirty_document(self, sqlite_session: Session) -> None:
+        owner = sqlite_session.get(DatasetDocument, DOCUMENT_ID)
+        assert owner is not None
+        owner.name = "Renamed before indexing"
+        statements: list[str] = []
+        bind = sqlite_session.get_bind()
+
+        def record_statement(
+            _connection: object,
+            _cursor: object,
+            statement: str,
+            _parameters: object,
+            _context: object,
+            _executemany: bool,
+        ) -> None:
+            statements.append(" ".join(statement.lower().split()))
+
+        event.listen(bind, "before_cursor_execute", record_statement)
+        try:
+            DatasetDocumentStore(dataset=_dataset(), user_id=USER_ID, document_id=DOCUMENT_ID).add_documents(
+                session=sqlite_session,
+                docs=[Document(page_content="New content", metadata={"doc_id": "new-doc", "doc_hash": "hash"})],
+                token_counts=[2],
+            )
+        finally:
+            event.remove(bind, "before_cursor_execute", record_statement)
+
+        dataset_lock = next(index for index, sql in enumerate(statements) if " from datasets " in sql)
+        document_lock = next(index for index, sql in enumerate(statements) if " from documents " in sql)
+        document_update = next(index for index, sql in enumerate(statements) if sql.startswith("update documents "))
+        assert dataset_lock < document_lock < document_update
 
     def test_add_documents_update_existing_document(self, sqlite_session: Session) -> None:
         """Test updating existing document with allow_update=True."""
@@ -502,6 +547,24 @@ class TestDatasetDocumentStoreMultimodelBinding(_UsesSQLiteSession):
         attachment = AttachmentDocument(page_content="attachment", metadata={"doc_id": ATTACHMENT_ID})
 
         mock_session = self.session
+        segment = _segment()
+        segment.id = "seg-1"
+        mock_session.add_all(
+            [
+                _dataset(),
+                make_document(document_id=DOCUMENT_ID, tenant_id=TENANT_ID, dataset_id=DATASET_ID),
+                segment,
+                make_upload_file(
+                    file_id=ATTACHMENT_ID,
+                    tenant_id=TENANT_ID,
+                    key="image_files/tenant/attachment.png",
+                    name="attachment.png",
+                    extension="png",
+                    mime_type="image/png",
+                ),
+            ]
+        )
+        mock_session.flush()
 
         store = DatasetDocumentStore(
             dataset=_dataset(),
@@ -565,7 +628,7 @@ class TestDatasetDocumentStoreMultimodelBinding(_UsesSQLiteSession):
         assert mock_session.scalar(select(func.count()).select_from(SegmentAttachmentBinding)) == 0
 
 
-class TestDatasetDocumentStoreAddDocumentsUpdateChild(_UsesSQLiteSession):
+class TestDatasetDocumentStoreAddDocumentsUpdateChild(_UsesPersistedAttachmentOwner):
     """Tests for add_documents when updating existing documents with children."""
 
     def test_add_documents_update_existing_with_children(self, sqlite_session: Session) -> None:
@@ -613,7 +676,7 @@ class TestDatasetDocumentStoreAddDocumentsUpdateChild(_UsesSQLiteSession):
         assert children[0].index_node_id == "child-1"
 
 
-class TestDatasetDocumentStoreAddDocumentsUpdateAnswer(_UsesSQLiteSession):
+class TestDatasetDocumentStoreAddDocumentsUpdateAnswer(_UsesPersistedAttachmentOwner):
     """Tests for add_documents when updating existing documents with answer metadata."""
 
     def test_add_documents_update_existing_with_answer(self, sqlite_session: Session) -> None:

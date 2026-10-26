@@ -152,29 +152,33 @@ type WebsiteCrawlTaskBody = {
 const createWebsiteCrawlTask = (provider: WebsiteCrawlProvider, body: WebsiteCrawlTaskBody) =>
   consoleClient.website.crawl.post({ body: { ...body, provider } })
 
-const checkWebsiteCrawlTaskStatus = (provider: WebsiteCrawlProvider, jobId: string) =>
+const checkWebsiteCrawlTaskStatus = (
+  provider: WebsiteCrawlProvider,
+  jobId: string,
+  sourceHandle: string,
+) =>
   consoleClient.website.crawl.status.byJobId.get(
-    { params: { job_id: jobId }, query: { provider } },
+    { params: { job_id: jobId }, query: { provider, source_handle: sourceHandle } },
     { context: { silent: true } },
   )
 
 export const createFirecrawlTask = (body: WebsiteCrawlTaskBody) =>
   createWebsiteCrawlTask(DataSourceProvider.fireCrawl, body)
 
-export const checkFirecrawlTaskStatus = (jobId: string) =>
-  checkWebsiteCrawlTaskStatus(DataSourceProvider.fireCrawl, jobId)
+export const checkFirecrawlTaskStatus = (jobId: string, sourceHandle: string) =>
+  checkWebsiteCrawlTaskStatus(DataSourceProvider.fireCrawl, jobId, sourceHandle)
 
 export const createJinaReaderTask = (body: WebsiteCrawlTaskBody) =>
   createWebsiteCrawlTask(DataSourceProvider.jinaReader, body)
 
-export const checkJinaReaderTaskStatus = (jobId: string) =>
-  checkWebsiteCrawlTaskStatus(DataSourceProvider.jinaReader, jobId)
+export const checkJinaReaderTaskStatus = (jobId: string, sourceHandle: string) =>
+  checkWebsiteCrawlTaskStatus(DataSourceProvider.jinaReader, jobId, sourceHandle)
 
 export const createWatercrawlTask = (body: WebsiteCrawlTaskBody) =>
   createWebsiteCrawlTask(DataSourceProvider.waterCrawl, body)
 
-export const checkWatercrawlTaskStatus = (jobId: string) =>
-  checkWebsiteCrawlTaskStatus(DataSourceProvider.waterCrawl, jobId)
+export const checkWatercrawlTaskStatus = (jobId: string, sourceHandle: string) =>
+  checkWebsiteCrawlTaskStatus(DataSourceProvider.waterCrawl, jobId, sourceHandle)
 
 export const retryErrorDocs = ({
   datasetId,

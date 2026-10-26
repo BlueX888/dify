@@ -10,8 +10,8 @@ from enums import CloudPlan, DeploymentEdition
 from models import Account, Tenant, TenantAccountJoin, TenantAccountRole
 from models.dataset import Dataset, Document, DocumentSegment
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus, SegmentStatus
+from services.knowledge.entities.resource_scope import DocumentRef
 from services.knowledge.indexing.errors import DocumentIsPausedError
-from services.knowledge.resource_scope import DocumentRef
 from tasks.duplicate_document_indexing_task import (
     _duplicate_document_indexing_task,  # Core function
     _duplicate_document_indexing_task_with_tenant_queue,  # Tenant queue wrapper function
@@ -42,27 +42,19 @@ class TestDuplicateDocumentIndexingTasks:
                 "tasks.duplicate_document_indexing_task.build_document_indexing_service", autospec=True
             ) as mock_indexing_runner,
             patch("tasks.duplicate_document_indexing_task.FeatureService", autospec=True) as mock_feature_service,
-            patch(
-                "tasks.duplicate_document_indexing_task.IndexProcessorFactory", autospec=True
-            ) as mock_index_processor_factory,
+            patch("tasks.duplicate_document_indexing_task.clean_document_for_reindex", autospec=True) as mock_cleanup,
         ):
             # Setup mock indexing runner
             mock_runner_instance = mock_indexing_runner.return_value  # Setup mock feature service
-            mock_features = MagicMock()
+            mock_features = mock_feature_service.get_features.return_value
             mock_feature_service.get_features.return_value = mock_features
-
-            # Setup mock index processor factory
-            mock_processor = MagicMock()
-            mock_processor.clean = MagicMock()
-            mock_index_processor_factory.return_value.init_index_processor.return_value = mock_processor
 
             yield {
                 "indexing_runner": mock_indexing_runner,
                 "indexing_runner_instance": mock_runner_instance,
                 "feature_service": mock_feature_service,
                 "features": mock_features,
-                "index_processor_factory": mock_index_processor_factory,
-                "index_processor": mock_processor,
+                "cleanup": mock_cleanup,
             }
 
     def _runner_documents_arg(self, mock_external_service_dependencies) -> list[DocumentRef]:
@@ -347,24 +339,17 @@ class TestDuplicateDocumentIndexingTasks:
         processed_documents = self._runner_documents_arg(mock_external_service_dependencies)
         assert len(processed_documents) == 3
 
-    def _test_duplicate_document_indexing_task_with_segment_cleanup(
+    def _test_duplicate_document_indexing_task_groups_cleanup_by_doc_form(
         self, db_session_with_containers: Session, mock_external_service_dependencies
     ):
-        """
-        Test duplicate document indexing with existing segments that need cleanup.
-
-        This test verifies:
-        - Old segments are identified and cleaned
-        - Index processor clean method is called
-        - Segments are deleted from database
-        - New indexing proceeds after cleanup
-        """
+        """Cleanup receives one owner-scoped call for each document form."""
         # Arrange: Create test data with existing segments
-        dataset, documents, segments = self._create_test_dataset_with_segments(
+        dataset, documents, _ = self._create_test_dataset_with_segments(
             db_session_with_containers, mock_external_service_dependencies, document_count=2, segments_per_doc=3
         )
+        documents[1].doc_form = IndexStructureType.QA_INDEX
+        db_session_with_containers.commit()
         document_ids = [doc.id for doc in documents]
-        segment_ids = [seg.id for seg in segments]
 
         # Act: Execute the task
         _duplicate_document_indexing_task(dataset.id, document_ids)
@@ -372,20 +357,16 @@ class TestDuplicateDocumentIndexingTasks:
         # Ensure we see committed changes from a different session
         db_session_with_containers.expire_all()
 
-        # Assert: Verify segment cleanup
-        db_session_with_containers.expire_all()
-
-        # Assert: Verify segment cleanup
-        # Verify index processor clean was called for each document with segments
-        assert mock_external_service_dependencies["index_processor"].clean.call_count == len(documents)
-
-        # Verify segments were deleted from database
-        # Re-query segments from database using captured IDs to avoid stale ORM instances
-        for seg_id in segment_ids:
-            deleted_segment = db_session_with_containers.scalar(
-                select(DocumentSegment).where(DocumentSegment.id == seg_id).limit(1)
-            )
-            assert deleted_segment is None
+        cleanup = mock_external_service_dependencies["cleanup"]
+        assert cleanup.call_count == 2
+        cleanup_calls = {item.kwargs["doc_form"]: item.kwargs for item in cleanup.call_args_list}
+        assert cleanup_calls[IndexStructureType.PARAGRAPH_INDEX]["document_ids"] == [documents[0].id]
+        assert cleanup_calls[IndexStructureType.QA_INDEX]["document_ids"] == [documents[1].id]
+        for cleanup_kwargs in cleanup_calls.values():
+            assert cleanup_kwargs["tenant_id"] == dataset.tenant_id
+            assert cleanup_kwargs["dataset_id"] == dataset.id
+            assert callable(cleanup_kwargs["new_session"])
+            assert callable(cleanup_kwargs["delete_blob"])
 
         # Verify documents were updated to parsing status
         for doc_id in document_ids:
@@ -420,7 +401,7 @@ class TestDuplicateDocumentIndexingTasks:
         # Assert: Verify no processing occurred
         mock_external_service_dependencies["indexing_runner"].assert_not_called()
         mock_external_service_dependencies["indexing_runner_instance"].run.assert_not_called()
-        mock_external_service_dependencies["index_processor"].clean.assert_not_called()
+        mock_external_service_dependencies["cleanup"].assert_not_called()
 
     def test_duplicate_document_indexing_task_document_not_found_in_dataset(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -786,6 +767,7 @@ class TestDuplicateDocumentIndexingTasks:
             "tenant_id": tenant_id,
             "dataset_id": dataset_id,
             "document_ids": document_ids,
+            "indexing_request_id": "duplicate-request-1",
         }
         mock_queue.pull_tasks.return_value = [next_task]
         mock_queue_class.return_value = mock_queue
@@ -803,6 +785,7 @@ class TestDuplicateDocumentIndexingTasks:
             tenant_id=tenant_id,
             dataset_id=dataset_id,
             document_ids=document_ids,
+            indexing_request_id="duplicate-request-1",
         )
         mock_queue.delete_task_key.assert_not_called()
 
@@ -887,10 +870,28 @@ class TestDuplicateDocumentIndexingTasks:
             db_session_with_containers, mock_external_service_dependencies
         )
 
-    def test_duplicate_document_indexing_cleans_old_segments(
+    def test_duplicate_document_indexing_groups_cleanup_by_doc_form(
         self, db_session_with_containers: Session, mock_external_service_dependencies
     ):
-        """Test that duplicate document indexing cleans old segments."""
-        self._test_duplicate_document_indexing_task_with_segment_cleanup(
+        self._test_duplicate_document_indexing_task_groups_cleanup_by_doc_form(
             db_session_with_containers, mock_external_service_dependencies
         )
+
+    def test_duplicate_document_indexing_cleanup_error_skips_indexing(
+        self, db_session_with_containers: Session, mock_external_service_dependencies
+    ):
+        dataset, documents = self._create_test_dataset_and_documents(
+            db_session_with_containers, mock_external_service_dependencies, document_count=2
+        )
+        document_ids = [document.id for document in documents]
+        mock_external_service_dependencies["cleanup"].side_effect = RuntimeError("cleanup failed")
+
+        _duplicate_document_indexing_task(dataset.id, document_ids)
+
+        mock_external_service_dependencies["cleanup"].assert_called_once()
+        mock_external_service_dependencies["indexing_runner_instance"].run.assert_not_called()
+        db_session_with_containers.expire_all()
+        for document_id in document_ids:
+            document = db_session_with_containers.get(Document, document_id)
+            assert document is not None
+            assert document.indexing_status == IndexingStatus.WAITING

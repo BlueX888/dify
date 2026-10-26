@@ -16,6 +16,8 @@ from core.callback_handler.index_tool_callback_handler import DatasetIndexToolCa
 from core.db.session_factory import create_session
 from core.model_manager import ModelManager
 from core.moderation.base import ModerationError
+from core.rag.embedding.retrieval import RetrievalFinalizer
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from graphon.file import File
 from graphon.model_runtime.entities.message_entities import ImagePromptMessageContent
@@ -29,6 +31,12 @@ class CompletionAppRunner(AppRunner):
     """
     Completion Application Runner
     """
+
+    def __init__(
+        self, *, external_retrieval: ExternalDatasetRetriever, retrieval_finalizer: RetrievalFinalizer
+    ) -> None:
+        self._external_retrieval = external_retrieval
+        self._retrieval_finalizer = retrieval_finalizer
 
     def run(
         self,
@@ -131,7 +139,11 @@ class CompletionAppRunner(AppRunner):
             if dataset_config and dataset_config.retrieve_config.query_variable:
                 query = inputs.get(dataset_config.retrieve_config.query_variable, "")
 
-            dataset_retrieval = DatasetRetrieval(application_generate_entity)
+            dataset_retrieval = DatasetRetrieval(
+                application_generate_entity,
+                external_retrieval=self._external_retrieval,
+                retrieval_finalizer=self._retrieval_finalizer,
+            )
             context, retrieved_files = dataset_retrieval.retrieve(
                 session=session,
                 app_id=app_record.id,

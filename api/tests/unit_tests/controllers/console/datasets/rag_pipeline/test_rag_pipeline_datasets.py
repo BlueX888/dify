@@ -76,6 +76,7 @@ class TestCreateRagPipelineDatasetApi:
             "imported_dsl_version": "0.1.0",
             "error": "",
         }
+        mock_service.finalize_committed_import.assert_called_once_with()
 
     def test_post_success_syncs_creator_under_rbac(self, app: Flask) -> None:
         """RBAC: RAG-pipeline dataset create must keep the creator bound to their own dataset.
@@ -159,6 +160,7 @@ class TestCreateRagPipelineDatasetApi:
         ):
             with pytest.raises(DatasetNameDuplicateError):
                 method(api, RagPipelineDatasetImportPayload.model_validate(payload), "tenant-1", user)
+        mock_service.finalize_committed_import.assert_not_called()
 
     def test_post_invalid_payload(self, app: Flask) -> None:
         api = CreateRagPipelineDatasetApi()

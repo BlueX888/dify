@@ -44,7 +44,7 @@ type IStepOneProps = {
   websitePages?: CrawlResultItem[]
   updateWebsitePages: (value: CrawlResultItem[]) => void
   onWebsiteCrawlProviderChange: (provider: DataSourceProvider) => void
-  onWebsiteCrawlJobIdChange: (jobId: string) => void
+  onWebsiteCrawlJobIdChange: (jobId: string, sourceHandle?: string) => void
   crawlOptions: CrawlOptions
   onCrawlOptionsChange: (payload: CrawlOptions) => void
   authedDataSourceList: DatasourceProviderAuthResponse[]

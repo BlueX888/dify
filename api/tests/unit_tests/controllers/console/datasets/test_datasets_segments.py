@@ -3,15 +3,18 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from inspect import unwrap
-from typing import Never
-from unittest.mock import create_autospec, patch
+from typing import Never, cast
+from unittest.mock import Mock, create_autospec, patch
 
 import pytest
 from flask import Flask
+from flask.testing import FlaskClient
 from werkzeug.exceptions import Forbidden, NotFound
 
 from controllers.common.controller_schemas import ChildChunkCreatePayload, ChildChunkUpdatePayload
+from controllers.console import flask_admission, wraps
 from controllers.console.app.error import ProviderNotInitializeError
+from controllers.console.datasets import datasets_segments as controller
 from controllers.console.datasets.datasets_segments import (
     BatchImportPayload,
     ChildChunkAddApi,
@@ -33,7 +36,12 @@ from controllers.console.datasets.datasets_segments import (
     _raise_segment_status_error,
 )
 from controllers.console.datasets.error import ChildChunkDeleteIndexError, ChildChunkIndexingError, InvalidActionError
+from enums import DeploymentEdition
+from enums.account import TenantAccountRole
+from libs.external_api import ExternalApi
+from libs.login import AccountWithTenant
 from machinery.context import RequestContext
+from models.account import Account
 from services.knowledge.entities.segments import ChildChunkRecord, ChildChunkUpdateArgs, SegmentRecord
 from services.knowledge.segments.application import (
     ChildChunkDeleteIndexApplicationError,
@@ -130,11 +138,55 @@ class ApplicationServiceStub:
     knowledge: KnowledgeServiceStub
 
 
+@dataclass
+class AdmittedAccount:
+    id: str
+    role: TenantAccountRole
+    status: str = "active"
+
+
+@dataclass(frozen=True)
+class BatchImportRoutes:
+    client: FlaskClient
+    account: AdmittedAccount
+    segments: Mock
+
+
 def _patch_services(segments: DatasetSegmentApplicationService) -> AbstractContextManager[object]:
     return patch(
         "controllers.console.datasets.datasets_segments.application_services",
         return_value=ApplicationServiceStub(knowledge=KnowledgeServiceStub(segments=segments)),
     )
+
+
+@pytest.fixture
+def batch_import_routes(monkeypatch: pytest.MonkeyPatch, config_overrides) -> BatchImportRoutes:
+    config_overrides(
+        DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY,
+        LOGIN_DISABLED=True,
+        RBAC_ENABLED=False,
+    )
+    app = Flask(__name__)
+    app.config.update(TESTING=False, PROPAGATE_EXCEPTIONS=False)
+    api = ExternalApi(app)
+    api.add_resource(
+        DatasetDocumentSegmentBatchImportApi,
+        "/datasets/<uuid:dataset_id>/documents/<uuid:document_id>/segments/batch_import",
+    )
+
+    account = AdmittedAccount(id="account-1", role=TenantAccountRole.EDITOR)
+    identity = AccountWithTenant(account=cast("Account", account), tenant_id="workspace-1")
+    monkeypatch.setattr(flask_admission, "current_account_with_tenant", lambda: identity)
+    monkeypatch.setattr(wraps, "current_account_with_tenant", lambda: identity)
+    monkeypatch.setattr(wraps, "_is_setup_completed", lambda: True)
+    segments = create_autospec(DatasetSegmentApplicationService, instance=True, spec_set=True)
+    segments.start_batch_import.return_value = SegmentBatchImport(job_id="job-1", job_status="waiting")
+    monkeypatch.setattr(
+        controller,
+        "application_services",
+        lambda: ApplicationServiceStub(knowledge=KnowledgeServiceStub(segments=segments)),
+    )
+    return BatchImportRoutes(client=app.test_client(), account=account, segments=segments)
 
 
 def test_list_segments_delegates_typed_query_and_serializes_page(app: Flask) -> None:
@@ -278,6 +330,51 @@ def test_batch_import_delegates_and_preserves_dispatch_failure_response(app: Fla
             "document-1",
         )
     assert (response, status) == ({"error": "redis down"}, 500)
+
+
+def test_batch_import_admission_rejects_community_normal_member(batch_import_routes: BatchImportRoutes) -> None:
+    batch_import_routes.account.role = TenantAccountRole.NORMAL
+
+    response = batch_import_routes.client.post(
+        "/datasets/00000000-0000-0000-0000-000000000001/"
+        "documents/00000000-0000-0000-0000-000000000002/segments/batch_import",
+        json={"upload_file_id": "file-1"},
+    )
+
+    assert response.status_code == 403
+    batch_import_routes.segments.start_batch_import.assert_not_called()
+
+
+def test_batch_import_admission_allows_community_editor(batch_import_routes: BatchImportRoutes) -> None:
+    response = batch_import_routes.client.post(
+        "/datasets/00000000-0000-0000-0000-000000000001/"
+        "documents/00000000-0000-0000-0000-000000000002/segments/batch_import",
+        json={"upload_file_id": "file-1"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"job_id": "job-1", "job_status": "waiting"}
+    call = batch_import_routes.segments.start_batch_import.call_args
+    assert call.args[0].account_id == "account-1"
+    assert call.args[0].active_workspace_id == "workspace-1"
+    assert call.kwargs == {
+        "dataset_id": "00000000-0000-0000-0000-000000000001",
+        "document_id": "00000000-0000-0000-0000-000000000002",
+        "upload_file_id": "file-1",
+    }
+
+
+def test_batch_import_maps_private_dataset_denial_after_admission(batch_import_routes: BatchImportRoutes) -> None:
+    batch_import_routes.segments.start_batch_import.side_effect = SegmentPermissionDeniedError("access denied")
+
+    response = batch_import_routes.client.post(
+        "/datasets/00000000-0000-0000-0000-000000000001/"
+        "documents/00000000-0000-0000-0000-000000000002/segments/batch_import",
+        json={"upload_file_id": "file-1"},
+    )
+
+    assert response.status_code == 403
+    batch_import_routes.segments.start_batch_import.assert_called_once()
 
 
 def test_batch_import_status_preserves_missing_job_contract(app: Flask) -> None:

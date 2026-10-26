@@ -6,6 +6,7 @@ they never create, commit, or close a session and perform no external I/O.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,6 +38,22 @@ from models.dataset import (
 )
 from models.model import App, Tag, TagBinding, UploadFile
 from models.tools import ToolFile
+
+# Match persisted file references, including the old query string that presentation replaces.
+_FILE_ID = r"[a-fA-F0-9]{8}(?:-[a-fA-F0-9]{4}){3}-[a-fA-F0-9]{12}"
+SEGMENT_FILE_LINK = re.compile(
+    rf"/files/(?:(?P<upload>{_FILE_ID})/(?P<preview>image-preview|file-preview)"
+    rf"|tools/(?P<tool>{_FILE_ID})\.(?P<extension>[a-zA-Z0-9]+))"
+    r"(?:\?[^\s)\"'<>]*)?"
+)
+
+
+def segment_content_file_ids(content: str) -> tuple[set[str], set[str]]:
+    matches = list(SEGMENT_FILE_LINK.finditer(content))
+    return (
+        {match["upload"].lower() for match in matches if match["upload"]},
+        {match["tool"].lower() for match in matches if match["tool"]},
+    )
 
 
 @dataclass(frozen=True)
@@ -132,14 +149,15 @@ def load_document_read_batch(documents: Sequence[Document], *, session: Session)
     )
 
 
-def get_segment_content_file_ids(
-    segment: DocumentSegment, *, upload_ids: set[str], tool_ids: set[str], session: Session
+def get_content_file_ids(
+    tenant_id: str, *, upload_ids: set[str], tool_ids: set[str], session: Session
 ) -> tuple[set[str], set[str]]:
+    """Validate a batch of content references against the tenant and execution scope."""
     access = DatabaseFileAccessController()
     uploads = (
         session.scalars(
             access.apply_upload_file_filters(
-                select(UploadFile).where(UploadFile.id.in_(upload_ids), UploadFile.tenant_id == segment.tenant_id)
+                select(UploadFile).where(UploadFile.id.in_(upload_ids), UploadFile.tenant_id == tenant_id)
             )
         ).all()
         if upload_ids
@@ -148,7 +166,7 @@ def get_segment_content_file_ids(
     tools = (
         session.scalars(
             access.apply_tool_file_filters(
-                select(ToolFile).where(ToolFile.id.in_(tool_ids), ToolFile.tenant_id == segment.tenant_id)
+                select(ToolFile).where(ToolFile.id.in_(tool_ids), ToolFile.tenant_id == tenant_id)
             )
         ).all()
         if tool_ids
@@ -157,8 +175,20 @@ def get_segment_content_file_ids(
     return {file.id for file in uploads}, {file.id for file in tools}
 
 
-def get_segment_attachment_files(segment: DocumentSegment, *, session: Session) -> Sequence[UploadFile]:
-    return session.scalars(
+def get_segment_attachment_files(
+    segment: DocumentSegment,
+    *,
+    session: Session,
+    lock: bool = False,
+) -> Sequence[UploadFile]:
+    """Read attachment owners, optionally as a locking current read.
+
+    Retrieval finalization first locks the complete Dataset/Document/Segment
+    owner chain, then requests this lock. Binding writers take the same owner
+    locks before their UploadFile and binding locks, so the final read cannot
+    observe a stale REPEATABLE READ snapshot or reverse a live writer's order.
+    """
+    statement = (
         select(UploadFile)
         .join(SegmentAttachmentBinding, UploadFile.id == SegmentAttachmentBinding.attachment_id)
         .where(
@@ -168,35 +198,30 @@ def get_segment_attachment_files(segment: DocumentSegment, *, session: Session) 
             SegmentAttachmentBinding.segment_id == segment.id,
             UploadFile.tenant_id == segment.tenant_id,
         )
-    ).all()
+    )
+    if lock:
+        statement = statement.with_for_update(read=True).execution_options(populate_existing=True)
+    return session.scalars(statement).all()
 
 
-def is_retrieved_segment_owned(
-    segment: DocumentSegment, *, tenant_id: str, dataset_ids: Sequence[str], session: Session
-) -> bool:
-    """Validate retrieved identifiers against the complete persisted owner chain."""
-    if segment.tenant_id != tenant_id or segment.dataset_id not in dataset_ids:
-        return False
+def retrieved_segment_statement(*, tenant_id: str, dataset_ids: Sequence[str]):
+    """Shared complete owner-chain query for retrieval readers."""
     return (
-        session.scalar(
-            select(DocumentSegment.id)
-            .join(Document, Document.id == DocumentSegment.document_id)
-            .join(Dataset, Dataset.id == Document.dataset_id)
-            .where(
-                Dataset.tenant_id == tenant_id,
-                Dataset.id == segment.dataset_id,
-                Document.tenant_id == tenant_id,
-                Document.dataset_id == segment.dataset_id,
-                Document.id == segment.document_id,
-                Document.enabled.is_(True),
-                Document.archived.is_(False),
-                DocumentSegment.tenant_id == tenant_id,
-                DocumentSegment.dataset_id == segment.dataset_id,
-                DocumentSegment.id == segment.id,
-                DocumentSegment.enabled.is_(True),
-            )
+        select(DocumentSegment)
+        .join(Document, Document.id == DocumentSegment.document_id)
+        .join(Dataset, Dataset.id == Document.dataset_id)
+        .where(
+            Dataset.tenant_id == tenant_id,
+            Dataset.id.in_(dataset_ids),
+            Document.tenant_id == tenant_id,
+            Document.dataset_id == DocumentSegment.dataset_id,
+            Document.indexing_status == "completed",
+            Document.enabled.is_(True),
+            Document.archived.is_(False),
+            DocumentSegment.tenant_id == tenant_id,
+            DocumentSegment.status == "completed",
+            DocumentSegment.enabled.is_(True),
         )
-        is not None
     )
 
 
@@ -464,13 +489,6 @@ def get_document_hit_count(document: Document, *, session: Session) -> int:
 def get_document_uploader(document: Document, *, session: Session) -> str | None:
     user = session.scalar(select(Account).where(Account.id == document.created_by))
     return user.name if user else None
-
-
-def get_segment_dataset(segment: DocumentSegment, *, session: Session) -> Dataset | None:
-    """Load the owning dataset with the caller-owned database session."""
-    return session.scalar(
-        select(Dataset).where(Dataset.id == segment.dataset_id, Dataset.tenant_id == segment.tenant_id)
-    )
 
 
 def get_segment_document(segment: DocumentSegment, *, session: Session) -> Document | None:

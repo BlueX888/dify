@@ -242,6 +242,20 @@ class WorkflowTriggerLog(TypeBase):
     - total_tokens (int) Optional - Total tokens used
     - created_by_role (string) Creator role: account, end_user
     - created_by (string) Creator ID
+    - terminal_owner_id (uuid) Execution claim token that most recently committed
+      a pause or terminal state; this is an ownership receipt, not a user actor
+    - pending_dispatch_abandoned_at (timestamp) Durable fence for a legacy
+      producer that published before making the trigger executable
+    - dispatch_prepared_at (timestamp) Durable start of a current-protocol
+      broker publication attempt
+    - dispatch_published_at (timestamp) Broker publication receipt
+    - dispatch_abandoned_at (timestamp) Durable terminal fence for an
+      unpublished dispatch
+    - quota_reservation_id (string) Optional durable billing reservation
+    - quota_settlement_status (string) Durable quota settlement outcome
+    - quota_settlement_attempted_at (timestamp) Last quota reconciliation attempt
+    - quota_sync_pending (boolean) Whether a known dispatch outcome still
+      requires quota reconciliation
     - created_at (timestamp) Creation time
     - triggered_at (timestamp) Optional - When actually triggered
     - finished_at (timestamp) Optional - Completion time
@@ -255,6 +269,36 @@ class WorkflowTriggerLog(TypeBase):
         sa.Index("workflow_trigger_log_created_at_idx", "created_at"),
         sa.Index("workflow_trigger_log_workflow_run_idx", "workflow_run_id"),
         sa.Index("workflow_trigger_log_workflow_id_idx", "workflow_id"),
+        sa.Index(
+            "workflow_trigger_log_quota_sync_pending_idx",
+            "quota_sync_pending",
+            "quota_settlement_attempted_at",
+            "dispatch_prepared_at",
+            "id",
+        ),
+        sa.CheckConstraint(
+            "status <> 'queued' OR pending_dispatch_abandoned_at IS NULL",
+            name="workflow_trigger_log_pending_dispatch_abandoned_check",
+        ),
+        sa.CheckConstraint(
+            "(dispatch_published_at IS NULL OR dispatch_prepared_at IS NOT NULL) "
+            "AND (dispatch_abandoned_at IS NULL OR dispatch_prepared_at IS NOT NULL) "
+            "AND (dispatch_published_at IS NULL OR dispatch_abandoned_at IS NULL)",
+            name="workflow_trigger_log_dispatch_receipt_check",
+        ),
+        sa.CheckConstraint(
+            "status <> 'queued' OR dispatch_abandoned_at IS NULL",
+            name="workflow_trigger_log_queued_dispatch_abandoned_check",
+        ),
+        sa.CheckConstraint(
+            "quota_settlement_status IS NULL "
+            "OR quota_settlement_status IN ('committed', 'refunded', 'permanent_error')",
+            name="workflow_trigger_log_quota_settlement_status_check",
+        ),
+        sa.CheckConstraint(
+            "quota_sync_pending = false OR quota_settlement_status IS NULL",
+            name="workflow_trigger_log_quota_sync_pending_check",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -278,6 +322,22 @@ class WorkflowTriggerLog(TypeBase):
     celery_task_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_by_role: Mapped[CreatorUserRole] = mapped_column(EnumText(CreatorUserRole, length=255), nullable=False)
     created_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    execution_owner_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    execution_lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    terminal_owner_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    pending_dispatch_abandoned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    dispatch_prepared_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    dispatch_published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    dispatch_abandoned_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    quota_reservation_id: Mapped[str | None] = mapped_column(String(255), nullable=True, default=None)
+    quota_settlement_status: Mapped[str | None] = mapped_column(String(16), nullable=True, default=None)
+    quota_settlement_attempted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True, default=None)
+    quota_sync_pending: Mapped[bool] = mapped_column(
+        sa.Boolean,
+        nullable=False,
+        default=False,
+        server_default=sa.false(),
+    )
     retry_count: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
     elapsed_time: Mapped[float | None] = mapped_column(sa.Float, nullable=True, default=None)
     total_tokens: Mapped[int | None] = mapped_column(sa.Integer, nullable=True, default=None)

@@ -16,8 +16,69 @@ from models.dataset import (
 )
 from repositories.knowledge.dataset_read_repository import get_document_uploader
 from services.errors.metadata import MetadataResourceNotFoundError
-from services.knowledge.metadata.application import MetadataList, MetadataOperation, MetadataRecord
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
+from services.knowledge.metadata.application import (
+    MetadataList,
+    MetadataOperation,
+    MetadataRecord,
+    validate_metadata_value,
+)
+
+
+def lock_metadata_dataset(session: Session, ref: DatasetRef) -> Dataset | None:
+    """Lock and refresh the dataset that serializes all metadata mutations."""
+
+    return session.scalar(
+        select(Dataset)
+        .where(Dataset.id == ref.dataset_id, Dataset.tenant_id == ref.tenant_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+def lock_metadata_document(session: Session, ref: DatasetRef, document_id: str) -> Document | None:
+    """Lock and refresh one document after its dataset metadata lock is held."""
+
+    return session.scalar(
+        select(Document)
+        .where(
+            Document.id == document_id,
+            Document.tenant_id == ref.tenant_id,
+            Document.dataset_id == ref.dataset_id,
+        )
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+
+def lock_metadata_document_bindings(
+    session: Session, ref: DatasetRef, document_id: str
+) -> list[tuple[DatasetMetadataBinding, DatasetMetadata]]:
+    """Lock and current-read the document's valid custom metadata bindings.
+
+    The caller must already hold the dataset metadata lock and the document
+    lock, in that order. Joining through the complete owner chain prevents a
+    malformed cross-tenant binding from protecting or restoring JSON values.
+    """
+
+    rows = session.execute(
+        select(DatasetMetadataBinding, DatasetMetadata)
+        .join(
+            DatasetMetadata,
+            (DatasetMetadata.id == DatasetMetadataBinding.metadata_id)
+            & (DatasetMetadata.tenant_id == DatasetMetadataBinding.tenant_id)
+            & (DatasetMetadata.dataset_id == DatasetMetadataBinding.dataset_id),
+        )
+        .where(
+            DatasetMetadataBinding.tenant_id == ref.tenant_id,
+            DatasetMetadataBinding.dataset_id == ref.dataset_id,
+            DatasetMetadataBinding.document_id == document_id,
+        )
+        .order_by(DatasetMetadataBinding.id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).tuples()
+    return [(binding, metadata) for binding, metadata in rows]
 
 
 class SQLAlchemyMetadataRepository:
@@ -26,10 +87,11 @@ class SQLAlchemyMetadataRepository:
 
     @staticmethod
     def _dataset(session: Session, ref: DatasetRef, *, write: bool = False) -> Dataset:
-        query = select(Dataset).where(Dataset.id == ref.dataset_id, Dataset.tenant_id == ref.tenant_id)
-        if write:
-            query = query.with_for_update()
-        dataset = session.scalar(query)
+        dataset = (
+            lock_metadata_dataset(session, ref)
+            if write
+            else session.scalar(select(Dataset).where(Dataset.id == ref.dataset_id, Dataset.tenant_id == ref.tenant_id))
+        )
         if dataset is None:
             raise MetadataResourceNotFoundError("Dataset not found.")
         return dataset
@@ -96,7 +158,8 @@ class SQLAlchemyMetadataRepository:
                 self._documents(ref).where(Document.id.in_([b.document_id for b in bindings]))
             ):
                 values = dict(document.doc_metadata or {})
-                values[name] = values.pop(old_name, None)
+                if old_name in values:
+                    values[name] = values.pop(old_name)
                 document.doc_metadata = values
             return self._record(row)
 
@@ -133,13 +196,10 @@ class SQLAlchemyMetadataRepository:
     def set_built_in(self, ref: DatasetRef, *, enabled: bool) -> None:
         with self._sessions.begin() as session:
             dataset = self._dataset(session, ref, write=True)
-            if dataset.built_in_field_enabled == enabled:
-                return
-            for document in session.scalars(
-                self._documents(ref).where(
-                    Document.enabled.is_(True), Document.archived.is_(False), Document.indexing_status == "completed"
-                )
-            ):
+            # The dataset flag applies to every owned document, including ones that
+            # are temporarily ineligible for retrieval. Reconcile even when the flag
+            # already has the requested value so older partial writes can be healed.
+            for document in session.scalars(self._documents(ref)):
                 values = dict(document.doc_metadata or {})
                 if enabled:
                     values.update(self._built_in(session, document))
@@ -165,6 +225,15 @@ class SQLAlchemyMetadataRepository:
             }
             if document_ids != set(documents):
                 raise MetadataResourceNotFoundError("Document not found.")
+
+            # Validate the complete request before mutating any document or
+            # binding. A later invalid operation must not partially apply an
+            # earlier one, even if a subsequent query triggers autoflush.
+            for operation in operations:
+                for value in operation.metadata_list:
+                    field = fields[value.id]
+                    validate_metadata_value(field_name=field.name, field_type=field.type, value=value.value)
+
             for operation in operations:
                 document = documents[operation.document_id]
                 values = dict(document.doc_metadata or {}) if operation.partial_update else {}

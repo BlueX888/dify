@@ -15,22 +15,26 @@ from core.errors.error import LLMBadRequestError, ProviderTokenNotInitError
 from core.model_context import with_credit_usage_created_by
 from core.model_manager import ModelInstance, ModelManager
 from core.plugin.impl.exc import PluginDaemonClientSideError
-from core.rag.extractor.entity.extract_setting import ExtractSetting
+from core.rag.extractor.entity.extract_setting import CreatedUploadArtifact, ExtractSetting
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
 from core.rag.index_processor.index_processor import IndexProcessorFactory
 from core.rag.index_processor.index_processor_base import SummaryIndexSettingDict
-from core.tools.utils.web_reader_tool import get_image_upload_file_ids
 from enums import DeploymentEdition
 from extensions.ext_storage import storage
 from graphon.model_runtime.entities.model_entities import ModelType
 from models.dataset import Dataset, DatasetProcessRule
 from repositories.knowledge.dataset_repository import _get_dataset
 from repositories.knowledge.upload_file_repository import SQLAlchemyKnowledgeUploadRepository
+from services.knowledge.entities.resource_scope import DatasetRef
 from services.knowledge.indexing.estimate import (
     IndexingEstimateExecutionError,
     IndexingEstimateProviderUnavailableError,
 )
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.upload_file_cleanup import (
+    cleanup_created_upload_artifacts,
+    cleanup_unreferenced_upload_files,
+    maintain_created_upload_artifact_writers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,49 +114,89 @@ class IndexingEstimateAdapter:
         processor = IndexProcessorFactory(doc_form).init_index_processor()
         previews: list[PreviewDetail] = []
         qa_previews: list[QAPreviewDetail] = []
-        image_ids: set[str] = set()
-        total_segments = 0
-        # Legacy processors need a local session for extraction artifacts. No
-        # document-state transaction is shared with this preview operation.
-        with self._session_factory() as session:
-            for setting in extract_settings:
-                texts = processor.extract(setting, process_rule_mode=processing_rule["mode"], session=session)
-                documents = processor.transform(
-                    texts,
-                    current_user=None,
-                    embedding_model_instance=model,
-                    process_rule={"mode": processing_rule["mode"], "rules": processing_rule.get("rules")},
-                    tenant_id=tenant_id,
-                    doc_language=doc_language,
-                    preview=True,
-                    session=session,
-                )
-                total_segments += len(documents)
-                for document in documents:
-                    if doc_form == "qa_model":
-                        if len(qa_previews) < 10:
-                            qa_previews.append(
-                                QAPreviewDetail(
-                                    question=document.page_content, answer=document.metadata.get("answer") or ""
-                                )
-                            )
-                    elif len(previews) < 10:
-                        preview = PreviewDetail(content=document.page_content)
-                        if document.children:
-                            preview.child_chunks = [child.page_content for child in document.children]
-                        previews.append(preview)
-                    image_ids.update(get_image_upload_file_ids(document.page_content))
-            session.commit()
+        temporary_artifacts: dict[str, CreatedUploadArtifact] = {}
+        transformed_upload_file_ids: list[str] = []
+        writer_ids: dict[str, str] = {}
 
-        # Storage I/O takes place after extraction commits and outside the
-        # upload-record deletion transaction. Foreign tenant files are excluded.
-        uploads = self._uploads.get_files(workspace_id=tenant_id, file_ids=tuple(image_ids))
-        for upload in uploads.values():
-            try:
-                storage.delete(upload.key)
-            except Exception:
-                logger.exception("Delete image file failed while estimating indexing, upload_file_id: %s", upload.id)
-        self._uploads.delete_files(workspace_id=tenant_id, file_ids=tuple(uploads))
+        def begin_artifact_write(artifact: CreatedUploadArtifact) -> None:
+            temporary_artifacts[artifact.id] = artifact
+            writer_ids[artifact.id] = self._uploads.begin_created_upload_artifact_write(
+                workspace_id=tenant_id,
+                artifact=artifact,
+            )
+
+        total_segments = 0
+        try:
+            # Legacy processors need a local session for extraction artifacts. No
+            # document-state transaction is shared with this preview operation.
+            with (
+                maintain_created_upload_artifact_writers(
+                    workspace_id=tenant_id,
+                    upload_file_ids=lambda: (*temporary_artifacts, *transformed_upload_file_ids),
+                    files=self._uploads,
+                    logger=logger,
+                ),
+                self._session_factory() as session,
+            ):
+                for setting in extract_settings:
+                    extraction = processor.extract(
+                        setting,
+                        process_rule_mode=processing_rule["mode"],
+                        session=session,
+                        on_upload_artifact_created=begin_artifact_write,
+                    )
+                    temporary_artifacts.update(
+                        (artifact.id, artifact) for artifact in extraction.created_upload_artifacts
+                    )
+                    # Make the explicitly owned artifacts visible to cleanup if a
+                    # later transformation fails.
+                    self._uploads.finish_created_upload_artifact_writes_in_session(
+                        session,
+                        workspace_id=tenant_id,
+                        writer_ids=writer_ids,
+                    )
+                    session.commit()
+                    writer_ids.clear()
+                    documents = processor.transform(
+                        extraction.documents,
+                        current_user=None,
+                        embedding_model_instance=model,
+                        process_rule={"mode": processing_rule["mode"], "rules": processing_rule.get("rules")},
+                        tenant_id=tenant_id,
+                        doc_language=doc_language,
+                        preview=True,
+                        on_upload_file_created=transformed_upload_file_ids.append,
+                        session=session,
+                    )
+                    total_segments += len(documents)
+                    for document in documents:
+                        if doc_form == "qa_model":
+                            if len(qa_previews) < 10:
+                                qa_previews.append(
+                                    QAPreviewDetail(
+                                        question=document.page_content, answer=document.metadata.get("answer") or ""
+                                    )
+                                )
+                        elif len(previews) < 10:
+                            preview = PreviewDetail(content=document.page_content)
+                            if document.children:
+                                preview.child_chunks = [child.page_content for child in document.children]
+                            previews.append(preview)
+                session.commit()
+        except Exception:
+            self._cleanup_temporary_files(
+                tenant_id,
+                tuple(temporary_artifacts.values()),
+                tuple(transformed_upload_file_ids),
+                suppress_errors=True,
+            )
+            raise
+
+        self._cleanup_temporary_files(
+            tenant_id,
+            tuple(temporary_artifacts.values()),
+            tuple(transformed_upload_file_ids),
+        )
 
         if doc_form == "qa_model":
             return IndexingEstimate(total_segments=total_segments * 20, qa_preview=qa_previews, preview=[])
@@ -163,6 +207,46 @@ class IndexingEstimateAdapter:
                     tenant_id, previews, cast(SummaryIndexSettingDict, summary), doc_language, session=session
                 )
         return IndexingEstimate(total_segments=total_segments, preview=previews)
+
+    def _cleanup_temporary_files(
+        self,
+        tenant_id: str,
+        artifacts: tuple[CreatedUploadArtifact, ...],
+        transformed_upload_file_ids: tuple[str, ...],
+        *,
+        suppress_errors: bool = False,
+    ) -> None:
+        cleanup_error: Exception | None = None
+        try:
+            cleanup_created_upload_artifacts(
+                workspace_id=tenant_id,
+                artifacts=artifacts,
+                files=self._uploads,
+                delete_blob=storage.delete,
+                logger=logger,
+            )
+        except Exception as error:
+            cleanup_error = error
+            logger.exception("Failed to clean extracted files after indexing estimate")
+        try:
+            if transformed_upload_file_ids:
+                self._uploads.abandon_created_upload_artifact_writes(
+                    workspace_id=tenant_id,
+                    upload_file_ids=transformed_upload_file_ids,
+                )
+                cleanup_unreferenced_upload_files(
+                    workspace_id=tenant_id,
+                    file_ids=transformed_upload_file_ids,
+                    files=self._uploads,
+                    delete_blob=storage.delete,
+                    logger=logger,
+                )
+        except Exception as error:
+            if cleanup_error is None:
+                cleanup_error = error
+            logger.exception("Failed to clean transformed files after indexing estimate")
+        if cleanup_error is not None and not suppress_errors:
+            raise cleanup_error
 
     def _embedding_model(self, tenant_id: str, dataset_id: str | None, technique: str) -> ModelInstance | None:
         provider = None

@@ -4,10 +4,11 @@ SQLAlchemy implementation of the WorkflowExecutionRepository.
 
 import json
 import logging
-from typing import override
+from collections.abc import Callable
+from typing import TypeVar, override
 
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from core.repositories.factory import WorkflowExecutionRepository
 from graphon.entities import WorkflowExecution
@@ -23,6 +24,7 @@ from models.enums import WorkflowRunTriggeredFrom
 from repositories.entities.workflow_execution import WorkflowExecution as TimedWorkflowExecution
 
 logger = logging.getLogger(__name__)
+_SaveResult = TypeVar("_SaveResult")
 
 
 class SQLAlchemyWorkflowExecutionRepository(WorkflowExecutionRepository):
@@ -195,6 +197,24 @@ class SQLAlchemyWorkflowExecutionRepository(WorkflowExecutionRepository):
         Args:
             execution: The WorkflowExecution domain entity to persist
         """
+        self._save(execution)
+
+    def save_with_model_callback(
+        self,
+        execution: WorkflowExecution,
+        callback: Callable[[Session, WorkflowRun], _SaveResult],
+    ) -> _SaveResult:
+        """Persist and invoke a thin hook on the exact model being committed."""
+        result = self._save(execution, callback)
+        if result is None:
+            raise AssertionError("workflow execution save callback did not return a result")
+        return result
+
+    def _save(
+        self,
+        execution: WorkflowExecution,
+        callback: Callable[[Session, WorkflowRun], _SaveResult] | None = None,
+    ) -> _SaveResult | None:
         # Convert domain model to database model using tenant context and other attributes
         db_model = self._to_db_model(execution)
 
@@ -209,18 +229,35 @@ class SQLAlchemyWorkflowExecutionRepository(WorkflowExecutionRepository):
                     existing_model.stop_requested_at is not None
                     and existing_model.status == WorkflowExecutionStatus.STOPPED
                 ):
-                    return
+                    result = callback(session, existing_model) if callback is not None else None
+                    session.commit()
+                    self._execution_cache[existing_model.id] = existing_model
+                    return result
                 # Preserve the original start time for pause/resume flows.
                 db_model.created_at = existing_model.created_at
 
             # SQLAlchemy merge intelligently handles both insert and update operations
             # based on the presence of the primary key
-            session.merge(db_model)
+            persisted_model = session.merge(db_model)
+            result = callback(session, persisted_model) if callback is not None else None
             session.commit()
 
             # Update the in-memory cache for faster subsequent lookups
-            self._execution_cache[db_model.id] = db_model
+            self._execution_cache[persisted_model.id] = persisted_model
+            return result
 
     @override
     def save_synchronously(self, execution: WorkflowExecution) -> None:
         self.save(execution)
+
+    @override
+    def publish_committed_pause(
+        self,
+        execution: WorkflowExecution,
+        *,
+        history_revision: int,
+        history_claim_id: str,
+    ) -> None:
+        # SQL control already contains the complete pause summary. Rewriting it
+        # here would split the atomic pause publication into a second commit.
+        del execution, history_revision, history_claim_id

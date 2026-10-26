@@ -3,120 +3,147 @@ import time
 
 import click
 from celery import shared_task
-from sqlalchemy import delete, select
 
 from configs import dify_config
 from core.db.session_factory import session_factory
-from core.rag.index_processor.index_processor import IndexProcessorFactory
 from enums import DeploymentEdition
 from extensions.ext_redis import redis_client
 from libs.datetime_utils import naive_utc_now
-from models.dataset import Dataset, DocumentSegment
-from models.enums import IndexingStatus
-from repositories.knowledge.document_repository import _get_document
+from repositories.knowledge.document_indexing_outbox_repository import (
+    DocumentIndexingAction,
+    SQLAlchemyDocumentIndexingOutboxRepository,
+)
+from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
 from services.feature_service import FeatureService
 from services.knowledge.indexing.adapters.execution import build_document_indexing_service
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.indexing.errors import DocumentIndexingClaimLostError, DocumentIsPausedError
+from services.knowledge.indexing.website_sync_hint import delete_website_sync_hint_if_owned
 
 logger = logging.getLogger(__name__)
 
 
+def _clear_website_sync_hint(*, document_id: str, indexing_request_id: str) -> None:
+    try:
+        delete_website_sync_hint_if_owned(
+            redis_client,
+            document_id=document_id,
+            owner_id=indexing_request_id,
+        )
+    except Exception:
+        # The database request and claim are authoritative; a cache outage must
+        # not make completed indexing retry or overwrite a newer hint owner.
+        logger.warning("Failed to clear website sync hint, document_id=%s", document_id, exc_info=True)
+
+
+def _website_sync_admission_error(tenant_id: str) -> str | None:
+    if dify_config.DEPLOYMENT_EDITION != DeploymentEdition.CLOUD:
+        return None
+    try:
+        vector_space = FeatureService.get_features(tenant_id).vector_space
+        if vector_space is None:
+            raise ValueError("Vector space entitlement is unavailable.")
+        if 0 < vector_space.limit <= vector_space.size:
+            raise ValueError(
+                "Your total number of documents plus the number of uploads have over the limit of your subscription."
+            )
+    except Exception as error:
+        return str(error)
+    return None
+
+
 @shared_task(queue="dataset")
-def sync_website_document_indexing_task(dataset_id: str, document_id: str):
-    """
-    Async process document
-    :param dataset_id:
-    :param document_id:
+def sync_website_document_indexing_task(
+    dataset_id: str,
+    document_id: str,
+    *,
+    indexing_request_id: str | None = None,
+) -> None:
+    """Rebuild one website document while owning its exact durable generation.
 
-    Usage: sync_website_document_indexing_task.delay(dataset_id, document_id)
+    A rolling-deployment message without a request token may create or reuse a
+    durable request only after the repository locks and validates the complete
+    persisted website-document owner chain.
     """
-    start_at = time.perf_counter()
-
-    with session_factory.create_session() as session:
-        dataset = session.scalar(select(Dataset).where(Dataset.id == dataset_id).limit(1))
-        if dataset is None:
-            raise ValueError("Dataset not found")
-        tenant_id = dataset.tenant_id
-        dataset_ref = DatasetRef(tenant_id=dataset.tenant_id, dataset_id=dataset.id)
-        document_ref = dataset_ref.document(document_id)
-        document = _get_document(session, document_ref)
-        if document is None:
-            logger.info(click.style(f"Document not found: {document_id}", fg="yellow"))
+    started_at = time.perf_counter()
+    database_client = session_factory.get_session_maker()
+    outbox = SQLAlchemyDocumentIndexingOutboxRepository(session_factory=database_client)
+    if indexing_request_id is None:
+        intent = outbox.get_or_create_legacy_website_sync_intent(
+            dataset_id=dataset_id,
+            document_id=document_id,
+        )
+        if intent is None:
+            logger.info(
+                "Legacy website sync message is not eligible for bridging, dataset_id=%s document_id=%s",
+                dataset_id,
+                document_id,
+            )
             return
-        if document.data_source_type != "website_crawl":
-            raise ValueError("Document is not a website document")
+        indexing_request_id = intent.id
+    else:
+        intent = outbox.get_intent(indexing_request_id)
+    if intent is None or intent.action != DocumentIndexingAction.WEBSITE_SYNC:
+        logger.info("No website sync intent found, indexing_request_id=%s", indexing_request_id)
+        return
+    if len(intent.document_ids) != 1:
+        logger.error("Invalid website sync intent payload, indexing_request_id=%s", indexing_request_id)
+        return
+    (owned_document_id,) = intent.document_ids
+    if not outbox.request_is_current(intent):
+        outbox.complete(intent)
+        _clear_website_sync_hint(document_id=owned_document_id, indexing_request_id=indexing_request_id)
+        logger.info("Website sync request was superseded, indexing_request_id=%s", indexing_request_id)
+        return
 
-        sync_indexing_cache_key = f"document_{document_id}_is_sync"
-        # check document limit
-        if dify_config.DEPLOYMENT_EDITION == DeploymentEdition.CLOUD:
-            features = FeatureService.get_features(dataset.tenant_id)
-            try:
-                vector_space = features.vector_space
-                assert vector_space is not None
-                if 0 < vector_space.limit <= vector_space.size:
-                    raise ValueError(
-                        "Your total number of documents plus the number of uploads have over the limit of "
-                        "your subscription."
-                    )
-            except Exception as e:
-                document.indexing_status = IndexingStatus.ERROR
-                document.error = str(e)
-                document.stopped_at = naive_utc_now()
-                session.add(document)
-                session.commit()
-                redis_client.delete(sync_indexing_cache_key)
-                return
+    admission_error = _website_sync_admission_error(intent.tenant_id)
+    documents = SQLAlchemyDocumentRepository(session_factory=database_client)
+    claims = documents.claim_indexing_request(
+        indexing_request_id,
+        expected_action=DocumentIndexingAction.WEBSITE_SYNC.value,
+        processing_started_at=naive_utc_now(),
+        admission_error=lambda _count: admission_error,
+    )
+    if not claims:
+        # An admission failure or a terminal document consumes the request.
+        # Do not clear the hint while a duplicate delivery observes the active
+        # owner of this same request.
+        if outbox.get_intent(indexing_request_id) is None:
+            _clear_website_sync_hint(document_id=owned_document_id, indexing_request_id=indexing_request_id)
+        return
 
-        logger.info(click.style(f"Start sync website document: {document_id}", fg="green"))
+    (claim,) = claims
+    logger.info(click.style(f"Start sync website document: {claim.ref.document_id}", fg="green"))
+    try:
+        build_document_indexing_service(session_factory=database_client).restart_claimed(
+            claim.ref,
+            claim_id=claim.claim_id,
+        )
+    except DocumentIndexingClaimLostError:
+        logger.info("Website sync indexing claim was superseded: %s", claim.ref)
+    except DocumentIsPausedError:
         try:
-            # clean old data
-            index_processor = IndexProcessorFactory(document.doc_form).init_index_processor()
-
-            segments = session.scalars(
-                select(DocumentSegment).where(
-                    DocumentSegment.tenant_id == tenant_id,
-                    DocumentSegment.dataset_id == dataset_id,
-                    DocumentSegment.document_id == document_id,
-                )
-            ).all()
-            if segments:
-                index_node_ids = [segment.index_node_id for segment in segments if segment.index_node_id]
-                # delete from vector index
-                if index_node_ids:
-                    index_processor.clean(
-                        dataset, index_node_ids, with_keywords=True, delete_child_chunks=True, session=session
-                    )
-
-            segment_ids = [segment.id for segment in segments]
-            if segment_ids:
-                segment_delete_stmt = delete(DocumentSegment).where(
-                    DocumentSegment.id.in_(segment_ids),
-                    DocumentSegment.tenant_id == tenant_id,
-                    DocumentSegment.dataset_id == dataset_id,
-                    DocumentSegment.document_id == document_id,
-                )
-                session.execute(segment_delete_stmt)
-            session.commit()
-
-            document.indexing_status = IndexingStatus.PARSING
-            document.processing_started_at = naive_utc_now()
-            session.add(document)
-            indexing_service = build_document_indexing_service(session_factory=session_factory.get_session_maker())
-            # Release document/segment locks before extraction starts.
-            session.commit()
-            indexing_service.run([document_ref])
-            redis_client.delete(sync_indexing_cache_key)
-        except Exception as ex:
-            session.rollback()
-            document = _get_document(session, document_ref)
-            if document:
-                document.indexing_status = IndexingStatus.ERROR
-                document.error = str(ex)
-                document.stopped_at = naive_utc_now()
-                session.add(document)
-                session.commit()
-            logger.info(click.style(str(ex), fg="yellow"))
-            redis_client.delete(sync_indexing_cache_key)
-            logger.exception("sync_website_document_indexing_task failed, document_id: %s", document_id)
-        end_at = time.perf_counter()
-        logger.info(click.style(f"Sync document: {document_id} latency: {end_at - start_at}", fg="green"))
+            documents.release_indexing_claim_for_pause(claim.ref, claim_id=claim.claim_id)
+        except DocumentIndexingClaimLostError:
+            logger.info("Website sync claim was superseded while recording pause: %s", claim.ref)
+    except Exception as error:
+        logger.exception("Website sync failed, document_id=%s", claim.ref.document_id)
+        try:
+            documents.fail_indexing(
+                claim.ref,
+                str(error),
+                claim_id=claim.claim_id,
+                dataset_generation_id=claim.dataset_generation_id,
+            )
+        except DocumentIndexingClaimLostError:
+            logger.info("Website sync claim was superseded while recording failure: %s", claim.ref)
+    finally:
+        _clear_website_sync_hint(
+            document_id=claim.ref.document_id,
+            indexing_request_id=indexing_request_id,
+        )
+        logger.info(
+            click.style(
+                f"Sync document: {claim.ref.document_id} latency: {time.perf_counter() - started_at}",
+                fg="green",
+            )
+        )

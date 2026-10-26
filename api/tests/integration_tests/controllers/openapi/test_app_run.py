@@ -18,7 +18,7 @@ def test_chat_run_reaches_the_generator(
 ):
     captured = {}
 
-    def _fake_generate(*, app_model, user, args, invoke_from, streaming):
+    def _fake_generate(*, app_model, user, args, invoke_from, external_retrieval, session, streaming):
         captured["mode"] = app_model.mode
         captured["args"] = args
         captured["invoke_from"] = invoke_from
@@ -107,7 +107,7 @@ def test_completion_run_reaches_the_generator(
 
     captured = {}
 
-    def _fake_generate(*, app_model, user, args, invoke_from, streaming):
+    def _fake_generate(*, app_model, user, args, invoke_from, external_retrieval, session, streaming):
         captured["mode"] = app_model.mode
         captured["args"] = args
         return {
@@ -148,7 +148,7 @@ def test_workflow_run_reaches_the_generator(
 ):
     app = app_with_mode("workflow")
 
-    def _fake_generate(*, app_model, user, args, invoke_from, streaming):
+    def _fake_generate(*, app_model, user, args, invoke_from, external_retrieval, session, streaming):
         return {
             "workflow_run_id": "wfr",
             "task_id": "t",

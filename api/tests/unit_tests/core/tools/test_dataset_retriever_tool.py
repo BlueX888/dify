@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 import pytest
 from sqlalchemy.orm import Session
@@ -11,9 +11,12 @@ from core.app.app_config.entities import DatasetRetrieveConfigEntity
 from core.app.apps.message_based_app_queue_manager import MessageBasedAppQueueManager
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.callback_handler.index_tool_callback_handler import DatasetIndexToolCallbackHandler
+from core.rag.embedding.retrieval import RetrievalFinalizer
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.tools.utils.dataset_retriever.dataset_retriever_tool import DatasetRetrieverTool as RetrievalTool
 from core.tools.utils.dataset_retriever_tool import DatasetRetrieverTool
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from models.model import AppMode
 
 
@@ -36,12 +39,18 @@ def _hit_callback() -> DatasetIndexToolCallbackHandler:
     )
 
 
-def _retrieval_tool() -> RetrievalTool:
+def _external_retrieval() -> ExternalDatasetRetriever:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+
+
+def _retrieval_tool(external_retrieval: ExternalDatasetRetriever) -> RetrievalTool:
     return RetrievalTool(
         name="dataset_tool",
         description="desc",
         tenant_id="tenant",
         dataset_id="d1",
+        external_retrieval=external_retrieval,
+        retrieval_finalizer=build_retrieval_finalizer(),
         retrieve_config=_retrieve_config(),
         inputs={},
         return_resource=False,
@@ -57,6 +66,7 @@ def test_get_dataset_tools_returns_empty_for_empty_dataset_ids(sqlite_session: S
     # Act
     tools = DatasetRetrieverTool.get_dataset_tools(
         session=sqlite_session,
+        external_retrieval=_external_retrieval(),
         tenant_id="tenant",
         dataset_ids=[],
         retrieve_config=retrieve_config,
@@ -79,6 +89,7 @@ def test_get_dataset_tools_returns_empty_for_missing_retrieve_config(sqlite_sess
     # Act
     tools = DatasetRetrieverTool.get_dataset_tools(
         session=sqlite_session,
+        external_retrieval=_external_retrieval(),
         tenant_id="tenant",
         dataset_ids=dataset_ids,
         retrieve_config=None,  # type: ignore[arg-type]
@@ -97,12 +108,15 @@ def test_get_dataset_tools_returns_empty_for_missing_retrieve_config(sqlite_sess
 def test_get_dataset_tools_builds_tool_and_restores_strategy(sqlite_session: Session) -> None:
     # Arrange
     retrieve_config = _retrieve_config()
-    retrieval_tool = _retrieval_tool()
+    external_retrieval = _external_retrieval()
+    retrieval_tool = _retrieval_tool(external_retrieval)
 
     # Act
-    with patch.object(DatasetRetrieval, "to_dataset_retriever_tool", return_value=[retrieval_tool]):
+    with patch("core.tools.utils.dataset_retriever_tool.DatasetRetrieval", autospec=True) as retrieval:
+        retrieval.return_value.to_dataset_retriever_tool.return_value = [retrieval_tool]
         tools = DatasetRetrieverTool.get_dataset_tools(
             session=sqlite_session,
+            external_retrieval=external_retrieval,
             tenant_id="tenant",
             dataset_ids=["d1"],
             retrieve_config=retrieve_config,
@@ -117,13 +131,18 @@ def test_get_dataset_tools_builds_tool_and_restores_strategy(sqlite_session: Ses
     assert len(tools) == 1
     assert tools[0].entity.identity.name == "dataset_tool"
     assert retrieve_config.retrieve_strategy == DatasetRetrieveConfigEntity.RetrieveStrategy.MULTIPLE
+    retrieval.assert_called_once()
+    assert retrieval.call_args.kwargs["external_retrieval"] is external_retrieval
+    assert isinstance(retrieval.call_args.kwargs["retrieval_finalizer"], RetrievalFinalizer)
 
 
 def _build_dataset_tool(sqlite_session: Session) -> tuple[DatasetRetrieverTool, RetrievalTool]:
-    retrieval_tool = _retrieval_tool()
+    external_retrieval = _external_retrieval()
+    retrieval_tool = _retrieval_tool(external_retrieval)
     with patch.object(DatasetRetrieval, "to_dataset_retriever_tool", return_value=[retrieval_tool]):
         tools = DatasetRetrieverTool.get_dataset_tools(
             session=sqlite_session,
+            external_retrieval=external_retrieval,
             tenant_id="tenant",
             dataset_ids=["d1"],
             retrieve_config=_retrieve_config(),
@@ -133,6 +152,7 @@ def _build_dataset_tool(sqlite_session: Session) -> tuple[DatasetRetrieverTool, 
             user_id="u",
             inputs={},
         )
+    assert retrieval_tool.external_retrieval is external_retrieval
     return tools[0], retrieval_tool
 
 

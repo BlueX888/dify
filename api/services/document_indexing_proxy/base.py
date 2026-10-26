@@ -45,7 +45,7 @@ class DocumentTaskProxyBase(ABC):
         return FeatureService.get_features(self._tenant_id, exclude_vector_space=True)
 
     @abstractmethod
-    def _send_to_direct_queue(self, task_func: Callable[..., Any]):
+    def _send_to_direct_queue(self, task_func: Callable[..., Any]) -> bool:
         """
         Send task directly to Celery queue without tenant isolation.
 
@@ -57,7 +57,7 @@ class DocumentTaskProxyBase(ABC):
         pass
 
     @abstractmethod
-    def _send_to_tenant_queue(self, task_func: Callable[..., Any]):
+    def _send_to_tenant_queue(self, task_func: Callable[..., Any]) -> bool:
         """
         Send task to tenant-isolated queue.
 
@@ -68,19 +68,19 @@ class DocumentTaskProxyBase(ABC):
         """
         pass
 
-    def _send_to_default_tenant_queue(self):
+    def _send_to_default_tenant_queue(self) -> bool:
         """Route to normal priority with tenant isolation."""
-        self._send_to_tenant_queue(self.NORMAL_TASK_FUNC)
+        return self._send_to_tenant_queue(self.NORMAL_TASK_FUNC)
 
-    def _send_to_priority_tenant_queue(self):
+    def _send_to_priority_tenant_queue(self) -> bool:
         """Route to priority queue with tenant isolation."""
-        self._send_to_tenant_queue(self.PRIORITY_TASK_FUNC)
+        return self._send_to_tenant_queue(self.PRIORITY_TASK_FUNC)
 
-    def _send_to_priority_direct_queue(self):
+    def _send_to_priority_direct_queue(self) -> bool:
         """Route to priority queue without tenant isolation."""
-        self._send_to_direct_queue(self.PRIORITY_TASK_FUNC)
+        return self._send_to_direct_queue(self.PRIORITY_TASK_FUNC)
 
-    def _dispatch(self):
+    def _dispatch(self) -> bool:
         """
         Dispatch task based on billing plan.
 
@@ -95,14 +95,14 @@ class DocumentTaskProxyBase(ABC):
         if dify_config.DEPLOYMENT_EDITION == DeploymentEdition.CLOUD:
             if self.features.billing.subscription.plan == CloudPlan.SANDBOX:
                 # dispatch to normal pipeline queue with tenant self sub queue for sandbox plan
-                self._send_to_default_tenant_queue()
+                return self._send_to_default_tenant_queue()
             else:
                 # dispatch to priority pipeline queue with tenant self sub queue for other plans
-                self._send_to_priority_tenant_queue()
+                return self._send_to_priority_tenant_queue()
         else:
             # dispatch to priority queue without tenant isolation for others, e.g.: self-hosted or enterprise
-            self._send_to_priority_direct_queue()
+            return self._send_to_priority_direct_queue()
 
-    def delay(self):
+    def delay(self) -> bool:
         """Public API: Queue the task asynchronously."""
-        self._dispatch()
+        return self._dispatch()

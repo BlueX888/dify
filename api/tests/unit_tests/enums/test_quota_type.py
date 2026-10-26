@@ -6,7 +6,8 @@ from unittest.mock import patch
 import pytest
 
 from enums import DeploymentEdition, QuotaType
-from services.quota_service import QuotaCharge, QuotaService, unlimited
+from services.errors.billing import BillingUpstreamInvalidResponseError, BillingUpstreamUnavailableError
+from services.quota_service import QuotaCharge, QuotaService, QuotaSettlementResult, unlimited
 
 
 class TestQuotaType:
@@ -75,6 +76,49 @@ class TestQuotaService:
             charge = QuotaService.reserve(QuotaType.TRIGGER, "t1")
             assert charge.success is True
             assert charge.charge_id is None
+
+    def test_durable_settlement_reports_confirmed_remote_commit(self) -> None:
+        with patch("services.billing_service.BillingService") as mock_bs:
+            mock_bs.quota_commit.return_value = dict[str, object]()
+
+            result = QuotaService.settle_reservation(
+                QuotaType.WORKFLOW,
+                "t1",
+                "reservation-1",
+                settlement="committed",
+            )
+
+        assert result == QuotaSettlementResult.CONFIRMED
+        mock_bs.quota_commit.assert_called_once_with(
+            tenant_id="t1",
+            feature_key="api_rate_limit",
+            reservation_id="reservation-1",
+            actual_amount=1,
+        )
+
+    @pytest.mark.parametrize(
+        ("error", "expected"),
+        [
+            (BillingUpstreamUnavailableError(), QuotaSettlementResult.RETRYABLE_ERROR),
+            (BillingUpstreamInvalidResponseError(), QuotaSettlementResult.PERMANENT_ERROR),
+        ],
+    )
+    def test_durable_settlement_preserves_unknown_and_permanent_results(
+        self,
+        error: Exception,
+        expected: QuotaSettlementResult,
+    ) -> None:
+        with patch("services.billing_service.BillingService") as mock_bs:
+            mock_bs.quota_release.side_effect = error
+
+            result = QuotaService.settle_reservation(
+                QuotaType.WORKFLOW,
+                "t1",
+                "reservation-1",
+                settlement="refunded",
+            )
+
+        assert result == expected
 
     def test_consume_calls_reserve_and_commit(self) -> None:
         with patch("services.billing_service.BillingService") as mock_bs:

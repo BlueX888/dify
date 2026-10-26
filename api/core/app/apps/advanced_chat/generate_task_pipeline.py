@@ -78,6 +78,7 @@ from core.workflow.file_reference import resolve_file_record_id
 from core.workflow.nodes.human_input.pause_reason import HumanInputRequired
 from core.workflow.system_variables import build_system_variables
 from graphon.enums import WorkflowExecutionStatus
+from graphon.file import FileTransferMethod
 from graphon.model_runtime.entities.llm_entities import LLMUsage
 from graphon.model_runtime.utils.encoders import jsonable_encoder
 from graphon.nodes import BuiltinNodeTypes
@@ -88,6 +89,7 @@ from models.enums import CreatorUserRole, MessageFileBelongsTo, MessageStatus
 from models.execution_extra_content import HumanInputContent
 from models.model import AppMode
 from models.workflow import Workflow, WorkflowRun
+from repositories.upload_file_repository import lock_and_validate_owned_upload_files_in_session
 
 logger = logging.getLogger(__name__)
 
@@ -1031,6 +1033,21 @@ class AdvancedChatAppGenerateTaskPipeline(GraphRuntimeStateSupport):
         if message is None:
             return
 
+        resolved_files = []
+        for file in self._recorded_files:
+            reference = file.get("reference") or file.get("related_id")
+            file_id = resolve_file_record_id(reference if isinstance(reference, str) else None)
+            resolved_files.append((file, file_id))
+        locked_upload_files = lock_and_validate_owned_upload_files_in_session(
+            session,
+            tenant_id=self._workflow_tenant_id,
+            upload_file_ids=[
+                file_id
+                for file, file_id in resolved_files
+                if file_id is not None and file["transfer_method"] != FileTransferMethod.TOOL_FILE
+            ],
+        )
+
         if message.status == MessageStatus.PAUSED:
             message.status = MessageStatus.NORMAL
 
@@ -1067,8 +1084,9 @@ class AdvancedChatAppGenerateTaskPipeline(GraphRuntimeStateSupport):
         metadata = self._task_state.metadata.model_dump()
         message.message_metadata = json.dumps(jsonable_encoder(metadata))
         message_files: list[MessageFile] = []
-        for file in self._recorded_files:
-            reference = file.get("reference") or file.get("related_id")
+        for file, file_id in resolved_files:
+            if file_id is not None and file["transfer_method"] != FileTransferMethod.TOOL_FILE:
+                file_id = locked_upload_files[file_id].id
             message_files.append(
                 MessageFile(
                     message_id=message.id,
@@ -1076,7 +1094,7 @@ class AdvancedChatAppGenerateTaskPipeline(GraphRuntimeStateSupport):
                     transfer_method=file["transfer_method"],
                     url=file["remote_url"],
                     belongs_to=MessageFileBelongsTo.ASSISTANT,
-                    upload_file_id=resolve_file_record_id(reference if isinstance(reference, str) else None),
+                    upload_file_id=file_id,
                     created_by_role=CreatorUserRole.ACCOUNT
                     if message.invoke_from in {InvokeFrom.EXPLORE, InvokeFrom.DEBUGGER}
                     else CreatorUserRole.END_USER,

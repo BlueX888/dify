@@ -1,6 +1,7 @@
 import json
 from datetime import datetime
 from decimal import Decimal
+from unittest.mock import create_autospec
 
 import pytest
 from pytest_mock import MockerFixture
@@ -24,6 +25,7 @@ from core.app.entities.app_invoke_entities import (
     InvokeFrom,
 )
 from core.model_manager import ModelInstance
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.tools.__base.tool import Tool
 from core.tools.__base.tool_runtime import ToolRuntime
 from core.tools.entities.common_entities import I18nObject
@@ -36,6 +38,7 @@ from core.tools.entities.tool_entities import (
 )
 from core.tools.utils.dataset_retriever.dataset_multi_retriever_tool import DatasetMultiRetrieverTool
 from core.tools.utils.dataset_retriever_tool import DatasetRetrieverTool
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from extensions.ext_storage import storage
 from extensions.storage.storage_type import StorageType
 from graphon.file import FileTransferMethod, FileType
@@ -195,6 +198,7 @@ def _dataset_tool(name: str) -> DatasetRetrieverTool:
         entity=_tool_entity(name),
         runtime=ToolRuntime(tenant_id="tenant"),
         retrieval_tool=DatasetMultiRetrieverTool(
+            retrieval_finalizer=build_retrieval_finalizer(),
             tenant_id="tenant",
             dataset_ids=[],
             return_resource=False,
@@ -241,6 +245,7 @@ def runner(
 
     return BaseAgentRunner(
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         session=sqlite_session,
         tenant_id="tenant",
         application_generate_entity=_app_generate(app_config=app_config),
@@ -748,6 +753,7 @@ def test_init_uses_real_session_for_count_and_dependencies(
 
     initialized = BaseAgentRunner(
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         session=sqlite_session,
         tenant_id="tenant",
         application_generate_entity=app_generate,

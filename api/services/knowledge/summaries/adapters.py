@@ -4,40 +4,176 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import TypedDict, cast
 
 from sqlalchemy import select, update
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.orm.attributes import set_committed_value
 
 from core.credit_usage import CreditUsageCreatedBy
 from core.db.session_factory import session_factory
 from core.model_context import with_credit_usage_created_by
-from core.model_manager import ModelManager
+from core.model_manager import ModelInstance, ModelManager
 from core.rag.datasource.vdb.vector_factory import Vector
 from core.rag.index_processor.constant.doc_type import DocType
-from core.rag.index_processor.constant.index_type import IndexTechniqueType
+from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from core.rag.index_processor.index_processor_base import SummaryIndexSettingDict
 from core.rag.models.document import Document
 from graphon.model_runtime.entities.llm_entities import LLMUsage
 from graphon.model_runtime.entities.model_entities import ModelType
 from libs import helper
+from libs.datetime_utils import naive_utc_now
 from models.dataset import Dataset, DocumentSegment, DocumentSegmentSummary
 from models.dataset import Document as DatasetDocument
-from models.enums import SummaryStatus
+from models.enums import SegmentStatus, SummaryStatus
+from repositories.knowledge.dataset_indexing_outbox_repository import (
+    lock_dataset_indexing_execution_shared,
+    lock_dataset_indexing_generation_shared,
+)
 from repositories.knowledge.dataset_read_repository import get_segment_document
-from repositories.knowledge.summary_repository import SQLAlchemySummaryRepository
-from services.knowledge.resource_scope import DatasetRef
-from services.knowledge.summaries.application import SummaryIndexService, SummaryVectorInput, SummaryVectorResult
+from repositories.knowledge.summary_vector_cleanup_repository import SQLAlchemySummaryVectorCleanupRepository
+from services.knowledge.entities.resource_scope import DatasetRef
+from services.knowledge.entities.summaries import (
+    SummaryVectorCleanupClaim,
+    SummaryVectorGenerationLostError,
+    SummaryVectorInput,
+    SummaryVectorResult,
+)
+from services.knowledge.entities.vector_route import VectorRoute
+from services.knowledge.indexing.vector_route import capture_vector_route, vector_for_route
+from services.knowledge.summaries.application import (
+    SummaryIndexService,
+    SummaryVectorWriteNotSubmittedError,
+)
 
 logger = logging.getLogger(__name__)
 
 
-def _delete_summary_vectors(dataset: Dataset, node_ids: list[str], *, session: Session) -> None:
-    # Legacy callers own this transaction; committing here breaks session.begin().
-    # Document cleanup tasks materialize their inputs before deleting external indexes.
-    vector_type = Vector.resolve_vector_type(dataset, session=session)
-    Vector(dataset, session=None, vector_type=vector_type).delete_by_ids(node_ids)
+def _lock_summary_dataset_owner(
+    session: Session,
+    *,
+    ref: DatasetRef,
+    indexing_request_id: str | None,
+    indexing_intent_id: str | None,
+    indexing_claim_id: str | None,
+) -> Dataset | None:
+    execution_values = (indexing_intent_id, indexing_claim_id)
+    if any(value is not None for value in execution_values):
+        if indexing_request_id is None or any(value is None for value in execution_values):
+            raise ValueError("A durable summary rebuild requires generation, intent, and claim ownership")
+        assert indexing_intent_id is not None
+        assert indexing_claim_id is not None
+        return lock_dataset_indexing_execution_shared(
+            session,
+            tenant_id=ref.tenant_id,
+            dataset_id=ref.dataset_id,
+            generation_id=indexing_request_id,
+            intent_id=indexing_intent_id,
+            claim_id=indexing_claim_id,
+        )
+    return lock_dataset_indexing_generation_shared(
+        session,
+        dataset_id=ref.dataset_id,
+        generation_id=indexing_request_id,
+    )
+
+
+def _require_summary_dataset_owner(
+    session: Session,
+    *,
+    ref: DatasetRef,
+    indexing_request_id: str | None,
+    indexing_intent_id: str | None,
+    indexing_claim_id: str | None,
+) -> Dataset:
+    """Lock one immutable task generation or report that it was superseded."""
+
+    dataset = _lock_summary_dataset_owner(
+        session,
+        ref=ref,
+        indexing_request_id=indexing_request_id,
+        indexing_intent_id=indexing_intent_id,
+        indexing_claim_id=indexing_claim_id,
+    )
+    if dataset is None or dataset.tenant_id != ref.tenant_id:
+        raise SummaryVectorGenerationLostError()
+    return dataset
+
+
+def _lock_eligible_summary_segments(
+    session: Session,
+    dataset: Dataset,
+    segment_owners: dict[str, str],
+    *,
+    read: bool = False,
+) -> dict[str, DocumentSegment]:
+    """Lock and return current summary-eligible segments in owner order.
+
+    The Dataset generation lock must already be held. Documents are locked
+    before segments so archive/disable and segment state transitions cannot
+    cross an authoritative summary mutation. ``read=True`` keeps the vector
+    publication guard compatible with the cleanup repository's separate
+    summary-row transaction while still excluding Document/Segment writers.
+    """
+
+    if not segment_owners:
+        return {}
+    document_ids = sorted(set(segment_owners.values()))
+    documents = session.scalars(
+        select(DatasetDocument)
+        .where(
+            DatasetDocument.id.in_(document_ids),
+            DatasetDocument.dataset_id == dataset.id,
+            DatasetDocument.tenant_id == dataset.tenant_id,
+        )
+        .order_by(DatasetDocument.id)
+        .with_for_update(read=read)
+        .execution_options(populate_existing=True)
+    ).all()
+    documents_by_id = {document.id: document for document in documents}
+    segment_ids = sorted(segment_owners)
+    segments = session.scalars(
+        select(DocumentSegment)
+        .where(
+            DocumentSegment.id.in_(segment_ids),
+            DocumentSegment.dataset_id == dataset.id,
+            DocumentSegment.tenant_id == dataset.tenant_id,
+        )
+        .order_by(DocumentSegment.id)
+        .with_for_update(read=read)
+        .execution_options(populate_existing=True)
+    ).all()
+    eligible: dict[str, DocumentSegment] = {}
+    for segment in segments:
+        expected_document_id = segment_owners.get(segment.id)
+        document = documents_by_id.get(segment.document_id)
+        if (
+            expected_document_id != segment.document_id
+            or document is None
+            or not document.enabled
+            or document.archived
+            or document.doc_form == IndexStructureType.QA_INDEX
+            or not segment.enabled
+            or segment.status != SegmentStatus.COMPLETED
+        ):
+            continue
+        eligible[segment.id] = segment
+    return eligible
+
+
+def _require_eligible_summary_segments(
+    session: Session,
+    dataset: Dataset,
+    segment_owners: dict[str, str],
+    *,
+    read: bool = False,
+) -> dict[str, DocumentSegment]:
+    eligible = _lock_eligible_summary_segments(session, dataset, segment_owners, read=read)
+    if set(eligible) != set(segment_owners):
+        raise SummaryVectorGenerationLostError()
+    return eligible
 
 
 class SummaryEntryDict(TypedDict):
@@ -146,6 +282,11 @@ class SummaryIndexAdapter:
         Returns:
             Created or updated DocumentSegmentSummary instance
         """
+        current_segment = _require_eligible_summary_segments(
+            session,
+            dataset,
+            {segment.id: segment.document_id},
+        )[segment.id]
         # Check if summary record already exists
         existing_summary = session.scalar(
             select(DocumentSegmentSummary)
@@ -154,10 +295,13 @@ class SummaryIndexAdapter:
                 DocumentSegmentSummary.dataset_id == dataset.id,
             )
             .limit(1)
+            .with_for_update()
+            .execution_options(populate_existing=True)
         )
 
         if existing_summary:
             # Update existing record
+            existing_summary.version += 1
             existing_summary.summary_content = summary_content
             existing_summary.status = status
             existing_summary.error = None  # Clear any previous errors
@@ -173,8 +317,8 @@ class SummaryIndexAdapter:
             # Create new record (enabled by default)
             summary_record = DocumentSegmentSummary(
                 dataset_id=dataset.id,
-                document_id=segment.document_id,
-                chunk_id=segment.id,
+                document_id=current_segment.document_id,
+                chunk_id=current_segment.id,
                 summary_content=summary_content,
                 status=status,
                 enabled=True,  # Explicitly set enabled to True
@@ -193,14 +337,22 @@ class SummaryIndexAdapter:
         *,
         new_session: Callable[[], Session] | None = None,
         vector_factory: Callable[[], Vector] | None = None,
-    ) -> None:
+        indexing_request_id: str | None = None,
+        indexing_intent_id: str | None = None,
+        indexing_claim_id: str | None = None,
+        reuse_existing_node: bool = False,
+        expected_segment_state_intent_id: str | None = None,
+    ) -> bool:
         """Bridge already-authorized ORM callers to the detached summary use case.
 
         Pending summary writes are committed before external I/O. Each outcome
         attempt then owns a separate transaction, including retries and failures.
+        Vector submission and publication hold shared locks on the current
+        eligible Document/Segment owner chain; losing eligibility returns
+        ``False`` without publishing ERROR.
         """
         if dataset.indexing_technique != IndexTechniqueType.HIGH_QUALITY:
-            return
+            return False
         ref = DatasetRef(dataset.tenant_id, dataset.id).document(segment.document_id).segment(segment.id)
         if segment.dataset_id != dataset.id or segment.tenant_id != dataset.tenant_id:
             raise ValueError("Segment does not belong to the dataset")
@@ -210,8 +362,16 @@ class SummaryIndexAdapter:
             or summary_record.chunk_id != segment.id
         ):
             raise ValueError("Summary does not belong to the segment")
+        # ``None`` is the exact legacy generation, not an instruction to read
+        # whichever generation the possibly-expired ORM Dataset has now.
+        effective_generation_id = indexing_request_id
         command = SummaryVectorInput(
-            ref, summary_record.id, summary_record.summary_content or "", summary_record.summary_index_node_id
+            ref,
+            summary_record.id,
+            summary_record.version,
+            summary_record.summary_content or "",
+            summary_record.summary_index_node_id,
+            effective_generation_id,
         )
         if not command.content.strip():
             raise ValueError(f"Summary content is empty for segment {segment.id}, cannot vectorize")
@@ -219,85 +379,159 @@ class SummaryIndexAdapter:
             session.commit()
         create_session = new_session or session_factory.create_session
         with create_session() as read_session:
-            owned_dataset = read_session.scalar(
-                select(Dataset).where(
-                    Dataset.id == ref.document.dataset.dataset_id, Dataset.tenant_id == ref.document.dataset.tenant_id
-                )
+            owned_dataset = _lock_summary_dataset_owner(
+                read_session,
+                ref=ref.document.dataset,
+                indexing_request_id=effective_generation_id,
+                indexing_intent_id=indexing_intent_id,
+                indexing_claim_id=indexing_claim_id,
             )
-            owned_segment = read_session.scalar(
-                select(DocumentSegment).where(
-                    DocumentSegment.id == ref.segment_id,
-                    DocumentSegment.tenant_id == ref.document.dataset.tenant_id,
-                    DocumentSegment.dataset_id == ref.document.dataset.dataset_id,
-                    DocumentSegment.document_id == ref.document.document_id,
-                )
-            )
-            owned_document = read_session.scalar(
-                select(DatasetDocument).where(
-                    DatasetDocument.id == ref.document.document_id,
-                    DatasetDocument.dataset_id == ref.document.dataset.dataset_id,
-                    DatasetDocument.tenant_id == ref.document.dataset.tenant_id,
-                )
-            )
-            if owned_dataset is None or owned_segment is None or owned_document is None:
+            if owned_dataset is None or owned_dataset.tenant_id != ref.document.dataset.tenant_id:
                 raise LookupError("Summary segment no longer exists in this dataset")
+            try:
+                eligible = _require_eligible_summary_segments(
+                    read_session,
+                    owned_dataset,
+                    {ref.segment_id: ref.document.document_id},
+                    read=True,
+                )
+                if (
+                    expected_segment_state_intent_id is not None
+                    and eligible[ref.segment_id].indexing_request_id != expected_segment_state_intent_id
+                ):
+                    raise SummaryVectorGenerationLostError()
+            except SummaryVectorGenerationLostError:
+                read_session.rollback()
+                return False
             vector_type = (
                 Vector.resolve_vector_type(owned_dataset, session=read_session) if vector_factory is None else None
             )
         factory = vector_factory or (lambda: Vector(owned_dataset, session=None, vector_type=vector_type))
+
+        @contextmanager
+        def generation_guard():
+            # begin_write commits the durable writer before this lock is taken.
+            # No second Dataset lock is requested while the guard is held, so a
+            # queued configuration UPDATE cannot create a MySQL lock-queue cycle.
+            with create_session() as guard_session:
+                current_dataset = _lock_summary_dataset_owner(
+                    guard_session,
+                    ref=ref.document.dataset,
+                    indexing_request_id=effective_generation_id,
+                    indexing_intent_id=indexing_intent_id,
+                    indexing_claim_id=indexing_claim_id,
+                )
+                if current_dataset is None or current_dataset.tenant_id != ref.document.dataset.tenant_id:
+                    raise SummaryVectorGenerationLostError()
+                eligible = _require_eligible_summary_segments(
+                    guard_session,
+                    current_dataset,
+                    {ref.segment_id: ref.document.document_id},
+                    read=True,
+                )
+                if (
+                    expected_segment_state_intent_id is not None
+                    and eligible[ref.segment_id].indexing_request_id != expected_segment_state_intent_id
+                ):
+                    raise SummaryVectorGenerationLostError()
+                yield
+
         service = SummaryIndexService(
-            store=SQLAlchemySummaryRepository(new_session=create_session),
+            store=SQLAlchemySummaryVectorCleanupRepository(session_factory=create_session),
             vectors=SummaryVectorGateway(owned_dataset, factory),
-            new_id=lambda: str(uuid.uuid4()),
+            new_id=(
+                (lambda: command.previous_node_id or str(uuid.uuid4()))
+                if reuse_existing_node
+                else lambda: str(uuid.uuid4())
+            ),
             text_hash=helper.generate_text_hash,
             sleep=time.sleep,
         )
         try:
-            result = service.vectorize(command)
+            result = service.vectorize(command, mutation_guard=generation_guard)
         except Exception as error:
             set_committed_value(summary_record, "status", SummaryStatus.ERROR)
             set_committed_value(summary_record, "error", f"Vectorization failed: {error}")
             raise
+        if result is None:
+            return False
         set_committed_value(summary_record, "summary_index_node_id", result.node_id)
         set_committed_value(summary_record, "summary_index_node_hash", result.content_hash)
         set_committed_value(summary_record, "tokens", result.tokens)
         set_committed_value(summary_record, "status", SummaryStatus.COMPLETED)
         set_committed_value(summary_record, "error", None)
+        return True
 
     @staticmethod
     def batch_create_summary_records(
         segments: list[DocumentSegment],
         dataset: Dataset,
         status: SummaryStatus = SummaryStatus.NOT_STARTED,
-    ) -> None:
-        """
-        Batch create summary records for segments with specified status.
-        If a record already exists, update its status.
+        *,
+        indexing_request_id: str | None,
+        indexing_intent_id: str | None = None,
+        indexing_claim_id: str | None = None,
+    ) -> bool:
+        """Reserve summary rows for one immutable dataset generation.
+
+        ``True`` means the exact parent generation committed the whole batch.
+        ``False`` means that generation was superseded before the transaction
+        acquired its Dataset lock, so no summary row was changed. Other errors
+        are raised for the task retry policy to handle. Segments that are no
+        longer enabled/completed, or whose document is disabled, archived, or
+        QA-formatted, are skipped without reserving a summary row.
 
         Args:
             segments: List of DocumentSegment instances
             dataset: Dataset containing the segments
             status: Initial status for the records (default: SummaryStatus.NOT_STARTED)
         """
-        segment_ids = [segment.id for segment in segments]
+        segment_owners = [(segment.id, segment.document_id) for segment in segments]
+        segment_ids = [segment_id for segment_id, _document_id in segment_owners]
         if not segment_ids:
-            return
+            return True
+        ref = DatasetRef(dataset.tenant_id, dataset.id)
 
         with session_factory.create_session() as session:
+            try:
+                owned_dataset = _require_summary_dataset_owner(
+                    session,
+                    ref=ref,
+                    indexing_request_id=indexing_request_id,
+                    indexing_intent_id=indexing_intent_id,
+                    indexing_claim_id=indexing_claim_id,
+                )
+            except SummaryVectorGenerationLostError:
+                session.rollback()
+                return False
+            eligible_segments = _lock_eligible_summary_segments(session, owned_dataset, dict(segment_owners))
+            eligible_owners = [
+                (segment_id, eligible_segments[segment_id].document_id)
+                for segment_id, _document_id in segment_owners
+                if segment_id in eligible_segments
+            ]
+            eligible_ids = [segment_id for segment_id, _document_id in eligible_owners]
+            if not eligible_ids:
+                session.commit()
+                return True
             # Query existing summary records
             existing_summaries = session.scalars(
-                select(DocumentSegmentSummary).where(
-                    DocumentSegmentSummary.chunk_id.in_(segment_ids),
-                    DocumentSegmentSummary.dataset_id == dataset.id,
+                select(DocumentSegmentSummary)
+                .where(
+                    DocumentSegmentSummary.chunk_id.in_(eligible_ids),
+                    DocumentSegmentSummary.dataset_id == ref.dataset_id,
                 )
+                .with_for_update()
+                .execution_options(populate_existing=True)
             ).all()
             existing_summary_map = {summary.chunk_id: summary for summary in existing_summaries}
 
             # Create or update records
-            for segment in segments:
-                existing_summary = existing_summary_map.get(segment.id)
+            for segment_id, document_id in eligible_owners:
+                existing_summary = existing_summary_map.get(segment_id)
                 if existing_summary:
                     # Update existing record
+                    existing_summary.version += 1
                     existing_summary.status = status
                     existing_summary.error = None  # Clear any previous errors
                     if not existing_summary.enabled:
@@ -308,9 +542,9 @@ class SummaryIndexAdapter:
                 else:
                     # Create new record
                     summary_record = DocumentSegmentSummary(
-                        dataset_id=dataset.id,
-                        document_id=segment.document_id,
-                        chunk_id=segment.id,
+                        dataset_id=ref.dataset_id,
+                        document_id=document_id,
+                        chunk_id=segment_id,
                         summary_content=None,  # Will be filled later
                         status=status,
                         enabled=True,
@@ -319,38 +553,7 @@ class SummaryIndexAdapter:
 
             # Commit the batch created records
             session.commit()
-
-    @staticmethod
-    def update_summary_record_error(
-        segment: DocumentSegment,
-        dataset: Dataset,
-        error: str,
-    ) -> None:
-        """
-        Update summary record with error status.
-
-        Args:
-            segment: DocumentSegment
-            dataset: Dataset containing the segment
-            error: Error message
-        """
-        with session_factory.create_session() as session:
-            summary_record = session.scalar(
-                select(DocumentSegmentSummary)
-                .where(
-                    DocumentSegmentSummary.chunk_id == segment.id,
-                    DocumentSegmentSummary.dataset_id == dataset.id,
-                )
-                .limit(1)
-            )
-
-            if summary_record:
-                summary_record.status = SummaryStatus.ERROR
-                summary_record.error = error
-                session.add(summary_record)
-                session.commit()
-            else:
-                logger.warning("Summary record not found for segment %s when updating error", segment.id)
+            return True
 
     @staticmethod
     @with_credit_usage_created_by(CreditUsageCreatedBy.KNOWLEDGE_INDEXING)
@@ -360,10 +563,19 @@ class SummaryIndexAdapter:
         summary_index_setting: SummaryIndexSettingDict,
         *,
         session: Session,
-    ) -> DocumentSegmentSummary:
-        """
-        Generate summary for a segment and vectorize it.
-        Assumes summary record already exists (created by batch_create_summary_records).
+        indexing_request_id: str | None,
+        indexing_intent_id: str | None = None,
+        indexing_claim_id: str | None = None,
+    ) -> DocumentSegmentSummary | None:
+        """Generate and publish one summary under an immutable parent generation.
+
+        A successful call commits the reserved version, generated content, and
+        vector publication for the supplied owner. If that owner is superseded
+        or its Document/Segment becomes ineligible, the current transition is
+        rolled back and ``None`` is returned without publishing content, vector,
+        or ERROR. Same-generation failures persist ERROR on the reserved version
+        only while the owner chain remains eligible, then are re-raised so the
+        task may retry.
 
         Args:
             segment: DocumentSegment to generate summary for
@@ -379,48 +591,126 @@ class SummaryIndexAdapter:
         Raises:
             ValueError: If summary generation fails
         """
+        ref = DatasetRef(dataset.tenant_id, dataset.id)
+        summary_id: str | None = None
+        generation_version: int | None = None
         try:
+            owned_dataset = _require_summary_dataset_owner(
+                session,
+                ref=ref,
+                indexing_request_id=indexing_request_id,
+                indexing_intent_id=indexing_intent_id,
+                indexing_claim_id=indexing_claim_id,
+            )
+            current_segment = _require_eligible_summary_segments(
+                session,
+                owned_dataset,
+                {segment.id: segment.document_id},
+            )[segment.id]
             # Get or refresh summary record in this session
             summary_record_in_session = session.scalar(
                 select(DocumentSegmentSummary)
                 .where(
-                    DocumentSegmentSummary.chunk_id == segment.id,
+                    DocumentSegmentSummary.chunk_id == current_segment.id,
                     DocumentSegmentSummary.dataset_id == dataset.id,
                 )
                 .limit(1)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
 
             if not summary_record_in_session:
                 # If not found, create one
-                logger.warning("Summary record not found for segment %s, creating one", segment.id)
+                logger.warning("Summary record not found for segment %s, creating one", current_segment.id)
                 summary_record_in_session = DocumentSegmentSummary(
                     dataset_id=dataset.id,
-                    document_id=segment.document_id,
-                    chunk_id=segment.id,
+                    document_id=current_segment.document_id,
+                    chunk_id=current_segment.id,
                     summary_content="",
                     status=SummaryStatus.GENERATING,
                     enabled=True,
                 )
                 session.add(summary_record_in_session)
                 session.flush()
+            else:
+                # Reserve a distinct generation before model I/O. Any later edit,
+                # regeneration, or clear invalidates this worker's completion.
+                summary_record_in_session.version += 1
 
             # Update status to "generating"
             summary_record_in_session.status = SummaryStatus.GENERATING
             summary_record_in_session.error = None
             session.add(summary_record_in_session)
+            summary_id = summary_record_in_session.id
+            generation_version = summary_record_in_session.version
             # Persist GENERATING and release the write transaction before LLM I/O.
             session.commit()
 
+            # Refresh the complete current segment immediately before loading
+            # model inputs. The reservation commit released its owner locks, so
+            # a same-generation content edit or state transition may have won
+            # in between.
+            owned_dataset = _require_summary_dataset_owner(
+                session,
+                ref=ref,
+                indexing_request_id=indexing_request_id,
+                indexing_intent_id=indexing_intent_id,
+                indexing_claim_id=indexing_claim_id,
+            )
+            current_segment = _require_eligible_summary_segments(
+                session,
+                owned_dataset,
+                {segment.id: segment.document_id},
+            )[segment.id]
+            generated_from_content = current_segment.content
             # Generate summary (returns summary_content and llm_usage)
             summary_content, llm_usage = SummaryIndexAdapter.generate_summary_for_segment(
-                segment, dataset, summary_index_setting, session=session
+                current_segment, owned_dataset, summary_index_setting, session=session
             )
 
-            # Update summary content
-            summary_record_in_session.summary_content = summary_content
-            session.add(summary_record_in_session)
-            # Flush to ensure summary_content is saved before vectorize_summary queries it
-            session.flush()
+            # Reacquire the same immutable parent generation before publishing
+            # model output. A newer Dataset generation must never receive old
+            # content, even when the summary version itself is unchanged.
+            owned_dataset = _require_summary_dataset_owner(
+                session,
+                ref=ref,
+                indexing_request_id=indexing_request_id,
+                indexing_intent_id=indexing_intent_id,
+                indexing_claim_id=indexing_claim_id,
+            )
+            current_segment = _require_eligible_summary_segments(
+                session,
+                owned_dataset,
+                {segment.id: segment.document_id},
+            )[segment.id]
+            if current_segment.content != generated_from_content:
+                session.rollback()
+                logger.info("Discarded summary generated from stale content for segment %s", segment.id)
+                return None
+            cursor = session.execute(
+                update(DocumentSegmentSummary)
+                .where(
+                    DocumentSegmentSummary.id == summary_id,
+                    DocumentSegmentSummary.version == generation_version,
+                    DocumentSegmentSummary.dataset_id == dataset.id,
+                    DocumentSegmentSummary.document_id == current_segment.document_id,
+                    DocumentSegmentSummary.chunk_id == current_segment.id,
+                )
+                .values(summary_content=summary_content, updated_at=naive_utc_now())
+            )
+            if cast(CursorResult[object], cursor).rowcount != 1:
+                session.rollback()
+                logger.info("Discarded superseded summary generation for segment %s", segment.id)
+                return None
+            session.commit()
+            summary_record_in_session = session.scalar(
+                select(DocumentSegmentSummary).where(
+                    DocumentSegmentSummary.id == summary_id,
+                    DocumentSegmentSummary.version == generation_version,
+                )
+            )
+            if summary_record_in_session is None:
+                return None
 
             # Log LLM usage for summary generation
             if llm_usage and llm_usage.total_tokens > 0:
@@ -432,29 +722,73 @@ class SummaryIndexAdapter:
                     llm_usage.completion_tokens,
                 )
 
-            SummaryIndexAdapter.vectorize_summary(summary_record_in_session, segment, dataset, session=session)
+            if not SummaryIndexAdapter.vectorize_summary(
+                summary_record_in_session,
+                current_segment,
+                owned_dataset,
+                session=session,
+                indexing_request_id=indexing_request_id,
+                indexing_intent_id=indexing_intent_id,
+                indexing_claim_id=indexing_claim_id,
+            ):
+                logger.info("Discarded superseded summary vector for segment %s", segment.id)
+                return None
             # vectorize_summary mutates status and token fields; refresh before returning the ORM object.
-            session.refresh(summary_record_in_session)
-            session.commit()
+            summary_record_in_session = session.scalar(
+                select(DocumentSegmentSummary).where(
+                    DocumentSegmentSummary.id == summary_id,
+                    DocumentSegmentSummary.version == generation_version,
+                )
+            )
+            if summary_record_in_session is None:
+                return None
             logger.info("Successfully generated and vectorized summary for segment %s", segment.id)
             return summary_record_in_session
 
+        except SummaryVectorGenerationLostError:
+            session.rollback()
+            logger.info(
+                "Discarded summary generation after losing dataset generation, dataset_id=%s, segment_id=%s",
+                ref.dataset_id,
+                segment.id,
+            )
+            return None
         except Exception as e:
             logger.exception("Failed to generate summary for segment %s", segment.id)
             session.rollback()
-            # Update summary record with error status
-            summary_record_in_session = session.scalar(
-                select(DocumentSegmentSummary)
-                .where(
-                    DocumentSegmentSummary.chunk_id == segment.id,
-                    DocumentSegmentSummary.dataset_id == dataset.id,
+            if summary_id is not None and generation_version is not None:
+                try:
+                    owned_dataset = _require_summary_dataset_owner(
+                        session,
+                        ref=ref,
+                        indexing_request_id=indexing_request_id,
+                        indexing_intent_id=indexing_intent_id,
+                        indexing_claim_id=indexing_claim_id,
+                    )
+                    _require_eligible_summary_segments(
+                        session,
+                        owned_dataset,
+                        {segment.id: segment.document_id},
+                    )
+                except SummaryVectorGenerationLostError:
+                    session.rollback()
+                    logger.info(
+                        "Discarded summary error after losing dataset generation, dataset_id=%s, segment_id=%s",
+                        ref.dataset_id,
+                        segment.id,
+                    )
+                    return None
+                session.execute(
+                    update(DocumentSegmentSummary)
+                    .where(
+                        DocumentSegmentSummary.id == summary_id,
+                        DocumentSegmentSummary.version == generation_version,
+                        DocumentSegmentSummary.dataset_id == ref.dataset_id,
+                        DocumentSegmentSummary.document_id == segment.document_id,
+                        DocumentSegmentSummary.chunk_id == segment.id,
+                    )
+                    .values(status=SummaryStatus.ERROR, error=str(e), updated_at=naive_utc_now())
                 )
-                .limit(1)
-            )
-            if summary_record_in_session:
-                summary_record_in_session.status = SummaryStatus.ERROR
-                summary_record_in_session.error = str(e)
-                session.add(summary_record_in_session)
                 session.commit()
             raise
 
@@ -465,9 +799,17 @@ class SummaryIndexAdapter:
         summary_index_setting: SummaryIndexSettingDict,
         segment_ids: list[str] | None = None,
         only_parent_chunks: bool = False,
+        *,
+        indexing_request_id: str | None,
+        indexing_intent_id: str | None = None,
+        indexing_claim_id: str | None = None,
     ) -> list[DocumentSegmentSummary]:
-        """
-        Generate summaries for all segments in a document including vectorization.
+        """Generate a document's summaries for one captured Dataset generation.
+
+        The parent identity is a primitive task token and is reused unchanged
+        for batch reservation and every segment. Losing it stops the remaining
+        work without adopting a newer ORM Dataset snapshot. Same-generation
+        failures remain retryable per segment.
 
         Args:
             dataset: Dataset containing the document
@@ -479,6 +821,13 @@ class SummaryIndexAdapter:
         Returns:
             List of created DocumentSegmentSummary instances
         """
+        # Capture only primitives before any commit can expire the caller's ORM
+        # snapshot. Every segment below reuses this exact task identity.
+        tenant_id = dataset.tenant_id
+        dataset_id = dataset.id
+        document_id = document.id
+        parent_generation_id = indexing_request_id
+
         # Only generate summary index for high_quality indexing technique
         if dataset.indexing_technique != IndexTechniqueType.HIGH_QUALITY:
             logger.info(
@@ -508,8 +857,9 @@ class SummaryIndexAdapter:
         with session_factory.create_session() as session:
             # Query segments (only enabled segments)
             stmt = select(DocumentSegment).where(
-                DocumentSegment.dataset_id == dataset.id,
-                DocumentSegment.document_id == document.id,
+                DocumentSegment.dataset_id == dataset_id,
+                DocumentSegment.document_id == document_id,
+                DocumentSegment.tenant_id == tenant_id,
                 DocumentSegment.status == "completed",
                 DocumentSegment.enabled.is_(True),  # Only generate summaries for enabled segments
             )
@@ -526,11 +876,21 @@ class SummaryIndexAdapter:
             session.commit()
             # Batch create summary records with "not_started" status before processing
             # This ensures all records exist upfront, allowing status tracking
-            SummaryIndexAdapter.batch_create_summary_records(
+            reserved = SummaryIndexAdapter.batch_create_summary_records(
                 segments=segments,
                 dataset=dataset,
                 status=SummaryStatus.NOT_STARTED,
+                indexing_request_id=parent_generation_id,
+                indexing_intent_id=indexing_intent_id,
+                indexing_claim_id=indexing_claim_id,
             )
+            if not reserved:
+                logger.info(
+                    "Discarded summary batch after losing dataset generation, dataset_id=%s, document_id=%s",
+                    dataset_id,
+                    document_id,
+                )
+                return []
 
             summary_records = []
 
@@ -548,18 +908,38 @@ class SummaryIndexAdapter:
 
                 try:
                     summary_record = SummaryIndexAdapter.generate_and_vectorize_summary(
-                        segment, dataset, summary_index_setting, session=session
+                        segment,
+                        dataset,
+                        summary_index_setting,
+                        session=session,
+                        indexing_request_id=parent_generation_id,
+                        indexing_intent_id=indexing_intent_id,
+                        indexing_claim_id=indexing_claim_id,
                     )
-                    summary_records.append(summary_record)
-                except Exception as e:
+                    if summary_record is not None:
+                        summary_records.append(summary_record)
+                    else:
+                        session.rollback()
+                        try:
+                            _require_summary_dataset_owner(
+                                session,
+                                ref=DatasetRef(tenant_id, dataset_id),
+                                indexing_request_id=parent_generation_id,
+                                indexing_intent_id=indexing_intent_id,
+                                indexing_claim_id=indexing_claim_id,
+                            )
+                        except SummaryVectorGenerationLostError:
+                            session.rollback()
+                            logger.info(
+                                "Stopped summary batch after losing dataset generation, dataset_id=%s",
+                                dataset_id,
+                            )
+                            return summary_records
+                        session.rollback()
+                except Exception:
                     logger.exception("Failed to generate summary for segment %s", segment.id)
-                    # Update summary record with error status
-                    SummaryIndexAdapter.update_summary_record_error(
-                        segment=segment,
-                        dataset=dataset,
-                        error=str(e),
-                    )
-                    # Continue with other segments
+                    # The inner use case persists an error only for its exact
+                    # summary id and generation version.
                     continue
 
             logger.info(
@@ -576,8 +956,11 @@ class SummaryIndexAdapter:
         disabled_by: str | None = None,
     ) -> None:
         """
-        Disable summary records and remove vectors from vector database for segments.
+        Disable summary records and durably schedule their exact vectors for removal.
         Unlike delete, this preserves the summary records but marks them as disabled.
+        Every explicit request advances the summary version, including an
+        already-disabled row, so a pending document-enable intent cannot revive
+        the superseded revision.
 
         Args:
             dataset: Dataset containing the segments
@@ -589,13 +972,14 @@ class SummaryIndexAdapter:
         with session_factory.create_session() as session:
             stmt = select(DocumentSegmentSummary).where(
                 DocumentSegmentSummary.dataset_id == dataset.id,
-                DocumentSegmentSummary.enabled.is_(True),  # Only disable enabled summaries
             )
 
             if segment_ids:
                 stmt = stmt.where(DocumentSegmentSummary.chunk_id.in_(segment_ids))
 
-            summaries = session.scalars(stmt).all()
+            summaries = session.scalars(
+                stmt.order_by(DocumentSegmentSummary.id).with_for_update().execution_options(populate_existing=True)
+            ).all()
 
             if not summaries:
                 return
@@ -607,109 +991,26 @@ class SummaryIndexAdapter:
                 len(segment_ids) if segment_ids else "all",
             )
 
-            # Remove from vector database (but keep records)
-            if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
-                summary_node_ids = [s.summary_index_node_id for s in summaries if s.summary_index_node_id]
-                if summary_node_ids:
-                    try:
-                        _delete_summary_vectors(dataset, summary_node_ids, session=session)
-                    except Exception:
-                        logger.warning("Failed to remove summary vectors", exc_info=True)
+            SQLAlchemySummaryVectorCleanupRepository.add_terminal_cleanups(
+                session,
+                tenant_id=dataset.tenant_id,
+                summaries=summaries,
+            )
 
             # Disable summary records (don't delete)
             now = naive_utc_now()
             session.execute(
                 update(DocumentSegmentSummary)
                 .where(DocumentSegmentSummary.id.in_(s.id for s in summaries))
-                .values(enabled=False, disabled_at=now, disabled_by=disabled_by)
+                .values(
+                    version=DocumentSegmentSummary.version + 1,
+                    enabled=False,
+                    disabled_at=now,
+                    disabled_by=disabled_by,
+                )
             )
             session.commit()
             logger.info("Disabled %s summary records for dataset %s", len(summaries), dataset.id)
-
-    @staticmethod
-    def enable_summaries_for_segments(
-        dataset: Dataset,
-        segment_ids: list[str] | None = None,
-    ) -> None:
-        """
-        Enable summary records and re-add vectors to vector database for segments.
-
-        Note: This method enables summaries based on chunk status, not summary_index_setting.enable.
-        The summary_index_setting.enable flag only controls automatic generation,
-        not whether existing summaries can be used.
-        Summary.enabled should always be kept in sync with chunk.enabled.
-
-        Args:
-            dataset: Dataset containing the segments
-            segment_ids: List of segment IDs to enable summaries for. If None, enable all.
-        """
-        # Only enable summary index for high_quality indexing technique
-        if dataset.indexing_technique != IndexTechniqueType.HIGH_QUALITY:
-            return
-
-        with session_factory.create_session() as session:
-            stmt = select(DocumentSegmentSummary).where(
-                DocumentSegmentSummary.dataset_id == dataset.id,
-                DocumentSegmentSummary.enabled.is_(False),  # Only enable disabled summaries
-            )
-
-            if segment_ids:
-                stmt = stmt.where(DocumentSegmentSummary.chunk_id.in_(segment_ids))
-
-            summaries = session.scalars(stmt).all()
-
-            if not summaries:
-                return
-
-            logger.info(
-                "Enabling %s summary records for dataset %s, segment_ids: %s",
-                len(summaries),
-                dataset.id,
-                len(segment_ids) if segment_ids else "all",
-            )
-
-            # Re-vectorize and re-add to vector database
-            enabled_count = 0
-            for summary in summaries:
-                # Get the original segment
-                segment = session.scalar(
-                    select(DocumentSegment)
-                    .where(
-                        DocumentSegment.id == summary.chunk_id,
-                        DocumentSegment.dataset_id == dataset.id,
-                    )
-                    .limit(1)
-                )
-
-                # Summary.enabled stays in sync with chunk.enabled,
-                # only enable summary if the associated chunk is enabled.
-                if not segment or not segment.enabled or segment.status != "completed":
-                    continue
-
-                if not summary.summary_content:
-                    continue
-
-                try:
-                    # Re-vectorize summary (this will update status and tokens in its own session)
-                    # Pass the session to vectorize_summary to avoid session isolation issues
-                    SummaryIndexAdapter.vectorize_summary(summary, segment, dataset, session=session)
-
-                    # Refresh the object from database to get the updated status and tokens from vectorize_summary
-                    session.refresh(summary)
-
-                    # Enable summary record
-                    summary.enabled = True
-                    summary.disabled_at = None
-                    summary.disabled_by = None
-                    session.add(summary)
-                    enabled_count += 1
-                except Exception:
-                    logger.exception("Failed to re-vectorize summary %s", summary.id)
-                    # Keep it disabled if vectorization fails
-                    continue
-
-            session.commit()
-            logger.info("Enabled %s summary records for dataset %s", enabled_count, dataset.id)
 
     @staticmethod
     def delete_summaries_for_segments(
@@ -719,8 +1020,8 @@ class SummaryIndexAdapter:
         session: Session,
     ) -> None:
         """
-        Delete summary records and vectors for segments (used only for actual deletion scenarios).
-        For disable/enable operations, use disable_summaries_for_segments/enable_summaries_for_segments.
+        Delete summary records and durably hand their exact vectors to cleanup.
+        For disable operations, use disable_summaries_for_segments.
 
         Args:
             dataset: Dataset containing the segments
@@ -731,16 +1032,18 @@ class SummaryIndexAdapter:
         if segment_ids:
             stmt = stmt.where(DocumentSegmentSummary.chunk_id.in_(segment_ids))
 
-        summaries = session.scalars(stmt).all()
+        summaries = session.scalars(
+            stmt.order_by(DocumentSegmentSummary.id).with_for_update().execution_options(populate_existing=True)
+        ).all()
 
         if not summaries:
             return
 
-        # Preserve the caller's transaction until it decides to commit or roll back.
-        if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
-            summary_node_ids = [s.summary_index_node_id for s in summaries if s.summary_index_node_id]
-            if summary_node_ids:
-                _delete_summary_vectors(dataset, summary_node_ids, session=session)
+        SQLAlchemySummaryVectorCleanupRepository.add_terminal_cleanups(
+            session,
+            tenant_id=dataset.tenant_id,
+            summaries=summaries,
+        )
 
         # Delete summary records in the caller's existing transaction.
         for summary in summaries:
@@ -748,135 +1051,6 @@ class SummaryIndexAdapter:
 
         session.flush()
         logger.info("Deleted %s summary records for dataset %s", len(summaries), dataset.id)
-
-    @staticmethod
-    def update_summary_for_segment(
-        segment: DocumentSegment,
-        dataset: Dataset,
-        summary_content: str,
-        *,
-        session: Session,
-    ) -> DocumentSegmentSummary | None:
-        """
-        Update summary for a segment and re-vectorize it.
-
-        Args:
-            segment: DocumentSegment to update summary for
-            dataset: Dataset containing the segment
-            summary_content: New summary content
-
-        Keyword Args:
-            session: SQLAlchemy session used for summary record updates.
-
-        Returns:
-            Updated DocumentSegmentSummary instance, or None if indexing technique is not high_quality
-        """
-        # Only update summary index for high_quality indexing technique
-        if dataset.indexing_technique != IndexTechniqueType.HIGH_QUALITY:
-            return None
-
-        # When user manually provides summary, allow saving even if summary_index_setting doesn't exist
-        # summary_index_setting is only needed for LLM generation, not for manual summary vectorization
-        # Vectorization uses dataset.embedding_model, which doesn't require summary_index_setting
-
-        # Skip qa_model documents
-        document = get_segment_document(segment, session=session)
-        if document and document.doc_form == "qa_model":
-            return None
-
-        try:
-            summary_record = session.scalar(
-                select(DocumentSegmentSummary)
-                .where(
-                    DocumentSegmentSummary.chunk_id == segment.id,
-                    DocumentSegmentSummary.dataset_id == dataset.id,
-                )
-                .limit(1)
-            )
-
-            # Check if summary_content is empty (whitespace-only strings are considered empty)
-            if not summary_content or not summary_content.strip():
-                # If summary is empty, only delete existing summary vector and record
-                if summary_record:
-                    # Delete old vector if exists
-                    old_summary_node_id = summary_record.summary_index_node_id
-                    if old_summary_node_id:
-                        try:
-                            _delete_summary_vectors(dataset, [old_summary_node_id], session=session)
-                        except Exception as e:
-                            logger.warning(
-                                "Failed to delete old summary vector for segment %s: %s",
-                                segment.id,
-                                str(e),
-                            )
-
-                    # Delete summary record since summary is empty
-                    session.delete(summary_record)
-                    session.commit()
-                    logger.info("Deleted summary for segment %s (empty content provided)", segment.id)
-                    return None
-                else:
-                    # No existing summary record, nothing to do
-                    logger.info("No summary record found for segment %s, nothing to delete", segment.id)
-                    return None
-
-            if summary_record:
-                # Update summary content
-                summary_record.summary_content = summary_content
-                summary_record.status = SummaryStatus.GENERATING
-                summary_record.error = None  # Clear any previous errors
-                session.add(summary_record)
-                # Flush to ensure summary_content is saved before vectorize_summary queries it
-                session.flush()
-
-            else:
-                # Create new summary record if doesn't exist
-                summary_record = SummaryIndexAdapter.create_summary_record(
-                    segment,
-                    dataset,
-                    summary_content,
-                    status=SummaryStatus.GENERATING,
-                    session=session,
-                )
-
-            try:
-                # Vectorization must finish here so the manual summary is searchable immediately.
-                SummaryIndexAdapter.vectorize_summary(summary_record, segment, dataset, session=session)
-                session.refresh(summary_record)
-                session.commit()
-                logger.info("Successfully updated and re-vectorized summary for segment %s", segment.id)
-                return summary_record
-            except Exception as e:
-                # If vectorization fails, update status to error in current session.
-                # Return the record with error status so callers can still finish segment updates.
-                if not session.is_active:
-                    session.rollback()
-                summary_record.summary_content = summary_content
-                summary_record.status = SummaryStatus.ERROR
-                summary_record.error = f"Vectorization failed: {str(e)}"
-                session.add(summary_record)
-                session.commit()
-                logger.exception("Failed to vectorize summary for segment %s", segment.id)
-                return summary_record
-
-        except Exception as e:
-            logger.exception("Failed to update summary for segment %s", segment.id)
-            session.rollback()
-            # Update summary record with error status if it exists
-            summary_record = session.scalar(
-                select(DocumentSegmentSummary)
-                .where(
-                    DocumentSegmentSummary.chunk_id == segment.id,
-                    DocumentSegmentSummary.dataset_id == dataset.id,
-                )
-                .limit(1)
-            )
-            if summary_record:
-                summary_record.status = SummaryStatus.ERROR
-                summary_record.error = str(e)
-                session.add(summary_record)
-                session.commit()
-            raise
 
     @staticmethod
     def get_segment_summary(
@@ -1204,14 +1378,80 @@ class SummaryIndexAdapter:
         )
 
 
+class _PreparedSummaryVectorWrite:
+    def __init__(self, vector: Vector, document: Document, route: VectorRoute) -> None:
+        self._vector = vector
+        self._document = document
+        self._route = route
+
+    @property
+    def route(self) -> VectorRoute:
+        return self._route
+
+    def submit(self) -> None:
+        write_started = False
+
+        def mark_write_started() -> None:
+            nonlocal write_started
+            write_started = True
+
+        try:
+            self._vector.add_texts(
+                [self._document],
+                duplicate_check=False,
+                before_write=mark_write_started,
+            )
+        except Exception as error:
+            if not write_started:
+                raise SummaryVectorWriteNotSubmittedError(str(error)) from error
+            raise
+
+
 class SummaryVectorGateway:
     def __init__(self, dataset: Dataset, factory: Callable[[], Vector]) -> None:
         self._dataset, self._factory = dataset, factory
+        self._model: ModelInstance | None = None
 
-    def delete(self, node_id: str) -> None:
-        self._factory().delete_by_ids([node_id])
+    def delete(self, claim: SummaryVectorCleanupClaim) -> None:
+        if claim.route is None:
+            raise ValueError("Summary vector cleanup has no trustworthy persisted route")
+        vector_for_route(claim.route).delete_by_ids([claim.node_id])
 
     def count_tokens(self, content: str) -> int:
+        model = self._resolve_model()
+        tokens = model.get_text_embedding_num_tokens([content])
+        return tokens[0] if tokens and isinstance(tokens[0], int) else 0
+
+    def prepare(self, command: SummaryVectorInput, result: SummaryVectorResult) -> _PreparedSummaryVectorWrite:
+        """Build a write that marks the exact vector-store mutation boundary.
+
+        Embedding happens before that boundary. Failures there are reported as
+        definitely not submitted; processor failures remain uncertain.
+        """
+        dataset_ref = command.ref.document.dataset
+        if dataset_ref.tenant_id != self._dataset.tenant_id or dataset_ref.dataset_id != self._dataset.id:
+            raise ValueError("Summary vector command does not belong to the dataset")
+        if not command.content.strip():
+            raise ValueError("Summary vector content is empty")
+        vector = self._factory()
+        route = capture_vector_route(self._dataset, vector, doc_form="summary")
+        document = Document(
+            page_content=command.content,
+            metadata={
+                "doc_id": result.node_id,
+                "doc_hash": result.content_hash,
+                "dataset_id": dataset_ref.dataset_id,
+                "document_id": command.ref.document.document_id,
+                "original_chunk_id": command.ref.segment_id,
+                "doc_type": DocType.TEXT,
+                "is_summary": True,
+            },
+        )
+        return _PreparedSummaryVectorWrite(vector, document, route)
+
+    def _resolve_model(self) -> ModelInstance:
+        if self._model is not None:
+            return self._model
         dataset = self._dataset
         model = ModelManager.for_tenant(tenant_id=dataset.tenant_id).get_model_instance(
             tenant_id=dataset.tenant_id,
@@ -1219,20 +1459,5 @@ class SummaryVectorGateway:
             model_type=ModelType.TEXT_EMBEDDING,
             model=dataset.embedding_model or "",
         )
-        tokens = model.get_text_embedding_num_tokens([content])
-        return tokens[0] if tokens and isinstance(tokens[0], int) else 0
-
-    def write(self, command: SummaryVectorInput, result: SummaryVectorResult) -> None:
-        document = Document(
-            page_content=command.content,
-            metadata={
-                "doc_id": result.node_id,
-                "doc_hash": result.content_hash,
-                "dataset_id": command.ref.document.dataset.dataset_id,
-                "document_id": command.ref.document.document_id,
-                "original_chunk_id": command.ref.segment_id,
-                "doc_type": DocType.TEXT,
-                "is_summary": True,
-            },
-        )
-        self._factory().add_texts([document], duplicate_check=False)
+        self._model = model
+        return model

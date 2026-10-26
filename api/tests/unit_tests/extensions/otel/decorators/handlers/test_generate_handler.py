@@ -6,12 +6,20 @@ Test objectives:
 2. Verify span attribute mapping correctness
 """
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
+
+import pytest
 
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from extensions.otel.decorators.handlers.generate_handler import AppGenerateHandler
 from extensions.otel.semconv import DifySpanAttributes, GenAIAttributes
 from tests.unit_tests.config_override import config_overrides_context
+
+
+@pytest.fixture
+def external_retrieval() -> ExternalDatasetRetriever:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
 
 class TestAppGenerateHandler:
@@ -19,7 +27,7 @@ class TestAppGenerateHandler:
 
     @config_overrides_context(ENABLE_OTEL=True)
     def test_compatible_with_real_function_signature(
-        self, tracer_provider_with_memory_exporter, mock_app_model, mock_account_user
+        self, tracer_provider_with_memory_exporter, mock_app_model, mock_account_user, external_retrieval
     ):
         """
         Verify handler compatibility with real AppGenerateService.generate signature.
@@ -39,6 +47,7 @@ class TestAppGenerateHandler:
             "invoke_from": InvokeFrom.DEBUGGER,
             "streaming": True,
             "root_node_id": None,
+            "external_retrieval": external_retrieval,
         }
 
         arguments = handler._extract_arguments(AppGenerateService.generate, **kwargs)
@@ -48,6 +57,7 @@ class TestAppGenerateHandler:
         assert "user" in arguments, "Handler uses user but parameter is missing"
         assert "args" in arguments, "Handler uses args but parameter is missing"
         assert "streaming" in arguments, "Handler uses streaming but parameter is missing"
+        assert arguments["external_retrieval"] is external_retrieval
 
     @config_overrides_context(ENABLE_OTEL=True)
     def test_all_span_attributes_set_correctly(

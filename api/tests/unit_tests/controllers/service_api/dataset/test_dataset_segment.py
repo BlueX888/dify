@@ -16,7 +16,7 @@ Focus on:
 
 import inspect
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, create_autospec, patch
 
@@ -25,6 +25,7 @@ from flask import Flask
 from sqlalchemy.orm import Session
 from werkzeug.exceptions import NotFound, UnprocessableEntity
 
+import libs.login as login_module
 from controllers.service_api.dataset.segment import (
     ChildChunkApi,
     ChildChunkCreatePayload,
@@ -37,12 +38,13 @@ from controllers.service_api.dataset.segment import (
     SegmentCreatePayload,
     SegmentListQuery,
 )
+from core.model_manager import ModelManager
 from core.rag.index_processor.constant.index_type import IndexStructureType
 from libs.datetime_utils import naive_utc_now
 from models.account import Account, Tenant
 from models.dataset import ChildChunk, Dataset, Document, DocumentSegment, DocumentSegmentSummary
 from models.enums import IndexingStatus, SegmentType
-from services.api_token_service import CachedApiToken
+from models.model import ApiToken
 from services.knowledge.dataset_service import DocumentService, SegmentService
 from services.knowledge.segments.application import SegmentMutationService
 from tests.unit_tests.model_factories import make_account
@@ -95,14 +97,24 @@ def mock_tenant() -> Tenant:
     return tenant
 
 
-def _account() -> Account:
+def _account(*, tenant: Tenant | None = None) -> Account:
     return make_account(
-        account_id=str(uuid.uuid4()), name="Segment API User", email=f"segment-api-{uuid.uuid4()}@example.com"
+        account_id=str(uuid.uuid4()),
+        name="Segment API User",
+        email=f"segment-api-{uuid.uuid4()}@example.com",
+        tenant=tenant,
     )
 
 
-def _api_token(tenant_id: str) -> CachedApiToken:
-    return CachedApiToken(
+@pytest.fixture
+def authenticated_account(mock_tenant: Tenant, monkeypatch: pytest.MonkeyPatch) -> Account:
+    account = _account(tenant=mock_tenant)
+    monkeypatch.setattr(login_module, "current_user", account)
+    return account
+
+
+def _api_token(tenant_id: str) -> ApiToken:
+    return ApiToken(
         id=str(uuid.uuid4()),
         app_id=None,
         tenant_id=tenant_id,
@@ -1028,8 +1040,10 @@ class SQLiteEndpointTest:
     session: Session
 
     @pytest.fixture(autouse=True)
-    def _use_sqlite_session(self, sqlite_session: Session) -> None:
+    def _use_sqlite_session(self, sqlite_session: Session) -> Iterator[None]:
         self.session = sqlite_session
+        with patch("controllers.service_api.wraps.db.session", sqlite_session):
+            yield
 
     def _persist_dataset(self, dataset: Dataset, tenant_id: str) -> None:
         dataset.tenant_id = tenant_id
@@ -1208,6 +1222,7 @@ class TestSegmentApiGet(SQLiteEndpointTest):
                 api.get(tenant_id=mock_tenant.id, dataset_id=mock_dataset.id, document_id="doc-id")
 
 
+@pytest.mark.usefixtures("authenticated_account")
 class TestSegmentApiPost(SQLiteEndpointTest):
     """Test suite for SegmentApi.post() endpoint.
 
@@ -1219,10 +1234,12 @@ class TestSegmentApiPost(SQLiteEndpointTest):
     module to neutralise all billing decorators.
     """
 
-    @staticmethod
-    def _setup_billing_mocks(mock_validate_token, mock_feature_svc, tenant_id: str):
-        """Configure mocks to neutralise billing/auth decorators."""
-        mock_validate_token.return_value = _api_token(tenant_id)
+    def _setup_billing_mocks(self, mock_validate_token, mock_feature_svc, tenant_id: str):
+        """Configure billing boundaries with a persisted dataset token."""
+        api_token = _api_token(tenant_id)
+        self.session.add(api_token)
+        self.session.commit()
+        mock_validate_token.return_value = api_token
 
         mock_features = Mock()
         mock_feature_svc.get_features.return_value = mock_features
@@ -1412,7 +1429,9 @@ class TestDatasetSegmentApiDelete(SQLiteEndpointTest):
         # Arrange
         mock_account_fn.return_value = (_account(), mock_tenant.id)
         self._persist_dataset(mock_dataset, mock_tenant.id)
-        mock_dataset_svc.check_dataset_model_setting.return_value = None
+        mock_dataset_svc.check_dataset_model_setting.side_effect = AssertionError(
+            "Deleting a segment must not load embedding credentials"
+        )
 
         mock_doc = _document_for_dataset(mock_dataset)
         mock_doc_svc.get_document.return_value = mock_doc
@@ -1438,6 +1457,7 @@ class TestDatasetSegmentApiDelete(SQLiteEndpointTest):
 
         # Assert
         assert response == ("", 204)
+        mock_dataset_svc.check_dataset_model_setting.assert_not_called()
         mock_seg_svc.delete_segment.assert_called_once_with(
             mock_segment, mock_doc, mock_dataset, self.session, mutations=ANY
         )
@@ -1554,6 +1574,7 @@ class TestDatasetSegmentApiDelete(SQLiteEndpointTest):
                 )
 
 
+@pytest.mark.usefixtures("authenticated_account")
 class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
     """Test suite for DatasetSegmentApi.post() (update segment) endpoint.
 
@@ -1564,10 +1585,12 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
     module.
     """
 
-    @staticmethod
-    def _setup_billing_mocks(mock_validate_token, mock_feature_svc, tenant_id: str):
-        """Configure mocks to neutralise billing/auth decorators."""
-        mock_validate_token.return_value = _api_token(tenant_id)
+    def _setup_billing_mocks(self, mock_validate_token, mock_feature_svc, tenant_id: str):
+        """Configure billing boundaries with a persisted dataset token."""
+        api_token = _api_token(tenant_id)
+        self.session.add(api_token)
+        self.session.commit()
+        mock_validate_token.return_value = api_token
         mock_features = Mock()
         mock_feature_svc.get_features.return_value = mock_features
         mock_vector_space = Mock()
@@ -1586,6 +1609,7 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
     @patch("controllers.service_api.dataset.segment.current_account_with_tenant")
     @patch("controllers.service_api.wraps.FeatureService")
     @patch("controllers.service_api.wraps.validate_and_get_api_token")
+    @pytest.mark.parametrize("disable_only", [False, True])
     def test_update_segment_success(
         self,
         mock_validate_token,
@@ -1596,6 +1620,8 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
         mock_seg_svc,
         mock_get_summary,
         mock_dump_segment,
+        disable_only: bool,
+        monkeypatch: pytest.MonkeyPatch,
         app: Flask,
         mock_tenant,
         mock_dataset,
@@ -1604,9 +1630,19 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
         """Test successful segment update."""
         self._setup_billing_mocks(mock_validate_token, mock_feature_svc, mock_tenant.id)
         mock_account_fn.return_value = (_account(), mock_tenant.id)
-        mock_dataset.indexing_technique = "economy"
+        mock_dataset.indexing_technique = "high_quality" if disable_only else "economy"
         self._persist_dataset(mock_dataset, mock_tenant.id)
-        mock_dataset_svc.check_dataset_model_setting.return_value = None
+        if disable_only:
+            mock_dataset_svc.check_dataset_model_setting.side_effect = AssertionError(
+                "Disabling a segment must not load embedding credentials"
+            )
+
+            def reject_model_lookup(*, tenant_id: str) -> None:
+                raise AssertionError(f"Disable must not resolve the revoked embedding provider: {tenant_id}")
+
+            monkeypatch.setattr(ModelManager, "for_tenant", reject_model_lookup)
+        else:
+            mock_dataset_svc.check_dataset_model_setting.return_value = None
         mock_doc_svc.get_document.return_value = _document_for_dataset(
             mock_dataset, doc_form=IndexStructureType.PARAGRAPH_INDEX
         )
@@ -1622,6 +1658,7 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
             created_by="account-1",
         )
         updated.id = "updated-seg"
+        updated.enabled = not disable_only
         mock_seg_svc.update_segment.return_value = updated
         mock_get_summary.return_value = None
         mock_dump_segment.return_value = _segment_response_dict()
@@ -1629,7 +1666,7 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
         with app.test_request_context(
             f"/datasets/{mock_dataset.id}/documents/doc-id/segments/{mock_segment.id}",
             method="POST",
-            json={"segment": {"content": "updated content"}},
+            json={"segment": {"enabled": False} if disable_only else {"content": "updated content"}},
             headers={"Authorization": "Bearer test_token"},
         ):
             api = DatasetSegmentApi()
@@ -1643,6 +1680,9 @@ class TestDatasetSegmentApiUpdate(SQLiteEndpointTest):
         assert status == 200
         assert "data" in response
         mock_seg_svc.update_segment.assert_called_once()
+        if disable_only:
+            mock_dataset_svc.check_dataset_model_setting.assert_not_called()
+            assert mock_seg_svc.update_segment.call_args.args[0].enabled is False
         mock_dump_segment.assert_called_once_with(updated, None, session=ANY)
         assert isinstance(mock_dump_segment.call_args.kwargs["session"], Session)
 
@@ -2056,6 +2096,7 @@ class TestChildChunkApiGet(SQLiteEndpointTest):
                 )
 
 
+@pytest.mark.usefixtures("authenticated_account")
 class TestChildChunkApiPost(SQLiteEndpointTest):
     """Test suite for ChildChunkApi.post() endpoint.
 
@@ -2063,9 +2104,11 @@ class TestChildChunkApiPost(SQLiteEndpointTest):
     and ``FeatureService`` at the ``wraps`` module.
     """
 
-    @staticmethod
-    def _setup_billing_mocks(mock_validate_token, mock_feature_svc, tenant_id: str):
-        mock_validate_token.return_value = _api_token(tenant_id)
+    def _setup_billing_mocks(self, mock_validate_token, mock_feature_svc, tenant_id: str):
+        api_token = _api_token(tenant_id)
+        self.session.add(api_token)
+        self.session.commit()
+        mock_validate_token.return_value = api_token
         mock_features = Mock()
         mock_feature_svc.get_features.return_value = mock_features
         mock_vector_space = Mock()
@@ -2371,13 +2414,16 @@ class TestDatasetChildChunkApiDelete(SQLiteEndpointTest):
                 )
 
 
+@pytest.mark.usefixtures("authenticated_account")
 class TestModelValidateDecorator(SQLiteEndpointTest):
     """The endpoint tests above supply valid bodies, so this is what covers the decorators."""
 
-    @staticmethod
-    def _setup_billing_mocks(mock_validate_token: Mock, mock_feature_svc: Mock, tenant_id: str) -> None:
-        """Configure mocks to neutralise billing/auth decorators."""
-        mock_validate_token.return_value = _api_token(tenant_id)
+    def _setup_billing_mocks(self, mock_validate_token: Mock, mock_feature_svc: Mock, tenant_id: str) -> None:
+        """Configure billing boundaries with a persisted dataset token."""
+        api_token = _api_token(tenant_id)
+        self.session.add(api_token)
+        self.session.commit()
+        mock_validate_token.return_value = api_token
 
         mock_features = Mock()
         mock_feature_svc.get_features.return_value = mock_features

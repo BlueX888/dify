@@ -6,7 +6,7 @@ import uuid
 from collections.abc import Iterator
 from inspect import unwrap
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from flask import Flask
@@ -69,6 +69,8 @@ from controllers.console.app.workflow_draft_variable import (
 )
 from controllers.console.app.workflow_statistic import WorkflowStatisticQuery
 from controllers.console.app.workflow_trigger import ParserEnable, WebhookTriggerQuery
+from core.rag.retrieval.dataset_retrieval import ExternalDatasetRetriever
+from extensions.ext_application_services import ApplicationServices
 from machinery.context import RequestContext
 from models import App, Site
 from models.account import Account, AccountStatus
@@ -134,6 +136,15 @@ def database_app() -> Iterator[Flask]:
         yield app
 
 
+@pytest.fixture
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    retriever = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    services.knowledge.external_retrieval = retriever
+    monkeypatch.setattr(completion_module, "application_services", lambda: services)
+    return retriever
+
+
 class TestCompletionEndpoints:
     def test_completion_create_payload(self):
         payload = CompletionMessagePayload(inputs={"prompt": "test"}, model_config={})
@@ -149,15 +160,23 @@ class TestCompletionEndpoints:
         )
         assert payload.query == "hi"
 
-    def test_completion_api_success(self, app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_engine: Engine) -> None:
+    def test_completion_api_success(
+        self,
+        app: Flask,
+        monkeypatch: pytest.MonkeyPatch,
+        sqlite_engine: Engine,
+        external_retrieval: MagicMock,
+    ) -> None:
         api = completion_module.CompletionMessageApi()
         method = unwrap(api.post)
 
-        monkeypatch.setattr(
-            completion_module.AppGenerateService,
-            "generate",
-            lambda **_kwargs: {"text": "ok"},
-        )
+        generate_call: dict[str, object] = {}
+
+        def generate(**kwargs: object) -> dict[str, str]:
+            generate_call.update(kwargs)
+            return {"text": "ok"}
+
+        monkeypatch.setattr(completion_module.AppGenerateService, "generate", generate)
         monkeypatch.setattr(
             completion_module.helper,
             "compact_generate_response",
@@ -177,9 +196,14 @@ class TestCompletionEndpoints:
             )
 
         assert resp == {"result": {"text": "ok"}}
+        assert generate_call["external_retrieval"] is external_retrieval
 
     def test_completion_api_conversation_not_exists(
-        self, app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_engine: Engine
+        self,
+        app: Flask,
+        monkeypatch: pytest.MonkeyPatch,
+        sqlite_engine: Engine,
+        external_retrieval: MagicMock,
     ) -> None:
         api = completion_module.CompletionMessageApi()
         method = unwrap(api.post)
@@ -206,7 +230,11 @@ class TestCompletionEndpoints:
             )
 
     def test_completion_api_provider_not_initialized(
-        self, app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_engine: Engine
+        self,
+        app: Flask,
+        monkeypatch: pytest.MonkeyPatch,
+        sqlite_engine: Engine,
+        external_retrieval: MagicMock,
     ) -> None:
         api = completion_module.CompletionMessageApi()
         method = unwrap(api.post)
@@ -231,7 +259,11 @@ class TestCompletionEndpoints:
             )
 
     def test_completion_api_quota_exceeded(
-        self, app: Flask, monkeypatch: pytest.MonkeyPatch, sqlite_engine: Engine
+        self,
+        app: Flask,
+        monkeypatch: pytest.MonkeyPatch,
+        sqlite_engine: Engine,
+        external_retrieval: MagicMock,
     ) -> None:
         api = completion_module.CompletionMessageApi()
         method = unwrap(api.post)

@@ -25,6 +25,7 @@ from controllers.web.error import (
 from controllers.web.wraps import WebApiResource
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+from extensions.ext_application_services import application_services
 from extensions.ext_database import db
 from fields.conversation_fields import MessageResponseSource, ResultResponse
 from fields.message_fields import SuggestedQuestionsResponse, WebMessageInfiniteScrollPagination, WebMessageListItem
@@ -194,6 +195,7 @@ class MessageMoreLikeThisApi(WebApiResource):
 
         try:
             response = AppGenerateService.generate_more_like_this(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,

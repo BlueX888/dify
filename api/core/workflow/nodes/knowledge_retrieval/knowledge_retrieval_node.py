@@ -15,6 +15,8 @@ from core.app.entities.app_invoke_entities import DIFY_RUN_CONTEXT_KEY, DifyRunC
 from core.credit_usage import CreditUsageAppType
 from core.db.session_factory import session_factory
 from core.rag.data_post_processor.data_post_processor import RerankingModelDict, WeightsDict
+from core.rag.embedding.retrieval import RetrievalFinalizer
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.file_reference import parse_file_reference
 from graphon.enums import (
@@ -79,6 +81,8 @@ class KnowledgeRetrievalNode(Node[KnowledgeRetrievalNodeData]):
         *,
         init_params: "InitParams",
         runtime_state: "RuntimeState",
+        external_retrieval: ExternalDatasetRetriever,
+        retrieval_finalizer: RetrievalFinalizer,
         session_maker=None,
     ) -> None:
         super().__init__(
@@ -89,7 +93,10 @@ class KnowledgeRetrievalNode(Node[KnowledgeRetrievalNodeData]):
         )
         # LLM file outputs, used for MultiModal outputs.
         self._file_outputs = []
-        self._rag_retrieval = DatasetRetrieval()
+        self._rag_retrieval = DatasetRetrieval(
+            external_retrieval=external_retrieval,
+            retrieval_finalizer=retrieval_finalizer,
+        )
         self._session_maker = session_maker or session_factory.get_session_maker()
 
     @classmethod

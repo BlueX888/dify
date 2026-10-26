@@ -17,7 +17,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from pytest_mock import MockerFixture
@@ -25,6 +25,7 @@ from sqlalchemy.orm import Session
 
 import services.app_generate_service as ags_module
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from enums import DeploymentEdition, QuotaType
 from models.account import Account
 from models.enums import AppStatus
@@ -97,8 +98,9 @@ def _make_user() -> Account:
 
 class _RealSessionTest:
     @pytest.fixture(autouse=True)
-    def _bind_unbound_session(self, unbound_session: Session) -> None:
+    def _bind_unbound_session(self, unbound_session: Session, mocker: MockerFixture) -> None:
         self.session = unbound_session
+        self.external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
 
 def _make_workflow(
@@ -308,6 +310,10 @@ class TestGenerate(_RealSessionTest):
 
     # -- COMPLETION ---------------------------------------------------------
     def test_completion_mode(self, mocker: MockerFixture):
+        constructor = mocker.patch(
+            "services.app_generate_service.CompletionAppGenerator.__init__",
+            return_value=None,
+        )
         gen_spy = mocker.patch(
             "services.app_generate_service.CompletionAppGenerator.generate",
             return_value={"result": "ok"},
@@ -321,14 +327,20 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=self.session,
         )
         assert result == {"result": "ok"}
         gen_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
 
     # -- AGENT_CHAT via mode ------------------------------------------------
     def test_agent_chat_mode(self, mocker: MockerFixture):
+        constructor = mocker.patch(
+            "services.app_generate_service.AgentChatAppGenerator.__init__",
+            return_value=None,
+        )
         gen_spy = mocker.patch(
             "services.app_generate_service.AgentChatAppGenerator.generate",
             return_value={"result": "agent"},
@@ -342,11 +354,13 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=self.session,
         )
         assert result == {"result": "agent"}
         gen_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
 
     # -- AGENT_CHAT via is_agent flag (non-AGENT_CHAT mode) -----------------
     def test_agent_via_is_agent_flag(self, mocker: MockerFixture):
@@ -366,6 +380,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=session,
         )
@@ -390,6 +405,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=True,
             session=session,
         )
@@ -399,6 +415,10 @@ class TestGenerate(_RealSessionTest):
 
     # -- CHAT ---------------------------------------------------------------
     def test_chat_mode(self, mocker: MockerFixture):
+        constructor = mocker.patch(
+            "services.app_generate_service.ChatAppGenerator.__init__",
+            return_value=None,
+        )
         gen_spy = mocker.patch(
             "services.app_generate_service.ChatAppGenerator.generate",
             return_value={"result": "chat"},
@@ -413,16 +433,22 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=self.session,
         )
         assert result == {"result": "chat"}
         gen_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
 
     # -- ADVANCED_CHAT blocking ---------------------------------------------
     def test_advanced_chat_blocking(self, mocker: MockerFixture):
         workflow = _make_workflow()
         mocker.patch.object(AppGenerateService, "_get_workflow", return_value=workflow)
+        constructor = mocker.patch(
+            "services.app_generate_service.AdvancedChatAppGenerator.__init__",
+            return_value=None,
+        )
 
         retrieve_spy = mocker.patch("services.app_generate_service.AdvancedChatAppGenerator.retrieve_events")
         gen_spy = mocker.patch(
@@ -440,6 +466,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"workflow_id": None, "query": "hi", "inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=session,
         )
@@ -447,6 +474,7 @@ class TestGenerate(_RealSessionTest):
         call_kwargs = gen_spy.call_args.kwargs
         assert call_kwargs.get("streaming") is False
         assert call_kwargs["session"] is session
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         retrieve_spy.assert_not_called()
 
     # -- ADVANCED_CHAT streaming --------------------------------------------
@@ -469,6 +497,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"workflow_id": None, "query": "hi", "inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=True,
             session=self.session,
         )
@@ -484,6 +513,10 @@ class TestGenerate(_RealSessionTest):
     def test_workflow_blocking(self, mocker: MockerFixture):
         workflow = _make_workflow()
         mocker.patch.object(AppGenerateService, "_get_workflow", return_value=workflow)
+        constructor = mocker.patch(
+            "services.app_generate_service.WorkflowAppGenerator.__init__",
+            return_value=None,
+        )
         gen_spy = mocker.patch(
             "services.app_generate_service.WorkflowAppGenerator.generate",
             return_value={"result": "workflow-blocking"},
@@ -499,11 +532,13 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=session,
         )
         assert result == {"result": "workflow-blocking"}
         call_kwargs = gen_spy.call_args.kwargs
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         assert call_kwargs.get("pause_state_config") is not None
         assert call_kwargs["pause_state_config"].state_owner_user_id == "owner-id"
 
@@ -528,6 +563,7 @@ class TestGenerate(_RealSessionTest):
                 user=_make_user(),
                 args={"inputs": {}},
                 invoke_from=invoke_from,
+                external_retrieval=self.external_retrieval,
                 streaming=False,
                 session=MagicMock(),
             )
@@ -551,6 +587,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.TRIGGER,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=MagicMock(),
         )
@@ -578,6 +615,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}, "workflow_id": workflow_id},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=session,
         )
@@ -609,6 +647,7 @@ class TestGenerate(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=True,
             session=self.session,
         )
@@ -628,6 +667,7 @@ class TestGenerate(_RealSessionTest):
                 user=_make_user(),
                 args={},
                 invoke_from=InvokeFrom.SERVICE_API,
+                external_retrieval=self.external_retrieval,
                 streaming=False,
                 session=self.session,
             )
@@ -666,6 +706,7 @@ class TestGenerateBilling(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=self.session,
         )
@@ -690,6 +731,7 @@ class TestGenerateBilling(_RealSessionTest):
                 user=_make_user(),
                 args={"inputs": {}},
                 invoke_from=InvokeFrom.SERVICE_API,
+                external_retrieval=self.external_retrieval,
                 streaming=False,
                 session=self.session,
             )
@@ -718,6 +760,7 @@ class TestGenerateBilling(_RealSessionTest):
                 user=_make_user(),
                 args={"inputs": {}},
                 invoke_from=InvokeFrom.SERVICE_API,
+                external_retrieval=self.external_retrieval,
                 streaming=False,
                 session=self.session,
             )
@@ -750,6 +793,7 @@ class TestGenerateBilling(_RealSessionTest):
             user=_make_user(),
             args={"inputs": {}},
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             streaming=False,
             session=self.session,
         )
@@ -781,6 +825,7 @@ class TestGenerateBilling(_RealSessionTest):
                 user=_make_user(),
                 args={"inputs": {}},
                 invoke_from=InvokeFrom.SERVICE_API,
+                external_retrieval=self.external_retrieval,
                 streaming=False,
                 session=self.session,
             )
@@ -815,6 +860,7 @@ class TestGenerateBilling(_RealSessionTest):
                 user=_make_user(),
                 args={"inputs": {}},
                 invoke_from=InvokeFrom.SERVICE_API,
+                external_retrieval=self.external_retrieval,
                 streaming=True,
                 session=self.session,
             )
@@ -917,6 +963,10 @@ class TestGenerateSingleIteration(_RealSessionTest):
     def test_advanced_chat_mode(self, mocker: MockerFixture):
         workflow = _make_workflow()
         mocker.patch.object(AppGenerateService, "_get_workflow", return_value=workflow)
+        constructor = mocker.patch(
+            "services.app_generate_service.AdvancedChatAppGenerator.__init__",
+            return_value=None,
+        )
         mocker.patch(
             "services.app_generate_service.AdvancedChatAppGenerator.convert_to_event_stream",
             side_effect=lambda x: x,
@@ -932,15 +982,21 @@ class TestGenerateSingleIteration(_RealSessionTest):
             user=_make_user(),
             node_id="n1",
             args={"k": "v"},
+            external_retrieval=self.external_retrieval,
             session=session,
         )
         iter_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         assert iter_spy.call_args.kwargs["session"] is session
         assert result == {"event": "iteration"}
 
     def test_workflow_mode(self, mocker: MockerFixture):
         workflow = _make_workflow()
         mocker.patch.object(AppGenerateService, "_get_workflow", return_value=workflow)
+        constructor = mocker.patch(
+            "services.app_generate_service.WorkflowAppGenerator.__init__",
+            return_value=None,
+        )
         mocker.patch(
             "services.app_generate_service.AdvancedChatAppGenerator.convert_to_event_stream",
             side_effect=lambda x: x,
@@ -956,9 +1012,11 @@ class TestGenerateSingleIteration(_RealSessionTest):
             user=_make_user(),
             node_id="n1",
             args={"k": "v"},
+            external_retrieval=self.external_retrieval,
             session=session,
         )
         iter_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         assert iter_spy.call_args.kwargs["session"] is session
         assert result == {"event": "wf-iteration"}
 
@@ -966,7 +1024,12 @@ class TestGenerateSingleIteration(_RealSessionTest):
         app = _make_app(AppMode.CHAT)
         with pytest.raises(ValueError, match="Invalid app mode"):
             AppGenerateService.generate_single_iteration(
-                app_model=app, user=_make_user(), node_id="n1", args={}, session=self.session
+                app_model=app,
+                user=_make_user(),
+                node_id="n1",
+                args={},
+                external_retrieval=self.external_retrieval,
+                session=self.session,
             )
 
 
@@ -977,6 +1040,10 @@ class TestGenerateSingleLoop(_RealSessionTest):
     def test_advanced_chat_mode(self, mocker: MockerFixture):
         workflow = _make_workflow()
         mocker.patch.object(AppGenerateService, "_get_workflow", return_value=workflow)
+        constructor = mocker.patch(
+            "services.app_generate_service.AdvancedChatAppGenerator.__init__",
+            return_value=None,
+        )
         mocker.patch(
             "services.app_generate_service.AdvancedChatAppGenerator.convert_to_event_stream",
             side_effect=lambda x: x,
@@ -992,15 +1059,21 @@ class TestGenerateSingleLoop(_RealSessionTest):
             user=_make_user(),
             node_id="n1",
             args=MagicMock(),
+            external_retrieval=self.external_retrieval,
             session=session,
         )
         loop_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         assert loop_spy.call_args.kwargs["session"] is session
         assert result == {"event": "loop"}
 
     def test_workflow_mode(self, mocker: MockerFixture):
         workflow = _make_workflow()
         mocker.patch.object(AppGenerateService, "_get_workflow", return_value=workflow)
+        constructor = mocker.patch(
+            "services.app_generate_service.WorkflowAppGenerator.__init__",
+            return_value=None,
+        )
         mocker.patch(
             "services.app_generate_service.AdvancedChatAppGenerator.convert_to_event_stream",
             side_effect=lambda x: x,
@@ -1016,9 +1089,11 @@ class TestGenerateSingleLoop(_RealSessionTest):
             user=_make_user(),
             node_id="n1",
             args=MagicMock(),
+            external_retrieval=self.external_retrieval,
             session=session,
         )
         loop_spy.assert_called_once()
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         assert loop_spy.call_args.kwargs["session"] is session
         assert result == {"event": "wf-loop"}
 
@@ -1026,7 +1101,12 @@ class TestGenerateSingleLoop(_RealSessionTest):
         app = _make_app(AppMode.COMPLETION)
         with pytest.raises(ValueError, match="Invalid app mode"):
             AppGenerateService.generate_single_loop(
-                app_model=app, user=_make_user(), node_id="n1", args=MagicMock(), session=self.session
+                app_model=app,
+                user=_make_user(),
+                node_id="n1",
+                args=MagicMock(),
+                external_retrieval=self.external_retrieval,
+                session=self.session,
             )
 
 
@@ -1035,6 +1115,10 @@ class TestGenerateSingleLoop(_RealSessionTest):
 # ---------------------------------------------------------------------------
 class TestGenerateMoreLikeThis(_RealSessionTest):
     def test_delegates_to_completion_generator(self, mocker: MockerFixture):
+        constructor = mocker.patch(
+            "services.app_generate_service.CompletionAppGenerator.__init__",
+            return_value=None,
+        )
         gen_spy = mocker.patch(
             "services.app_generate_service.CompletionAppGenerator.generate_more_like_this",
             return_value={"result": "similar"},
@@ -1045,10 +1129,12 @@ class TestGenerateMoreLikeThis(_RealSessionTest):
             user=_make_user(),
             message_id="msg-1",
             invoke_from=InvokeFrom.SERVICE_API,
+            external_retrieval=self.external_retrieval,
             session=session,
             streaming=True,
         )
         assert result == {"result": "similar"}
+        assert constructor.call_args.kwargs["external_retrieval"] is self.external_retrieval
         gen_spy.assert_called_once()
         assert gen_spy.call_args.kwargs["session"] is session
         assert gen_spy.call_args.kwargs["stream"] is True

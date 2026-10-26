@@ -55,7 +55,7 @@ from libs.helper import dump_response, to_timestamp
 from machinery.context import RequestContext
 from models.account import TenantAccountRole
 from models.enums import ProcessRuleMode
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
 from services.knowledge.documents.application import (
     DocumentArchivedError,
     DocumentIndexingStateError,
@@ -106,12 +106,6 @@ def _raise_document_indexing_error(error: Exception) -> Never:
         if error.kind == "unsupported":
             raise ProviderModelCurrentlyNotSupportError() from error
         raise ProviderNotInitializeError(str(error)) from error
-    _raise_document_error(error)
-
-
-def _raise_document_action_error(error: Exception) -> Never:
-    if isinstance(error, DocumentInvalidActionError):
-        raise InvalidActionError(str(error)) from error
     _raise_document_error(error)
 
 
@@ -672,37 +666,6 @@ class DocumentBatchDownloadZipApi(Resource):
             _raise_document_indexing_error(error)
         # response-contract:ignore binary ZIP download response
         return response
-
-
-@console_ns.route("/datasets/<uuid:dataset_id>/documents/<uuid:document_id>/processing/<string:action>")
-class DocumentProcessingApi(Resource):
-    @error_responses(InvalidActionError)
-    @console_ns.doc("update_document_processing")
-    @console_ns.doc(description="Update document processing status (pause/resume)")
-    @console_ns.doc(
-        params={"dataset_id": "Dataset ID", "document_id": "Document ID", "action": "Action to perform (pause/resume)"}
-    )
-    @console_ns.response(
-        200,
-        "Processing status updated successfully",
-        console_ns.models[SimpleResultResponse.__name__],
-    )
-    @console_ns.response(404, "Document not found")
-    @console_ns.response(400, "Invalid action")
-    @console_account_admission(
-        allowed_roles=_DATASET_EDIT_ROLES, rbac_checks=(RBACCheck(RBACPermission.DATASET_EDIT, DatasetId()),)
-    )
-    @cloud_edition_billing_rate_limit_check("knowledge")
-    def patch(
-        self, request_context: RequestContext, dataset_id: UUID, document_id: UUID, action: Literal["pause", "resume"]
-    ):
-        try:
-            application_services().knowledge.documents.update_processing(
-                request_context, dataset_id=str(dataset_id), document_id=str(document_id), action=action
-            )
-        except Exception as error:
-            _raise_document_action_error(error)
-        return SimpleResultResponse(result="success").model_dump(mode="json"), 200
 
 
 @console_ns.route("/datasets/<uuid:dataset_id>/documents/<uuid:document_id>/metadata")

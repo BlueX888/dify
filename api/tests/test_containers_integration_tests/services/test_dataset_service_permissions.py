@@ -21,9 +21,10 @@ from models.dataset import (
     DatasetPermissionEnum,
 )
 from models.enums import DataSourceType
+from models.model import ResourceCleanupOutbox
 from services.errors.base import NoPermissionError
 from services.knowledge.dataset_service import DatasetCollectionBindingService, DatasetPermissionService, DatasetService
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 from tests.unit_tests.config_override import config_overrides_context
 
 
@@ -196,12 +197,16 @@ class TestDatasetServicePermissionsAndLifecycle:
             created_by=owner.id,
         )
 
-        with patch("services.knowledge.dataset_service.dataset_was_deleted.send") as send_deleted_signal:
+        with patch("services.knowledge.dataset_service.enqueue_resource_cleanup_intent", autospec=True) as enqueue:
             result = DatasetService.delete_dataset(dataset.id, user=owner, session=db_session_with_containers)
 
         assert result is True
         assert db_session_with_containers.get(Dataset, dataset.id) is None
-        send_deleted_signal.assert_called_once_with(dataset)
+        enqueue.assert_called_once()
+        intent = db_session_with_containers.get(ResourceCleanupOutbox, enqueue.call_args.args[0])
+        assert intent is not None
+        assert intent.tenant_id == tenant.id
+        assert intent.dataset_id == dataset.id
 
     def test_dataset_use_check_returns_true_when_join_exists(self, db_session_with_containers: Session):
         owner, tenant = DatasetPermissionIntegrationFactory.create_account_with_tenant(db_session_with_containers)

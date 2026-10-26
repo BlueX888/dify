@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from unittest.mock import create_autospec
 from uuid import uuid4
 
 import pytest
@@ -19,10 +20,12 @@ from core.app.file_access import (
 )
 from core.rag.datasource.retrieval_service import RetrievalService
 from core.rag.embedding.retrieval import RetrievalSegments
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.models.document import Document as RagDocument
 from core.rag.retrieval import dataset_retrieval as dataset_retrieval_module
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from extensions.storage.storage_type import StorageType
 from models import UploadFile
 from models.dataset import Dataset, DocumentSegment, SegmentAttachmentBinding
@@ -53,7 +56,7 @@ def test_file_access_grants_ignore_empty_inputs_and_missing_scope() -> None:
 
 
 @pytest.mark.parametrize("sqlite_session", [(UploadFile, SegmentAttachmentBinding)], indirect=True)
-def test_segment_attachment_lookup_grants_returned_upload_files_to_current_scope(sqlite_session: Session) -> None:
+def test_segment_attachment_lookup_is_pure(sqlite_session: Session) -> None:
     tenant_id = str(uuid4())
     dataset_id = str(uuid4())
     upload_file_id = str(uuid4())
@@ -95,14 +98,18 @@ def test_segment_attachment_lookup_grants_returned_upload_files_to_current_scope
             dataset_refs=((tenant_id, dataset_id),),
             session=sqlite_session,
         )
+        current_scope = get_current_file_access_scope()
         scoped_stmt = DatabaseFileAccessController().apply_upload_file_filters(
             select(UploadFile).where(UploadFile.id == upload_file_id)
         )
 
     assert result[0]["attachment_id"] == upload_file_id
+    assert result[0]["attachment_info"]["source_url"] == ""
+    assert current_scope is not None
+    assert upload_file_id not in current_scope.granted_upload_file_ids
     whereclause = str(scoped_stmt.whereclause)
     assert "upload_files.created_by_role" in whereclause
-    assert "upload_files.id IN" in whereclause
+    assert "upload_files.id IN" not in whereclause
 
 
 @pytest.mark.parametrize("sqlite_session", [(UploadFile, SegmentAttachmentBinding)], indirect=True)
@@ -183,6 +190,7 @@ def test_knowledge_retrieval_grants_returned_segments_to_current_scope(
         doc_metadata={},
     )
     document.id = document_id
+    document.indexing_status = "completed"
     segment = DocumentSegment(
         tenant_id=tenant_id,
         dataset_id=dataset_id,
@@ -201,7 +209,10 @@ def test_knowledge_retrieval_grants_returned_segments_to_current_scope(
     sqlite_session.commit()
 
     record = RetrievalSegments(segment=segment, score=0.8)
-    retrieval = DatasetRetrieval()
+    retrieval = DatasetRetrieval(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
     monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", lambda tenant_id: None)
     monkeypatch.setattr(retrieval, "_get_available_datasets", lambda tenant_id, dataset_ids: [dataset])
     monkeypatch.setattr(
@@ -209,7 +220,11 @@ def test_knowledge_retrieval_grants_returned_segments_to_current_scope(
         "multiple_retrieve",
         lambda **kwargs: [RagDocument(page_content="segment content", provider="dify")],
     )
-    monkeypatch.setattr(RetrievalService, "format_retrieval_documents", lambda _session, documents: [record])
+    monkeypatch.setattr(
+        RetrievalService,
+        "format_retrieval_documents",
+        lambda _session, documents, **_kwargs: [record],
+    )
     monkeypatch.setattr(dataset_retrieval_module.session_factory, "create_session", sqlite_session_factory)
     scope = FileAccessScope(
         tenant_id=tenant_id,

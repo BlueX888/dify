@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import Engine
+from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 from werkzeug.exceptions import NotFound
 
@@ -14,7 +14,7 @@ from enums import DeploymentEdition
 from extensions.storage.storage_type import StorageType
 from models.base import TypeBase
 from models.enums import CreatorUserRole
-from models.model import Account, EndUser, UploadFile
+from models.model import Account, EndUser, UploadFile, UploadFileCleanupOutbox
 from services.errors.file import (
     BlockedFileExtensionError,
     FileNotExistsError,
@@ -121,6 +121,171 @@ class TestFileService:
         persisted = db_session.get(UploadFile, result.id)
         assert persisted is not None
         assert persisted.hash == result.hash
+        assert db_session.scalar(select(UploadFileCleanupOutbox)) is None
+
+    def test_upload_file_registers_writer_before_storage_call(
+        self,
+        file_service: FileService,
+        sqlite_session_maker: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        observed: list[tuple[str, str]] = []
+
+        def save(key: str, _content: bytes) -> None:
+            with sqlite_session_maker() as session:
+                marker = session.scalar(select(UploadFileCleanupOutbox))
+                assert marker is not None
+                assert marker.key == key
+                assert marker.writer_id is not None
+                assert marker.writer_finished_at is None
+                assert marker.cleanup_started_at is None
+                assert session.get(UploadFile, marker.upload_file_id) is None
+                observed.append((marker.upload_file_id, marker.key))
+
+        monkeypatch.setattr("services.file_service.storage.save", save)
+        monkeypatch.setattr("services.file_service.extract_tenant_id", lambda _user: "tenant_id")
+        monkeypatch.setattr(
+            "services.file_service.file_helpers.get_signed_file_url",
+            lambda *, upload_file_id: f"signed:{upload_file_id}",
+        )
+
+        result = file_service.upload_file(
+            filename="image.png",
+            content=b"image",
+            mimetype="image/png",
+            user=_account(),
+        )
+
+        assert observed == [(result.id, result.key)]
+        with sqlite_session_maker() as session:
+            assert session.get(UploadFile, result.id) is not None
+            assert session.scalar(select(UploadFileCleanupOutbox)) is None
+
+    def test_temporary_upload_retains_leased_cleanup_owner_until_formal_handoff(
+        self,
+        file_service: FileService,
+        sqlite_session_maker: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr("services.file_service.storage.save", lambda _key, _content: None)
+        monkeypatch.setattr("services.file_service.extract_tenant_id", lambda _user: "tenant_id")
+        monkeypatch.setattr(
+            "services.file_service.file_helpers.get_signed_file_url",
+            lambda *, upload_file_id: f"signed:{upload_file_id}",
+        )
+
+        result = file_service.upload_file(
+            filename="remote.png",
+            content=b"image",
+            mimetype="image/png",
+            user=_account(),
+            temporary=True,
+        )
+
+        with sqlite_session_maker() as session:
+            marker = session.scalar(select(UploadFileCleanupOutbox))
+            assert marker is not None
+            assert marker.upload_file_id == result.id
+            assert marker.key == result.key
+            assert marker.writer_id is not None
+            assert marker.writer_finished_at is not None
+            assert marker.writer_expires_at is not None
+            assert marker.cleanup_started_at is None
+
+    def test_upload_file_rolls_back_record_and_blob_when_post_commit_work_fails(
+        self,
+        file_service: FileService,
+        sqlite_session_maker: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        saved_keys: list[str] = []
+        deleted_keys: list[str] = []
+        monkeypatch.setattr("services.file_service.storage.save", lambda key, _content: saved_keys.append(key))
+        monkeypatch.setattr("services.file_service.storage.delete", deleted_keys.append)
+        monkeypatch.setattr("services.file_service.extract_tenant_id", lambda _user: "tenant_id")
+
+        def fail_signed_url(*, upload_file_id: str) -> str:
+            raise RuntimeError(f"signing failed for {upload_file_id}")
+
+        monkeypatch.setattr("services.file_service.file_helpers.get_signed_file_url", fail_signed_url)
+
+        with pytest.raises(RuntimeError, match="signing failed"):
+            file_service.upload_file(
+                filename="image.png",
+                content=b"image",
+                mimetype="image/png",
+                user=_account(),
+            )
+
+        with sqlite_session_maker() as session:
+            assert session.scalars(select(UploadFile)).all() == []
+        assert deleted_keys == saved_keys
+
+    def test_upload_file_removes_fresh_key_when_storage_save_reports_failure_after_write(
+        self,
+        file_service: FileService,
+        sqlite_session_maker: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        attempted_keys: list[str] = []
+        deleted_keys: list[str] = []
+
+        def fail_after_write(key: str, _content: bytes) -> None:
+            attempted_keys.append(key)
+            raise RuntimeError("storage response lost")
+
+        monkeypatch.setattr("services.file_service.storage.save", fail_after_write)
+        monkeypatch.setattr("services.file_service.storage.delete", deleted_keys.append)
+        monkeypatch.setattr("services.file_service.extract_tenant_id", lambda _user: "tenant_id")
+
+        with pytest.raises(RuntimeError, match="storage response lost"):
+            file_service.upload_file(
+                filename="image.png",
+                content=b"image",
+                mimetype="image/png",
+                user=_account(),
+            )
+
+        with sqlite_session_maker() as session:
+            assert session.scalars(select(UploadFile)).all() == []
+            marker = session.scalar(select(UploadFileCleanupOutbox))
+            assert marker is not None
+            assert marker.writer_id is not None
+            assert marker.writer_finished_at is None
+            assert marker.cleanup_started_at is not None
+        assert deleted_keys == attempted_keys
+
+    def test_upload_file_blob_cleanup_failure_keeps_durable_key_after_record_commit(
+        self,
+        file_service: FileService,
+        sqlite_session_maker: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        saved_keys: list[str] = []
+        monkeypatch.setattr("services.file_service.storage.save", lambda key, _content: saved_keys.append(key))
+        monkeypatch.setattr(
+            "services.file_service.storage.delete",
+            lambda _key: (_ for _ in ()).throw(OSError("storage unavailable")),
+        )
+        monkeypatch.setattr("services.file_service.extract_tenant_id", lambda _user: "tenant_id")
+        monkeypatch.setattr(
+            "services.file_service.file_helpers.get_signed_file_url",
+            lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("signing failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="signing failed"):
+            file_service.upload_file(
+                filename="image.png",
+                content=b"image",
+                mimetype="image/png",
+                user=_account(),
+            )
+
+        with sqlite_session_maker() as session:
+            assert session.scalars(select(UploadFile)).all() == []
+            cleanup = session.scalar(select(UploadFileCleanupOutbox))
+            assert cleanup is not None
+            assert cleanup.key == saved_keys[0]
 
     @pytest.mark.parametrize("text", ["ASCII text", "包含多字节 UTF-8 文本 🚀"])
     def test_upload_text_uses_utf8_byte_length(self, text: str, file_service: FileService):
@@ -135,6 +300,38 @@ class TestFileService:
         expected_content = text.encode("utf-8")
         assert result.size == len(expected_content)
         mock_storage.save.assert_called_once_with(result.key, expected_content)
+
+    def test_upload_text_commit_failure_durably_compensates_created_blob(
+        self,
+        file_service: FileService,
+        sqlite_session_maker: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        saved_keys: list[str] = []
+        deleted_keys: list[str] = []
+        monkeypatch.setattr("services.file_service.storage.save", lambda key, _content: saved_keys.append(key))
+        monkeypatch.setattr("services.file_service.storage.delete", deleted_keys.append)
+        commit_attempts = 0
+
+        def fail_first_commit(_session: Session) -> None:
+            nonlocal commit_attempts
+            commit_attempts += 1
+            # The durable writer marker commits before the object is written.
+            if commit_attempts == 2:
+                raise RuntimeError("commit failed")
+
+        event.listen(sqlite_session_maker.class_, "before_commit", fail_first_commit)
+        try:
+            with pytest.raises(RuntimeError, match="commit failed"):
+                file_service.upload_text("text", "temp.txt", "user", "tenant_id")
+        finally:
+            event.remove(sqlite_session_maker.class_, "before_commit", fail_first_commit)
+
+        assert saved_keys
+        assert deleted_keys == saved_keys
+        with sqlite_session_maker() as session:
+            assert session.scalar(select(UploadFile)) is None
+            assert session.scalar(select(UploadFileCleanupOutbox)) is None
 
     def test_upload_file_uses_explicit_resource_tenant(self, file_service: FileService):
         user = Account(name="Test Account", email="test@example.com")
@@ -440,6 +637,10 @@ class TestFileService:
 
             # Assert
             assert result == "Extracted text content"
+            mock_extract.assert_called_once()
+            preview_upload = mock_extract.call_args.args[0]
+            assert preview_upload.id == "file_id"
+            assert mock_extract.call_args.kwargs == {"return_text": True, "persist_images": False}
 
     def test_get_file_preview_not_found(self, file_service: FileService):
         with pytest.raises(NotFound, match="File not found"):

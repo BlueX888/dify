@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from unittest.mock import patch
+from typing import override
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.orm import Session, scoped_session, sessionmaker
 from yaml import YAMLError
 
@@ -15,7 +18,9 @@ from core.app.app_config.entities import DatasetRetrieveConfigEntity
 from core.callback_handler.index_tool_callback_handler import DatasetIndexToolCallbackHandler
 from core.model_manager import ModelInstance, ModelManager
 from core.provider_manager import ProviderManager
-from core.rag.embedding.retrieval import RetrievalSegments
+from core.rag.embedding.retrieval import FinalizedRetrievalResult, RetrievalSegments
+from core.rag.entities import MetadataFilteringCondition
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.models.document import Document as RagDocument
 from core.rag.rerank.rerank_model import RerankModelRunner
 from core.tools.utils.dataset_retriever import dataset_multi_retriever_tool as multi_retriever_module
@@ -27,10 +32,15 @@ from core.tools.utils.uuid_utils import is_valid_uuid
 from core.tools.utils.yaml_utils import _load_yaml_file, load_yaml_file_cached
 from models.dataset import Dataset, Document, DocumentSegment
 from models.enums import DataSourceType, DocumentCreatedFrom, SegmentStatus
+from services.knowledge.retrieval import finalization as retrieval_finalization
 
 
 def _retrieve_config() -> DatasetRetrieveConfigEntity:
     return DatasetRetrieveConfigEntity(retrieve_strategy=DatasetRetrieveConfigEntity.RetrieveStrategy.SINGLE)
+
+
+def _external_retrieval() -> MagicMock:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
 
 def _persist_dataset(
@@ -76,6 +86,9 @@ def _persist_document(
         created_from=DocumentCreatedFrom.WEB,
         created_by=dataset.created_by,
         doc_metadata=doc_metadata,
+        indexing_status="completed",
+        enabled=True,
+        archived=False,
     )
     session.add(document)
     session.commit()
@@ -136,6 +149,65 @@ class _TestHitCallback(DatasetIndexToolCallbackHandler):
         self.resources = list(resource)
 
 
+class _SessionBoundaryFinalizer:
+    def __init__(self) -> None:
+        self._delegate = retrieval_finalization.KnowledgeRetrievalFinalizer()
+        self.format_session: Session | None = None
+        self.authorization_uses_format_session = False
+
+    def expand_document_ids_filter(
+        self,
+        *,
+        session: Session,
+        tenant_id: str,
+        dataset_id: str,
+        document_ids: Sequence[str],
+    ) -> tuple[str, ...]:
+        return self._delegate.expand_document_ids_filter(
+            session=session,
+            tenant_id=tenant_id,
+            dataset_id=dataset_id,
+            document_ids=document_ids,
+        )
+
+    def finalize(
+        self,
+        *,
+        format_session: Session,
+        authorization_session: Session,
+        candidates: Sequence[RagDocument],
+        tenant_id: str,
+        dataset_ids: Sequence[str],
+        top_k: int,
+    ) -> FinalizedRetrievalResult:
+        self.format_session = format_session
+        self.authorization_uses_format_session = authorization_session is format_session
+        result = self._delegate.finalize(
+            format_session=format_session,
+            authorization_session=authorization_session,
+            candidates=candidates,
+            tenant_id=tenant_id,
+            dataset_ids=dataset_ids,
+            top_k=top_k,
+        )
+        assert format_session.in_transaction()
+        return result
+
+
+class _SessionBoundaryHitCallback(_TestHitCallback):
+    def __init__(self, finalizer: _SessionBoundaryFinalizer) -> None:
+        super().__init__()
+        self._finalizer = finalizer
+        self.authorization_transaction_open_at_callback: bool | None = None
+
+    @override
+    def on_tool_end(self, documents: list[RagDocument], session: Session | None = None) -> None:
+        format_session = self._finalizer.format_session
+        assert format_session is not None
+        self.authorization_transaction_open_at_callback = format_session.in_transaction()
+        super().on_tool_end(documents, session)
+
+
 def test_remove_leading_symbols_preserves_markdown_link_and_strips_punctuation():
     markdown = "[Example](https://example.com) content"
     assert remove_leading_symbols(markdown) == markdown
@@ -191,16 +263,20 @@ def test_single_dataset_retriever_from_dataset_builds_name_and_description(sqlit
         name="Knowledge",
     )
 
+    external_retrieval = _external_retrieval()
     tool = SingleDatasetRetrieverTool.from_dataset(
         dataset=dataset,
+        external_retrieval=external_retrieval,
         retrieve_config=_retrieve_config(),
         return_resource=False,
         retriever_from="prod",
         inputs={},
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
     )
 
     assert tool.name == "dataset_dataset_1"
     assert tool.description == "useful for when you want to answer queries about the Knowledge"
+    assert tool.external_retrieval is external_retrieval
 
 
 def test_single_dataset_retriever_external_run_returns_content_and_resources(sqlite_session: Session):
@@ -208,21 +284,25 @@ def test_single_dataset_retriever_external_run_returns_content_and_resources(sql
     callback = _TestHitCallback()
     metadata_filter_result = (
         {dataset.id: ["doc-a"]},
-        {"logical_operator": "and"},
+        MetadataFilteringCondition(logical_operator="and"),
     )
     external_documents = [
         {"content": "first", "metadata": {"document_id": "doc-a"}, "score": 0.9, "title": "Doc A"},
         {"content": "second", "metadata": {"document_id": "doc-b"}, "score": 0.8, "title": "Doc B"},
     ]
 
+    external_retrieval = _external_retrieval()
+    external_retrieval.retrieve.return_value = external_documents
     tool = SingleDatasetRetrieverTool(
         tenant_id=dataset.tenant_id,
         dataset_id=dataset.id,
+        external_retrieval=external_retrieval,
         retrieve_config=_retrieve_config(),
         return_resource=True,
         retriever_from="dev",
         hit_callbacks=[callback],
         inputs={"x": 1},
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
     )
 
     with patch.object(
@@ -230,12 +310,7 @@ def test_single_dataset_retriever_external_run_returns_content_and_resources(sql
         "get_metadata_filter_condition",
         return_value=metadata_filter_result,
     ):
-        with patch.object(
-            single_retriever_module.ExternalDatasetService,
-            "fetch_external_knowledge_retrieval",
-            return_value=external_documents,
-        ) as fetch_mock:
-            result = tool.run(session=sqlite_session, query="hello")
+        result = tool.run(session=sqlite_session, query="hello")
 
     assert result == "first\nsecond"
     assert callback.queries == [("hello", dataset.id)]
@@ -243,8 +318,13 @@ def test_single_dataset_retriever_external_run_returns_content_and_resources(sql
     resource_info = callback.resources
     assert [item.position for item in resource_info] == [1, 2]
     assert resource_info[0].dataset_id == dataset.id
-    fetch_mock.assert_called_once()
-    assert fetch_mock.call_args.kwargs["session"] is sqlite_session
+    external_retrieval.retrieve.assert_called_once_with(
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        query="hello",
+        retrieval_model={},
+        metadata_filters=metadata_filter_result[1].model_dump(),
+    )
 
 
 def test_single_dataset_retriever_returns_empty_when_metadata_filter_finds_no_documents(
@@ -254,11 +334,13 @@ def test_single_dataset_retriever_returns_empty_when_metadata_filter_finds_no_do
     tool = SingleDatasetRetrieverTool(
         tenant_id=dataset.tenant_id,
         dataset_id=dataset.id,
+        external_retrieval=_external_retrieval(),
         retrieve_config=_retrieve_config(),
         return_resource=False,
         retriever_from="prod",
         hit_callbacks=[_TestHitCallback()],
         inputs={},
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
     )
 
     with patch.object(
@@ -299,7 +381,8 @@ def test_single_dataset_retriever_non_economy_run_sorts_context_and_resources(sq
         data_source_type=DataSourceType.NOTION_IMPORT,
         doc_metadata={"lang": "fr"},
     )
-    callback = _TestHitCallback()
+    finalizer = _SessionBoundaryFinalizer()
+    callback = _SessionBoundaryHitCallback(finalizer)
     low_segment = DocumentSegment(
         tenant_id=dataset.tenant_id,
         dataset_id=dataset.id,
@@ -344,13 +427,17 @@ def test_single_dataset_retriever_non_economy_run_sorts_context_and_resources(sq
     tool = SingleDatasetRetrieverTool(
         tenant_id=dataset.tenant_id,
         dataset_id=dataset.id,
+        external_retrieval=_external_retrieval(),
         retrieve_config=_retrieve_config(),
         return_resource=True,
         retriever_from="dev",
         hit_callbacks=[callback],
         inputs={},
         top_k=2,
+        retrieval_finalizer=finalizer,
     )
+    caller_commits: list[None] = []
+    event.listen(sqlite_session, "after_commit", lambda _session: caller_commits.append(None))
 
     with (
         patch.object(
@@ -365,7 +452,7 @@ def test_single_dataset_retriever_non_economy_run_sorts_context_and_resources(sq
             return_value=records,
         ),
         patch.object(
-            single_retriever_module,
+            retrieval_finalization,
             "sign_segment_content",
             lambda segment, **_kwargs: segment.content.replace("raw", "signed"),
         ),
@@ -373,7 +460,14 @@ def test_single_dataset_retriever_non_economy_run_sorts_context_and_resources(sq
         result = tool.run(session=sqlite_session, query="hello")
 
     assert result == "signed high\nsummary low\nquestion:signed low answer:low answer"
-    assert callback.documents == documents
+    assert finalizer.authorization_uses_format_session is True
+    assert callback.authorization_transaction_open_at_callback is False
+    assert caller_commits == []
+    assert callback.documents is not None
+    assert [document.metadata["segment_id"] for document in callback.documents] == [
+        high_segment.id,
+        low_segment.id,
+    ]
     assert callback.resources is not None
     resource_info = callback.resources
     assert [item.position for item in resource_info] == [1, 2]
@@ -381,6 +475,63 @@ def test_single_dataset_retriever_non_economy_run_sorts_context_and_resources(sq
     assert resource_info[0].hit_count == 9
     assert resource_info[1].summary == "summary low"
     assert resource_info[1].content == "question:raw low \nanswer:low answer"
+
+
+def test_single_dataset_retriever_economy_rejects_stale_raw_hit(sqlite_session: Session) -> None:
+    dataset = _persist_dataset(sqlite_session)
+    dataset.indexing_technique = "economy"
+    document = _persist_document(sqlite_session, dataset=dataset, name="Disabled document")
+    segment = DocumentSegment(
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        document_id=document.id,
+        index_node_id="disabled-node",
+        content="must not escape",
+        position=1,
+        word_count=3,
+        tokens=3,
+        created_by=dataset.created_by,
+        status=SegmentStatus.COMPLETED,
+        enabled=False,
+    )
+    sqlite_session.add(segment)
+    sqlite_session.commit()
+    raw_hit = RagDocument(
+        page_content=segment.content,
+        metadata={
+            "doc_id": segment.index_node_id,
+            "document_id": document.id,
+            "dataset_id": dataset.id,
+            "score": 0.99,
+        },
+    )
+    callback = _TestHitCallback()
+    tool = SingleDatasetRetrieverTool(
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        external_retrieval=_external_retrieval(),
+        retrieve_config=_retrieve_config(),
+        return_resource=True,
+        retriever_from="prod",
+        hit_callbacks=[callback],
+        inputs={},
+        top_k=1,
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
+    )
+
+    with (
+        patch.object(
+            single_retriever_module.DatasetRetrieval,
+            "get_metadata_filter_condition",
+            return_value=(None, None),
+        ),
+        patch.object(single_retriever_module.RetrievalService, "retrieve", return_value=[raw_hit]),
+    ):
+        result = tool.run(session=sqlite_session, query="hello")
+
+    assert result == ""
+    assert callback.documents is None
+    assert callback.resources is None
 
 
 def test_multi_dataset_retriever_from_dataset_sets_tool_name():
@@ -391,6 +542,7 @@ def test_multi_dataset_retriever_from_dataset_sets_tool_name():
         reranking_model_name="model",
         return_resource=False,
         retriever_from="prod",
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
     )
 
     assert tool.name == "dataset_tenant_1"
@@ -407,6 +559,7 @@ def test_multi_dataset_retriever_retriever_returns_early_when_dataset_is_missing
         dataset_ids=["dataset-1"],
         reranking_provider_name="provider",
         reranking_model_name="model",
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
         return_resource=False,
         retriever_from="prod",
     )
@@ -458,6 +611,7 @@ def test_multi_dataset_retriever_retriever_non_economy_uses_retrieval_model(
         return_resource=False,
         retriever_from="prod",
         top_k=2,
+        retrieval_finalizer=retrieval_finalization.KnowledgeRetrievalFinalizer(),
     )
 
     try:
@@ -505,7 +659,8 @@ def test_multi_dataset_retriever_run_orders_segments_and_returns_resources(sqlit
         name="Doc One",
         doc_metadata={"p": 1},
     )
-    callback = _TestHitCallback()
+    finalizer = _SessionBoundaryFinalizer()
+    callback = _SessionBoundaryHitCallback(finalizer)
     tool = DatasetMultiRetrieverTool(
         tenant_id=dataset_one.tenant_id,
         dataset_ids=[dataset_one.id, dataset_two.id],
@@ -516,9 +671,26 @@ def test_multi_dataset_retriever_run_orders_segments_and_returns_resources(sqlit
         hit_callbacks=[callback],
         top_k=2,
         score_threshold=0.1,
+        retrieval_finalizer=finalizer,
     )
-    first_doc = RagDocument(page_content="first", metadata={"doc_id": "node-2", "score": 0.4})
-    second_doc = RagDocument(page_content="second", metadata={"doc_id": "node-1", "score": 0.9})
+    first_doc = RagDocument(
+        page_content="first",
+        metadata={
+            "doc_id": "node-2",
+            "document_id": document_two.id,
+            "dataset_id": dataset_one.id,
+            "score": 0.4,
+        },
+    )
+    second_doc = RagDocument(
+        page_content="second",
+        metadata={
+            "doc_id": "node-1",
+            "document_id": document_one.id,
+            "dataset_id": dataset_two.id,
+            "score": 0.9,
+        },
+    )
 
     def fake_retriever(**kwargs):
         if kwargs["dataset_id"] == dataset_one.id:
@@ -563,10 +735,12 @@ def test_multi_dataset_retriever_run_orders_segments_and_returns_resources(sqlit
     model_instance = _UnusedModelInstance()
     rerank_runner = RerankModelRunner(model_instance, session=sqlite_session)
     fake_current_app = _FakeCurrentApp()
+    caller_commits: list[None] = []
+    event.listen(sqlite_session, "after_commit", lambda _session: caller_commits.append(None))
 
     with (
         patch.object(
-            multi_retriever_module,
+            retrieval_finalization,
             "sign_segment_content",
             lambda segment, **_kwargs: segment.content.replace("raw", "signed"),
         ),
@@ -581,9 +755,16 @@ def test_multi_dataset_retriever_run_orders_segments_and_returns_resources(sqlit
         result = tool.run(session=sqlite_session, query="hello")
 
     assert result == "signed one\nquestion:signed two answer:answer two"
+    assert finalizer.authorization_uses_format_session is True
+    assert callback.authorization_transaction_open_at_callback is False
+    assert caller_commits == []
     rerank_runner_class.assert_called_once_with(model_instance, session=sqlite_session)
     assert retriever_mock.call_count == 2
-    assert callback.documents == [second_doc, first_doc]
+    assert callback.documents is not None
+    assert [document.metadata["segment_id"] for document in callback.documents] == [
+        segment_for_node_1.id,
+        segment_for_node_2.id,
+    ]
     assert callback.resources is not None
     resource_info = callback.resources
     assert [item.position for item in resource_info] == [1, 2]

@@ -89,6 +89,41 @@ def _get_upload_files(session_maker: sessionmaker[Session]) -> list[UploadFile]:
 
 
 class TestExcelExtractor:
+    def test_storage_failure_exposes_the_fresh_excel_image_artifact(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        database_session_maker: sessionmaker[Session],
+    ) -> None:
+        sheet = _FakeSheet(
+            header_rows=[("Question", "Image")],
+            data_rows=[(_FakeCell("Q1"), _FakeCell(None))],
+            images=[_FakeImage(b"\x89PNG\r\n\x1a\nimage", row=1, col=1)],
+        )
+        monkeypatch.setattr(excel_module, "load_workbook", lambda *_args, **_kwargs: _FakeWorkbook({"Data": sheet}))
+        attempted_keys: list[str] = []
+        deleted_keys: list[str] = []
+
+        def fail_after_write(key: str, _data: bytes) -> None:
+            attempted_keys.append(key)
+            raise RuntimeError("storage response lost")
+
+        monkeypatch.setattr(excel_module.storage, "save", fail_after_write)
+        monkeypatch.setattr(excel_module.storage, "delete", deleted_keys.append)
+        apply_config_overrides(monkeypatch, FILES_URL="http://files.local", STORAGE_TYPE="local")
+        extractor = ExcelExtractor(
+            "/tmp/sample.xlsx",
+            tenant_id="tenant-1",
+            user_id="user-1",
+            source_file_id="source-file-1",
+        )
+
+        with pytest.raises(RuntimeError, match="storage response lost"):
+            extractor.extract()
+
+        assert deleted_keys == []
+        assert _get_upload_files(database_session_maker) == []
+        assert [artifact.key for artifact in extractor.created_upload_artifacts] == attempted_keys
+
     def test_extract_xlsx_with_hyperlinks_and_sheet_skip(self, monkeypatch: pytest.MonkeyPatch):
         sheet_with_data = _FakeSheet(
             header_rows=[("Name", "Link")],
@@ -194,7 +229,7 @@ class TestExcelExtractor:
         )
         assert len(saves) == 1
 
-    def test_extract_xlsx_reuses_existing_embedded_image_uploads_on_retry(
+    def test_each_excel_extraction_owns_distinct_embedded_image_uploads(
         self,
         monkeypatch: pytest.MonkeyPatch,
         database_session_maker: sessionmaker[Session],
@@ -230,18 +265,110 @@ class TestExcelExtractor:
             source_file_id="source-file-1",
         )
         first_docs = extractor.extract()
+        first_created_upload_file_ids = extractor.created_upload_file_ids
         second_docs = extractor.extract()
+        second_created_upload_file_ids = extractor.created_upload_file_ids
         upload_files = _get_upload_files(database_session_maker)
-        assert len(upload_files) == 1
+        assert len(upload_files) == 2
+        assert first_created_upload_file_ids != second_created_upload_file_ids
+        assert set(first_created_upload_file_ids + second_created_upload_file_ids) == {
+            upload.id for upload in upload_files
+        }
+        assert first_docs[0].page_content != second_docs[0].page_content
+        assert len(saves) == 2
+        assert saves[0][0] != saves[1][0]
 
-        expected_page_content = (
-            '"Question":"Q1";"Answer":"A1";'
-            f'"Image":"![image](http://files.local/files/{upload_files[0].id}/file-preview)"'
+    def test_failed_excel_extraction_exposes_exact_artifact_without_deleting_evidence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        database_session_maker: sessionmaker[Session],
+    ):
+        class FailingSheet(_FakeSheet):
+            def iter_rows(self, min_row=1, max_row=None, max_col=None, values_only=False):
+                if values_only:
+                    yield from super().iter_rows(
+                        min_row=min_row, max_row=max_row, max_col=max_col, values_only=values_only
+                    )
+                    return
+                raise RuntimeError("row extraction failed")
+
+        image_bytes = b"\x89PNG\r\n\x1a\nfailing-row-image"
+        workbooks = [
+            _FakeWorkbook(
+                {
+                    "Data": _FakeSheet(
+                        header_rows=[("Question", "Image")],
+                        data_rows=[(_FakeCell("Q1"), _FakeCell(None))],
+                        images=[_FakeImage(image_bytes, row=1, col=1)],
+                    )
+                }
+            ),
+            _FakeWorkbook(
+                {
+                    "Data": FailingSheet(
+                        header_rows=[("Question", "Image")],
+                        data_rows=[],
+                        images=[_FakeImage(image_bytes, row=1, col=1)],
+                    )
+                }
+            ),
+        ]
+        monkeypatch.setattr(excel_module, "load_workbook", lambda *args, **kwargs: workbooks.pop(0))
+        saves = _patch_image_persistence(monkeypatch)
+        deleted_keys: list[str] = []
+        monkeypatch.setattr(excel_module.storage, "delete", deleted_keys.append)
+
+        extractor = ExcelExtractor(
+            "/tmp/sample.xlsx",
+            tenant_id="tenant-1",
+            user_id="user-1",
+            source_file_id="source-file-1",
+        )
+        extractor.extract()
+        successful_upload = _get_upload_files(database_session_maker)[0]
+
+        with pytest.raises(RuntimeError, match="row extraction failed"):
+            extractor.extract()
+
+        assert len(saves) == 2
+        assert saves[0][0] != saves[1][0]
+        assert deleted_keys == []
+        assert [artifact.key for artifact in extractor.created_upload_artifacts] == [saves[1][0]]
+        remaining_uploads = _get_upload_files(database_session_maker)
+        assert {upload.id for upload in remaining_uploads} == {
+            successful_upload.id,
+            extractor.created_upload_artifacts[0].id,
+        }
+        assert {upload.key for upload in remaining_uploads} == {saves[0][0], saves[1][0]}
+
+    def test_excel_text_only_extraction_skips_embedded_image_persistence(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        database_session_maker: sessionmaker[Session],
+    ):
+        sheet = _FakeSheet(
+            header_rows=[("Question", "Image")],
+            data_rows=[(_FakeCell("Q1"), _FakeCell(None))],
+            images=[_FakeImage(b"\x89PNG\r\n\x1a\npreview-image", row=1, col=1)],
+        )
+        workbook = _FakeWorkbook({"Data": sheet})
+        monkeypatch.setattr(excel_module, "load_workbook", lambda *args, **kwargs: workbook)
+        saves = _patch_image_persistence(monkeypatch)
+
+        extractor = ExcelExtractor(
+            "/tmp/sample.xlsx",
+            tenant_id="tenant-1",
+            user_id="user-1",
+            source_file_id="source-file-1",
+            persist_images=False,
         )
 
-        assert first_docs[0].page_content == expected_page_content
-        assert second_docs[0].page_content == expected_page_content
-        assert len(saves) == 1
+        documents = extractor.extract()
+
+        assert documents[0].page_content == '"Question":"Q1";"Image":""'
+        assert saves == []
+        assert _get_upload_files(database_session_maker) == []
+        assert extractor.created_upload_file_ids == ()
 
     def test_extract_xls_path(self, monkeypatch: pytest.MonkeyPatch):
         class FakeExcelFile:

@@ -2,13 +2,14 @@ import base64
 import logging
 import time
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any, override
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from configs import dify_config
+from core.app.file_access import DatabaseFileAccessController
 from core.model_manager import ModelManager
 from core.rag.datasource.vdb.vector_backend_registry import get_vector_factory_class
 from core.rag.datasource.vdb.vector_base import BaseVector, VectorIndexStructDict
@@ -25,6 +26,7 @@ from models.dataset import Dataset, Whitelist
 from models.model import UploadFile
 
 logger = logging.getLogger(__name__)
+_file_access_controller = DatabaseFileAccessController()
 
 
 class AbstractVectorFactory(ABC):
@@ -217,9 +219,24 @@ class Vector:
             logger.info("Embedding %s texts took %s s", len(texts), time.time() - start)
 
     def create_multimodal(
-        self, file_documents: list | None = None, *, upload_files: Mapping[str, UploadFile] | None = None, **kwargs
+        self,
+        file_documents: list | None = None,
+        *,
+        upload_files: Mapping[str, UploadFile] | None = None,
+        before_write: Callable[[tuple[str, ...]], None] | None = None,
+        after_write: Callable[[tuple[str, ...]], None] | None = None,
+        **kwargs,
     ):
         if file_documents:
+            deduplicated_documents: list[Document] = []
+            seen_attachment_ids: set[str] = set()
+            for document in file_documents:
+                attachment_id = str(document.metadata["doc_id"])
+                if attachment_id in seen_attachment_ids:
+                    continue
+                seen_attachment_ids.add(attachment_id)
+                deduplicated_documents.append(document)
+            file_documents = deduplicated_documents
             start = time.time()
             logger.info("start embedding %s files %s", len(file_documents), start)
             batch_size = 1000
@@ -230,7 +247,7 @@ class Vector:
                 logger.info("Processing batch %s/%s (%s files)", i // batch_size + 1, total_batches, len(batch))
 
                 # Batch query all upload files to avoid N+1 queries
-                attachment_ids = [doc.metadata["doc_id"] for doc in batch]
+                attachment_ids = [str(doc.metadata["doc_id"]) for doc in batch]
                 upload_file_map: Mapping[str, UploadFile]
                 if upload_files is None:
                     if self._session is None:
@@ -245,7 +262,7 @@ class Vector:
                 file_base64_list = []
                 real_batch = []
                 for document in batch:
-                    attachment_id = document.metadata["doc_id"]
+                    attachment_id = str(document.metadata["doc_id"])
                     doc_type = document.metadata["doc_type"]
                     upload_file = upload_file_map.get(attachment_id)
                     if upload_file:
@@ -259,14 +276,47 @@ class Vector:
                             }
                         )
                         real_batch.append(document)
+                if not real_batch:
+                    continue
                 batch_embeddings = self._embeddings.embed_multimodal_documents(file_base64_list)
                 logger.info(
                     "Embedding batch %s/%s took %s s", i // batch_size + 1, total_batches, time.time() - batch_start
                 )
-                self._vector_processor.create(texts=real_batch, embeddings=batch_embeddings, **kwargs)
+                real_attachment_ids = tuple(str(document.metadata["doc_id"]) for document in real_batch)
+                # Attachment vectors are physically shared by every current
+                # binding in the dataset. Persist the physical attachment ID
+                # as their canonical document identity instead of leaking the
+                # logical document that happened to publish the vector first.
+                backend_batch = [
+                    document.model_copy(
+                        update={
+                            "metadata": {
+                                **document.metadata,
+                                "document_id": str(document.metadata["doc_id"]),
+                            }
+                        }
+                    )
+                    for document in real_batch
+                ]
+                if before_write is not None:
+                    before_write(real_attachment_ids)
+                self._vector_processor.create(texts=backend_batch, embeddings=batch_embeddings, **kwargs)
+                if after_write is not None:
+                    after_write(real_attachment_ids)
             logger.info("Embedding %s files took %s s", len(file_documents), time.time() - start)
 
-    def add_texts(self, documents: list[Document], **kwargs):
+    def add_texts(
+        self,
+        documents: list[Document],
+        *,
+        before_write: Callable[[], None] | None = None,
+        **kwargs,
+    ):
+        """Embed documents, then signal immediately before the processor write.
+
+        ``before_write`` is orchestration metadata and is never forwarded to
+        the vector backend.
+        """
         documents = self._filter_empty_text_documents(documents)
         if not documents:
             return
@@ -277,6 +327,8 @@ class Vector:
                 return
 
         embeddings = self._embeddings.embed_documents([document.page_content for document in documents])
+        if before_write is not None:
+            before_write()
         self._vector_processor.create(texts=documents, embeddings=embeddings, **kwargs)
 
     def text_exists(self, id: str) -> bool:
@@ -284,6 +336,10 @@ class Vector:
 
     def delete_by_ids(self, ids: list[str]):
         self._vector_processor.delete_by_ids(ids)
+
+    def get_routing_target(self) -> tuple[str, str]:
+        """Return the non-secret backend and collection selected by the factory."""
+        return str(self._vector_processor.get_type()), str(self._vector_processor.collection_name)
 
     def delete_by_metadata_field(self, key: str, value: str):
         self._vector_processor.delete_by_metadata_field(key, value)
@@ -299,10 +355,13 @@ class Vector:
     def search_by_file(self, file_id: str, **kwargs: Any) -> list[Document]:
         if self._session is None:
             raise ValueError("File search requires a database session")
-        upload_file: UploadFile | None = self._session.get(UploadFile, file_id)
-
-        if not upload_file:
-            return []
+        stmt = select(UploadFile).where(
+            UploadFile.id == file_id,
+            UploadFile.tenant_id == self._dataset.tenant_id,
+        )
+        upload_file = self._session.scalar(_file_access_controller.apply_upload_file_filters(stmt))
+        if upload_file is None:
+            raise ValueError("Attachment file is not accessible")
         blob = storage.load_once(upload_file.key)
         file_base64_str = base64.b64encode(blob).decode()
         multimodal_vector = self._embeddings.embed_multimodal_query(

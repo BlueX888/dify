@@ -7,7 +7,9 @@ external boundaries.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -15,10 +17,11 @@ import pytest
 from sqlalchemy import event, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import tasks.dataset_indexing_outbox_task as dataset_indexing_task_module
 from core.errors.error import LLMBadRequestError, ProviderTokenNotInitError
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
 from graphon.model_runtime.entities.model_entities import ModelFeature, ModelType
-from models import Account
+from models import Account, Workflow
 from models.dataset import (
     Dataset,
     DatasetCollectionBinding,
@@ -28,6 +31,11 @@ from models.dataset import (
     ExternalKnowledgeBindings,
     Pipeline,
 )
+from models.enums import DatasetRuntimeMode
+from models.model import DatasetIndexingOutbox
+from models.workflow import WorkflowType
+from repositories.knowledge.dataset_indexing_outbox_repository import SQLAlchemyDatasetIndexingOutboxRepository
+from repositories.knowledge.external_repository import SQLAlchemyExternalKnowledgeRepository
 from services.enterprise import rbac_service
 from services.entities.knowledge_entities.rag_pipeline_entities import (
     IconInfo,
@@ -35,8 +43,16 @@ from services.entities.knowledge_entities.rag_pipeline_entities import (
 )
 from services.errors.base import NoPermissionError
 from services.errors.dataset import DatasetNameDuplicateError
-from services.knowledge.dataset_service import DatasetCollectionBindingService, DatasetPermissionService, DatasetService
-from tests.unit_tests.model_factories import make_account, make_dataset, make_tenant
+from services.knowledge import dataset_service as dataset_service_module
+from services.knowledge.dataset_service import (
+    DatasetCollectionBindingService,
+    DatasetPermissionService,
+    DatasetService,
+    ExternalKnowledgeTemplateLookup,
+)
+from services.knowledge.entities.datasets import DatasetIndexingRepresentation
+from services.rag_pipeline.rag_pipeline_dsl_service import RagPipelineDslService
+from tests.unit_tests.model_factories import make_account, make_dataset, make_tenant, make_workflow
 
 from .dataset_service_test_helpers import (
     MagicMock,
@@ -44,6 +60,26 @@ from .dataset_service_test_helpers import (
     _make_knowledge_configuration,
     _make_retrieval_model,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _EmbeddingModelStub:
+    provider: str
+    model_name: str
+
+
+class _ModelManagerStub:
+    def get_model_instance(
+        self,
+        *,
+        tenant_id: str,
+        provider: str,
+        model_type: object,
+        model: str,
+    ) -> _EmbeddingModelStub:
+        del model_type
+        assert tenant_id == "tenant-1"
+        return _EmbeddingModelStub(provider=provider, model_name=model)
 
 
 def _account(
@@ -88,6 +124,86 @@ def _dataset(
     )
 
 
+def _configuration_representation(
+    *,
+    provider: str,
+    model: str,
+    binding_id: str,
+) -> DatasetIndexingRepresentation:
+    return DatasetIndexingRepresentation(
+        indexing_technique="high_quality",
+        index_struct=None,
+        collection_binding_id=binding_id,
+        embedding_model=model,
+        embedding_model_provider=provider,
+        keyword_number=None,
+        is_multimodal=False,
+        doc_form="text_model",
+        summary_index_setting=None,
+    )
+
+
+def _seed_configuration_a(session: Session) -> Dataset:
+    binding_a = DatasetCollectionBinding(
+        provider_name="provider-a",
+        model_name="model-a",
+        type="dataset",
+        collection_name="collection-a",
+    )
+    binding_a.id = "binding-a"
+    binding_b = DatasetCollectionBinding(
+        provider_name="provider-b",
+        model_name="model-b",
+        type="dataset",
+        collection_name="collection-b",
+    )
+    binding_b.id = "binding-b"
+    dataset = _dataset(indexing_technique=IndexTechniqueType.HIGH_QUALITY)
+    dataset.embedding_model_provider = "provider-a"
+    dataset.embedding_model = "model-a"
+    dataset.collection_binding_id = binding_a.id
+    dataset.indexing_applied_representation = _configuration_representation(
+        provider="provider-a",
+        model="model-a",
+        binding_id=binding_a.id,
+    ).model_dump_json()
+    session.add_all([binding_a, binding_b, dataset])
+    session.commit()
+    return dataset
+
+
+def _commit_configuration_b(session_factory: sessionmaker[Session], *, account: Account) -> str:
+    with session_factory() as writer:
+        dataset = writer.get_one(Dataset, "dataset-1")
+        (intent_id,) = DatasetService.update_rag_pipeline_dataset_settings(
+            dataset,
+            _make_knowledge_configuration(
+                chunk_structure="text_model",
+                indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+                embedding_model_provider="provider-b",
+                embedding_model="model-b",
+            ),
+            has_published=True,
+            session=writer,
+            account=account,
+        )
+        writer.commit()
+        return intent_id
+
+
+def _assert_only_current_generation_claims(
+    session_factory: sessionmaker[Session],
+    *,
+    stale_intent_id: str,
+    current_intent_id: str,
+) -> None:
+    repository = SQLAlchemyDatasetIndexingOutboxRepository(session_factory=session_factory)
+    assert repository.claim(stale_intent_id) is None
+    current = repository.claim(current_intent_id)
+    assert current is not None
+    assert repository.release(current)
+
+
 def _external_api(*, api_id: str = "api-1", tenant_id: str = "tenant-1") -> ExternalKnowledgeApis:
     api = ExternalKnowledgeApis(
         name="External API",
@@ -118,6 +234,85 @@ def _binding(
     )
     binding.id = binding_id
     return binding
+
+
+def _knowledge_index_graph(*, embedding_model: str, embedding_model_provider: str) -> str:
+    return json.dumps(
+        {
+            "nodes": [
+                {
+                    "id": "knowledge-index-node",
+                    "data": {
+                        "type": "knowledge-index",
+                        "embedding_model": embedding_model,
+                        "embedding_model_provider": embedding_model_provider,
+                    },
+                }
+            ],
+            "edges": [],
+        }
+    )
+
+
+def _persist_pipeline_dataset(session: Session) -> tuple[Dataset, Pipeline, Workflow, Workflow, str]:
+    pipeline = Pipeline(
+        tenant_id="tenant-1",
+        name="Pipeline",
+        description="",
+        created_by="user-1",
+    )
+    pipeline.id = "pipeline-1"
+    original_graph = _knowledge_index_graph(
+        embedding_model="embedding-model",
+        embedding_model_provider="provider",
+    )
+    published = make_workflow(
+        workflow_id="published-workflow",
+        tenant_id=pipeline.tenant_id,
+        app_id=pipeline.id,
+        workflow_type=WorkflowType.RAG_PIPELINE,
+        version="published-v1",
+        graph=original_graph,
+        created_by="user-1",
+    )
+    draft = make_workflow(
+        workflow_id="draft-workflow",
+        tenant_id=pipeline.tenant_id,
+        app_id=pipeline.id,
+        workflow_type=WorkflowType.RAG_PIPELINE,
+        graph=original_graph,
+        created_by="user-1",
+    )
+    pipeline.workflow_id = published.id
+    dataset = _dataset(indexing_technique=IndexTechniqueType.HIGH_QUALITY)
+    dataset.runtime_mode = DatasetRuntimeMode.RAG_PIPELINE
+    dataset.pipeline_id = pipeline.id
+    session.add_all([pipeline, dataset, published, draft])
+    session.commit()
+    return dataset, pipeline, published, draft, original_graph
+
+
+@pytest.fixture
+def external_templates(sqlite_session_factory: sessionmaker[Session]) -> ExternalKnowledgeTemplateLookup:
+    return SQLAlchemyExternalKnowledgeRepository(session_factory=sqlite_session_factory)
+
+
+@pytest.fixture
+def configuration_model_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    def manager_for_tenant(*, tenant_id: str) -> _ModelManagerStub:
+        assert tenant_id == "tenant-1"
+        return _ModelManagerStub()
+
+    monkeypatch.setattr(
+        dataset_service_module.ModelManager,
+        "for_tenant",
+        staticmethod(manager_for_tenant),
+    )
+    monkeypatch.setattr(
+        DatasetService,
+        "check_is_multimodal_model",
+        staticmethod(lambda _tenant_id, _provider, _model: False),
+    )
 
 
 class TestDatasetServiceValidation:
@@ -393,7 +588,24 @@ class TestDatasetServiceRetrieval:
 
 
 class TestDatasetServiceCreationAndUpdate:
-    def test_create_empty_dataset_rejects_duplicate_name(self, sqlite_session: Session) -> None:
+    def test_external_template_lookup_reads_pending_row_in_current_transaction(
+        self, sqlite_session: Session, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
+        template = _external_api()
+        sqlite_session.add(template)
+        transaction_events: list[str] = []
+        event.listen(sqlite_session, "after_commit", lambda _session: transaction_events.append("commit"))
+        event.listen(sqlite_session, "after_rollback", lambda _session: transaction_events.append("rollback"))
+
+        external_templates.require_template(template.tenant_id, template.id, session=sqlite_session)
+
+        assert sqlite_session.get(ExternalKnowledgeApis, template.id) is template
+        assert sqlite_session.in_transaction()
+        assert transaction_events == []
+
+    def test_create_empty_dataset_rejects_duplicate_name(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
         sqlite_session.add(_dataset(name="Existing"))
         sqlite_session.commit()
 
@@ -405,12 +617,15 @@ class TestDatasetServiceCreationAndUpdate:
                 IndexTechniqueType.ECONOMY,
                 _account(),
                 session=sqlite_session,
+                external_templates=external_templates,
             )
 
     def test_create_empty_dataset_persists_default_embedding_and_creator_scope(
         self,
         sqlite_session: Session,
         sqlite_session_factory: sessionmaker[Session],
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
     ) -> None:
         embedding_model = SimpleNamespace(provider="provider", model_name="default-embedding")
 
@@ -428,6 +643,7 @@ class TestDatasetServiceCreationAndUpdate:
                 IndexTechniqueType.HIGH_QUALITY,
                 _account(),
                 session=sqlite_session,
+                external_templates=external_templates,
             )
 
         with sqlite_session_factory() as observer:
@@ -437,7 +653,9 @@ class TestDatasetServiceCreationAndUpdate:
             assert persisted.maintainer == "user-1"
             assert persisted.embedding_model == "default-embedding"
 
-    def test_create_empty_external_dataset_persists_tenant_owned_binding(self, sqlite_session: Session) -> None:
+    def test_create_empty_external_dataset_persists_tenant_owned_binding(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
         sqlite_session.add_all([_external_api(), _external_api(api_id="api-foreign", tenant_id="tenant-2")])
         sqlite_session.commit()
 
@@ -455,6 +673,7 @@ class TestDatasetServiceCreationAndUpdate:
                 external_knowledge_id="knowledge-1",
                 retrieval_model=_make_retrieval_model(),
                 session=sqlite_session,
+                external_templates=external_templates,
             )
 
         binding = sqlite_session.scalar(
@@ -464,7 +683,9 @@ class TestDatasetServiceCreationAndUpdate:
         assert binding.tenant_id == dataset.tenant_id
         assert binding.external_knowledge_api_id == "api-1"
 
-    def test_create_empty_external_dataset_rejects_foreign_api(self, sqlite_session: Session) -> None:
+    def test_create_empty_external_dataset_rejects_foreign_api(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
         sqlite_session.add(_external_api(api_id="api-foreign", tenant_id="tenant-2"))
         sqlite_session.commit()
 
@@ -484,6 +705,7 @@ class TestDatasetServiceCreationAndUpdate:
                 external_knowledge_api_id="api-foreign",
                 external_knowledge_id="knowledge-1",
                 session=sqlite_session,
+                external_templates=external_templates,
             )
 
     def test_create_empty_rag_pipeline_dataset_generates_incremental_name(self, sqlite_session: Session) -> None:
@@ -536,55 +758,282 @@ class TestDatasetServiceCreationAndUpdate:
         ):
             DatasetService.create_empty_rag_pipeline_dataset("tenant-1", entity, sqlite_session)
 
-    def test_update_dataset_rejects_missing_and_duplicate_rows(self, sqlite_session: Session) -> None:
+    def test_update_dataset_rejects_missing_and_duplicate_rows(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
         current = _dataset(name="Current")
         duplicate = _dataset(dataset_id="dataset-2", name="Duplicate")
         sqlite_session.add_all([current, duplicate])
         sqlite_session.commit()
 
         with pytest.raises(ValueError, match="Dataset not found"):
-            DatasetService.update_dataset("missing", {}, _account(), session=sqlite_session)
+            with DatasetService.update_dataset(
+                "missing", {}, _account(), session=sqlite_session, external_templates=external_templates
+            ):
+                pytest.fail("Missing dataset must be rejected")
         with pytest.raises(ValueError, match="Dataset name already exists"):
-            DatasetService.update_dataset(current.id, {"name": duplicate.name}, _account(), session=sqlite_session)
+            with DatasetService.update_dataset(
+                current.id,
+                {"name": duplicate.name},
+                _account(),
+                session=sqlite_session,
+                external_templates=external_templates,
+            ):
+                pytest.fail("Duplicate dataset name must be rejected")
+        with pytest.raises(NoPermissionError):
+            with DatasetService.update_dataset(
+                current.id,
+                {},
+                _account(tenant_id="tenant-2"),
+                session=sqlite_session,
+                external_templates=external_templates,
+            ):
+                pytest.fail("Foreign dataset must be rejected without refreshing its configuration")
 
     @pytest.mark.parametrize(
         ("provider", "helper_name"),
         [("external", "_update_external_dataset"), ("vendor", "_update_internal_dataset")],
     )
-    def test_update_dataset_routes_by_provider(self, sqlite_session: Session, provider: str, helper_name: str) -> None:
+    def test_update_dataset_routes_by_provider(
+        self,
+        sqlite_session: Session,
+        provider: str,
+        helper_name: str,
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
+    ) -> None:
         dataset = _dataset(provider=provider)
         sqlite_session.add(dataset)
         sqlite_session.commit()
 
         with (
             patch.object(DatasetService, "check_dataset_permission"),
-            patch.object(DatasetService, helper_name, return_value=dataset) as update_helper,
+            patch.object(
+                DatasetService, helper_name, return_value=dataset if provider == "external" else (dataset, None)
+            ) as update_helper,
         ):
-            result = DatasetService.update_dataset(
+            with DatasetService.update_dataset(
                 dataset.id,
                 {"name": dataset.name},
                 _account(),
                 session=sqlite_session,
-            )
-
-        assert result is dataset
+                external_templates=external_templates,
+            ) as result:
+                assert result is dataset
         update_helper.assert_called_once()
+
+    def test_pipeline_dataset_update_rolls_back_workflow_changes_when_response_building_fails(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
+    ) -> None:
+        dataset, pipeline, published, draft, original_graph = _persist_pipeline_dataset(sqlite_session)
+
+        with (
+            patch.object(DatasetService, "_handle_indexing_technique_change", return_value="update"),
+            patch("services.knowledge.dataset_service.enqueue_dataset_indexing_intent") as enqueue_intent,
+            pytest.raises(RuntimeError, match="response materialization failed"),
+        ):
+            with DatasetService.update_dataset(
+                dataset.id,
+                {
+                    "name": "Updated Dataset",
+                    "indexing_technique": IndexTechniqueType.HIGH_QUALITY,
+                    "embedding_model": "new-embedding-model",
+                    "embedding_model_provider": "new-provider",
+                },
+                _account(),
+                session=sqlite_session,
+                external_templates=external_templates,
+            ):
+                raise RuntimeError("response materialization failed")
+
+        enqueue_intent.assert_not_called()
+        with sqlite_session_factory() as observer:
+            persisted_dataset = observer.get(Dataset, dataset.id)
+            assert persisted_dataset is not None
+            assert persisted_dataset.name == "Dataset"
+            assert persisted_dataset.embedding_model == "embedding-model"
+            assert persisted_dataset.embedding_model_provider == "provider"
+            assert observer.scalar(select(DatasetIndexingOutbox.id).limit(1)) is None
+            workflows = observer.scalars(select(Workflow).where(Workflow.app_id == pipeline.id)).all()
+            assert {workflow.id for workflow in workflows} == {published.id, draft.id}
+            assert all(workflow.graph == original_graph for workflow in workflows)
+
+    def test_pipeline_dataset_update_dispatches_after_dataset_and_workflows_commit(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
+    ) -> None:
+        dataset, pipeline, published, draft, original_graph = _persist_pipeline_dataset(sqlite_session)
+        observed_committed_state: list[str] = []
+
+        def observe_committed_state(intent_id: str) -> None:
+            with sqlite_session_factory() as observer:
+                intent = observer.get(DatasetIndexingOutbox, intent_id)
+                assert intent is not None
+                persisted_dataset = observer.get(Dataset, dataset.id)
+                assert persisted_dataset is not None
+                assert persisted_dataset.name == "Updated Dataset"
+                assert persisted_dataset.embedding_model == "new-embedding-model"
+                assert persisted_dataset.embedding_model_provider == "new-provider"
+
+                workflows = observer.scalars(select(Workflow).where(Workflow.app_id == pipeline.id)).all()
+                assert len(workflows) == 3
+                persisted_published = next(workflow for workflow in workflows if workflow.id == published.id)
+                persisted_draft = next(workflow for workflow in workflows if workflow.id == draft.id)
+                new_versions = [workflow for workflow in workflows if workflow.id not in {published.id, draft.id}]
+                assert persisted_published.graph == original_graph
+                assert len(new_versions) == 1
+                for workflow in [persisted_draft, new_versions[0]]:
+                    node_data = json.loads(workflow.graph)["nodes"][0]["data"]
+                    assert node_data["embedding_model"] == "new-embedding-model"
+                    assert node_data["embedding_model_provider"] == "new-provider"
+                assert persisted_dataset.indexing_request_id == intent.generation_id
+                observed_committed_state.append(intent.operation)
+
+        with (
+            patch.object(DatasetService, "_handle_indexing_technique_change", return_value="update"),
+            patch(
+                "services.knowledge.dataset_service.enqueue_dataset_indexing_intent",
+                side_effect=observe_committed_state,
+            ) as enqueue_intent,
+        ):
+            with DatasetService.update_dataset(
+                dataset.id,
+                {
+                    "name": "Updated Dataset",
+                    "indexing_technique": IndexTechniqueType.HIGH_QUALITY,
+                    "embedding_model": "new-embedding-model",
+                    "embedding_model_provider": "new-provider",
+                },
+                _account(),
+                session=sqlite_session,
+                external_templates=external_templates,
+            ):
+                pass
+
+        assert observed_committed_state == ["rebuild"]
+        assert enqueue_intent.call_count == 1
+
+    def test_update_external_dataset_metadata_only_preserves_binding_without_template_validation(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
+        dataset = _dataset(provider="external")
+        binding = _binding()
+        sqlite_session.add_all([dataset, binding])
+        sqlite_session.commit()
+
+        with DatasetService.update_dataset(
+            dataset.id,
+            {"name": "Renamed", "description": "Changed"},
+            _account(),
+            session=sqlite_session,
+            external_templates=external_templates,
+        ) as updated:
+            assert updated is dataset
+        assert dataset.name == "Renamed"
+        assert dataset.description == "Changed"
+        assert binding.external_knowledge_id == "knowledge-1"
+        assert binding.external_knowledge_api_id == "api-1"
+
+    @pytest.mark.parametrize(
+        ("payload", "expected_knowledge_id", "expected_api_id"),
+        [
+            ({"external_knowledge_id": "knowledge-2"}, "knowledge-2", "api-1"),
+            ({"external_knowledge_api_id": "api-2"}, "knowledge-1", "api-2"),
+        ],
+    )
+    def test_update_external_dataset_merges_single_binding_field_with_existing_binding(
+        self,
+        sqlite_session: Session,
+        payload: dict[str, str],
+        expected_knowledge_id: str,
+        expected_api_id: str,
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
+    ) -> None:
+        dataset = _dataset(provider="external")
+        binding = _binding()
+        sqlite_session.add_all([dataset, binding, _external_api(), _external_api(api_id="api-2")])
+        sqlite_session.commit()
+
+        with DatasetService.update_dataset(
+            dataset.id,
+            payload,
+            _account(),
+            session=sqlite_session,
+            external_templates=external_templates,
+        ):
+            pass
+
+        assert binding.external_knowledge_id == expected_knowledge_id
+        assert binding.external_knowledge_api_id == expected_api_id
 
     @pytest.mark.parametrize(
         ("payload", "message"),
         [
-            ({"external_knowledge_api_id": "api-1"}, "External knowledge id is required"),
-            ({"external_knowledge_id": "knowledge-1"}, "External knowledge api id is required"),
+            ({"external_knowledge_id": None}, "External knowledge id is required"),
+            ({"external_knowledge_id": ""}, "External knowledge id is required"),
+            ({"external_knowledge_api_id": None}, "External knowledge api id is required"),
+            ({"external_knowledge_api_id": ""}, "External knowledge api id is required"),
         ],
     )
-    def test_update_external_dataset_requires_binding_fields(
-        self, unbound_session: Session, payload: dict[str, str], message: str
+    def test_update_external_dataset_rejects_explicit_binding_clear(
+        self,
+        sqlite_session: Session,
+        payload: dict[str, str | None],
+        message: str,
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
     ) -> None:
+        dataset = _dataset(provider="external")
+        binding = _binding()
+        sqlite_session.add_all([dataset, binding, _external_api()])
+        sqlite_session.commit()
+
         with pytest.raises(ValueError, match=message):
-            DatasetService._update_external_dataset(_dataset(provider="external"), payload, _account(), unbound_session)
+            with DatasetService.update_dataset(
+                dataset.id,
+                payload,
+                _account(),
+                session=sqlite_session,
+                external_templates=external_templates,
+            ):
+                pytest.fail("Cleared external binding must be rejected")
+
+        assert binding.external_knowledge_id == "knowledge-1"
+        assert binding.external_knowledge_api_id == "api-1"
+
+    def test_update_external_dataset_unchanged_binding_does_not_revalidate_template(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
+        dataset = _dataset(provider="external")
+        binding = _binding()
+        sqlite_session.add_all([dataset, binding])
+        sqlite_session.commit()
+
+        with DatasetService.update_dataset(
+            dataset.id,
+            {
+                "external_knowledge_id": binding.external_knowledge_id,
+                "external_knowledge_api_id": binding.external_knowledge_api_id,
+            },
+            _account(),
+            session=sqlite_session,
+            external_templates=external_templates,
+        ):
+            pass
+
+        assert binding.external_knowledge_id == "knowledge-1"
+        assert binding.external_knowledge_api_id == "api-1"
 
     def test_update_external_dataset_flushes_dataset_and_binding_without_committing(
-        self, sqlite_session: Session
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
     ) -> None:
         dataset = _dataset(provider="external")
         api = _external_api()
@@ -604,6 +1053,7 @@ class TestDatasetServiceCreationAndUpdate:
             },
             _account(),
             sqlite_session,
+            external_templates=external_templates,
         )
 
         assert updated is dataset
@@ -611,7 +1061,9 @@ class TestDatasetServiceCreationAndUpdate:
         assert binding.external_knowledge_id == "knowledge-2"
         assert transaction_events == []
 
-    def test_update_external_dataset_rejects_cross_tenant_api(self, sqlite_session: Session) -> None:
+    def test_update_external_dataset_rejects_cross_tenant_api(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
         dataset = _dataset(provider="external")
         foreign_api = _external_api(api_id="api-foreign", tenant_id="tenant-2")
         sqlite_session.add_all([dataset, foreign_api, _binding()])
@@ -626,15 +1078,33 @@ class TestDatasetServiceCreationAndUpdate:
                 },
                 _account(),
                 sqlite_session,
+                external_templates=external_templates,
             )
 
-    def test_update_external_knowledge_binding_rejects_missing_row(self, sqlite_session: Session) -> None:
+    def test_update_external_knowledge_binding_rejects_missing_row(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
         with pytest.raises(ValueError, match="binding not found"):
-            DatasetService._update_external_knowledge_binding(
-                "missing-dataset",
-                "knowledge-2",
-                "api-2",
-                sqlite_session,
+            DatasetService._patch_external_knowledge_binding(
+                _dataset(dataset_id="missing-dataset", provider="external"),
+                {"external_knowledge_id": "knowledge-2", "external_knowledge_api_id": "api-2"},
+                session=sqlite_session,
+                external_templates=external_templates,
+            )
+
+    def test_update_external_knowledge_binding_rejects_cross_tenant_binding(
+        self, sqlite_session: Session, *, external_templates: ExternalKnowledgeTemplateLookup
+    ) -> None:
+        dataset = _dataset(provider="external")
+        sqlite_session.add_all([dataset, _binding(tenant_id="tenant-2"), _external_api()])
+        sqlite_session.commit()
+
+        with pytest.raises(ValueError, match="binding not found"):
+            DatasetService._patch_external_knowledge_binding(
+                dataset,
+                {"external_knowledge_id": "knowledge-2"},
+                session=sqlite_session,
+                external_templates=external_templates,
             )
 
     def test_update_internal_dataset_executes_real_update_without_committing(self, sqlite_session: Session) -> None:
@@ -647,10 +1117,9 @@ class TestDatasetServiceCreationAndUpdate:
         with (
             patch.object(DatasetService, "_handle_indexing_technique_change", return_value="update"),
             patch.object(DatasetService, "_update_pipeline_knowledge_base_node_data"),
-            patch("services.knowledge.dataset_service.deal_dataset_vector_index_task.delay") as vector_task,
-            patch("services.knowledge.dataset_service.regenerate_summary_index_task.delay") as summary_task,
+            patch("services.knowledge.dataset_service.enqueue_dataset_indexing_intent") as enqueue_intent,
         ):
-            updated = DatasetService._update_internal_dataset(
+            updated, indexing_job = DatasetService._update_internal_dataset(
                 dataset,
                 {"name": "After", "description": "Changed"},
                 _account(),
@@ -660,8 +1129,10 @@ class TestDatasetServiceCreationAndUpdate:
         assert updated.name == "After"
         assert updated.description == "Changed"
         assert transaction_events == []
-        vector_task.assert_called_once_with(dataset.id, "update")
-        summary_task.assert_called_once()
+        enqueue_intent.assert_not_called()
+        assert indexing_job is not None
+        assert indexing_job.dataset.dataset_id == dataset.id
+        assert indexing_job.source.indexing_technique == indexing_job.target.indexing_technique
 
     def test_update_pipeline_node_data_returns_for_non_pipeline_or_missing_pipeline(
         self, sqlite_session: Session
@@ -676,7 +1147,7 @@ class TestDatasetServiceCreationAndUpdate:
         DatasetService._update_pipeline_knowledge_base_node_data(ordinary, "user-1", sqlite_session)
         DatasetService._update_pipeline_knowledge_base_node_data(missing_pipeline, "user-1", sqlite_session)
 
-    def test_update_pipeline_node_data_rolls_back_real_session_on_failure(self, sqlite_session: Session) -> None:
+    def test_update_pipeline_node_data_leaves_rollback_to_its_caller(self, sqlite_session: Session) -> None:
         pipeline = Pipeline(tenant_id="tenant-1", name="Pipeline", description="", created_by="user-1")
         pipeline.id = "pipeline-1"
         dataset = _dataset()
@@ -697,6 +1168,9 @@ class TestDatasetServiceCreationAndUpdate:
             with pytest.raises(RuntimeError, match="boom"):
                 DatasetService._update_pipeline_knowledge_base_node_data(dataset, "user-1", sqlite_session)
 
+        assert transaction_events == []
+        assert sqlite_session.in_transaction()
+        sqlite_session.rollback()
         assert transaction_events == ["rollback"]
 
 
@@ -811,7 +1285,7 @@ class TestDatasetServiceEmbeddingSettings:
         dataset = _dataset()
         filtered_data: dict[str, object] = {}
         account = _account()
-        embedding_model = SimpleNamespace(provider="new-provider", model_name="new-model")
+        embedding_model = _EmbeddingModelStub(provider="new-provider", model_name="new-model")
         collection_binding = DatasetCollectionBinding(
             provider_name="new-provider",
             model_name="new-model",
@@ -964,19 +1438,14 @@ class TestDatasetServiceRagPipelineSettings:
         assert persisted.indexing_technique == IndexTechniqueType.ECONOMY
         assert persisted.keyword_number == 17
 
-    def test_published_economy_settings_commit_keyword_change_and_dispatch_no_task(
-        self, sqlite_session: Session
-    ) -> None:
+    def test_published_economy_settings_stage_keyword_target_rebuild(self, sqlite_session: Session) -> None:
         dataset = _dataset(indexing_technique=IndexTechniqueType.ECONOMY, chunk_structure="paragraph")
         dataset.keyword_number = 4
         sqlite_session.add(dataset)
         sqlite_session.commit()
 
-        with (
-            patch("services.knowledge.dataset_service.current_user", _account()),
-            patch("services.knowledge.dataset_service.deal_dataset_index_update_task.delay") as update_task,
-        ):
-            DatasetService.update_rag_pipeline_dataset_settings(
+        with patch("services.knowledge.dataset_service.current_user", _account()):
+            intent_ids = DatasetService.update_rag_pipeline_dataset_settings(
                 dataset,
                 _make_knowledge_configuration(
                     chunk_structure="paragraph",
@@ -987,8 +1456,144 @@ class TestDatasetServiceRagPipelineSettings:
                 session=sqlite_session,
             )
 
-        assert sqlite_session.get(Dataset, dataset.id).keyword_number == 12
-        update_task.assert_not_called()
+        persisted = sqlite_session.get(Dataset, dataset.id)
+        assert persisted is not None
+        assert persisted.keyword_number == 12
+        assert len(intent_ids) == 1
+        row = sqlite_session.get_one(DatasetIndexingOutbox, intent_ids[0])
+        target = DatasetIndexingRepresentation.model_validate_json(row.target_representation)
+        assert target.indexing_technique == "economy"
+        assert target.keyword_number == 12
+
+    def test_published_embedding_change_survives_broker_failure_and_same_republish(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dataset = _dataset(indexing_technique=IndexTechniqueType.HIGH_QUALITY, chunk_structure="paragraph")
+        dataset.embedding_model_provider = "old-provider"
+        dataset.embedding_model = "old-model"
+        sqlite_session.add(dataset)
+        sqlite_session.commit()
+        embedding_model = _EmbeddingModelStub(provider="new-provider", model_name="new-model")
+        binding = DatasetCollectionBinding(
+            provider_name="new-provider",
+            model_name="new-model",
+            type="dataset",
+            collection_name="new-collection",
+        )
+        binding.id = "new-binding"
+        configuration = _make_knowledge_configuration(
+            chunk_structure="paragraph",
+            indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+            embedding_model_provider="new-provider",
+            embedding_model="new-model",
+        )
+        repository = SQLAlchemyDatasetIndexingOutboxRepository(session_factory=sqlite_session_factory)
+        monkeypatch.setattr(dataset_indexing_task_module, "_repository", lambda: repository)
+
+        with (
+            patch("services.knowledge.dataset_service.current_user", _account()),
+            patch("services.knowledge.dataset_service.ModelManager") as model_manager_cls,
+            patch.object(DatasetService, "check_is_multimodal_model", return_value=False),
+            patch.object(DatasetCollectionBindingService, "get_dataset_collection_binding", return_value=binding),
+            patch.object(
+                dataset_indexing_task_module.process_dataset_indexing_intent_task,
+                "delay",
+                side_effect=OSError("broker unavailable"),
+            ),
+        ):
+            model_manager_cls.for_tenant.return_value.get_model_instance.return_value = embedding_model
+            intent_ids = DatasetService.update_rag_pipeline_dataset_settings(
+                dataset,
+                configuration,
+                has_published=True,
+                session=sqlite_session,
+            )
+            sqlite_session.commit()
+            DatasetService.dispatch_dataset_indexing(intent_ids)
+            repeated_ids = DatasetService.update_rag_pipeline_dataset_settings(
+                dataset,
+                configuration,
+                has_published=True,
+                session=sqlite_session,
+            )
+            sqlite_session.commit()
+
+        assert len(intent_ids) == 1
+        assert repeated_ids == ()
+        with sqlite_session_factory() as observer:
+            assert observer.get(DatasetIndexingOutbox, intent_ids[0]) is not None
+
+        executed: list[str] = []
+        monkeypatch.setattr(
+            dataset_indexing_task_module.deal_dataset_vector_index_task,
+            "run",
+            lambda *_args, **_kwargs: executed.append("vector") or True,
+        )
+        monkeypatch.setattr(
+            dataset_indexing_task_module.regenerate_summary_index_task,
+            "run",
+            lambda *_args, **_kwargs: executed.append("summary") or True,
+        )
+        monkeypatch.setattr(
+            dataset_indexing_task_module.process_dataset_indexing_intent_task,
+            "delay",
+            dataset_indexing_task_module.process_dataset_indexing_intent_task.run,
+        )
+
+        dataset_indexing_task_module.drain_dataset_indexing_outbox_task.run()
+
+        assert executed == ["vector", "summary"]
+        with sqlite_session_factory() as observer:
+            assert observer.get(DatasetIndexingOutbox, intent_ids[0]) is None
+
+    def test_published_embedding_change_rolls_back_configuration_and_intent(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ) -> None:
+        dataset = _dataset(indexing_technique=IndexTechniqueType.HIGH_QUALITY, chunk_structure="paragraph")
+        dataset.embedding_model_provider = "old-provider"
+        dataset.embedding_model = "old-model"
+        sqlite_session.add(dataset)
+        sqlite_session.commit()
+        embedding_model = _EmbeddingModelStub(provider="new-provider", model_name="new-model")
+        binding = DatasetCollectionBinding(
+            provider_name="new-provider",
+            model_name="new-model",
+            type="dataset",
+            collection_name="new-collection",
+        )
+        binding.id = "new-binding"
+
+        with (
+            patch("services.knowledge.dataset_service.current_user", _account()),
+            patch("services.knowledge.dataset_service.ModelManager") as model_manager_cls,
+            patch.object(DatasetService, "check_is_multimodal_model", return_value=False),
+            patch.object(DatasetCollectionBindingService, "get_dataset_collection_binding", return_value=binding),
+        ):
+            model_manager_cls.for_tenant.return_value.get_model_instance.return_value = embedding_model
+            intent_ids = DatasetService.update_rag_pipeline_dataset_settings(
+                dataset,
+                _make_knowledge_configuration(
+                    chunk_structure="paragraph",
+                    indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+                    embedding_model_provider="new-provider",
+                    embedding_model="new-model",
+                ),
+                has_published=True,
+                session=sqlite_session,
+            )
+            assert len(intent_ids) == 1
+            sqlite_session.rollback()
+
+        with sqlite_session_factory() as observer:
+            persisted = observer.get_one(Dataset, dataset.id)
+            assert persisted.embedding_model_provider == "old-provider"
+            assert persisted.embedding_model == "old-model"
+            assert observer.scalar(select(DatasetIndexingOutbox.id)) is None
 
     @pytest.mark.parametrize(
         ("dataset", "configuration", "message"),
@@ -1028,6 +1633,242 @@ class TestDatasetServiceRagPipelineSettings:
                 has_published=True,
                 session=sqlite_session,
             )
+
+
+class TestDatasetConfigurationCurrentReads:
+    def test_patch_refreshes_stale_identity_before_model_comparison_and_target_capture(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+        configuration_model_boundary: None,
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
+    ) -> None:
+        del configuration_model_boundary
+        account = _account()
+        stale_dataset = _seed_configuration_a(sqlite_session)
+        assert stale_dataset.embedding_model == "model-a"
+        intent_b_id = _commit_configuration_b(sqlite_session_factory, account=account)
+        stale_dataset.embedding_model = "dirty-stale-model"
+        stale_dataset.embedding_model_provider = "dirty-stale-provider"
+        stale_dataset.collection_binding_id = "binding-a"
+        dispatched: list[str] = []
+        monkeypatch.setattr(dataset_service_module, "current_user", account)
+        monkeypatch.setattr(dataset_service_module, "enqueue_dataset_indexing_intent", dispatched.append)
+
+        with DatasetService.update_dataset(
+            stale_dataset.id,
+            {
+                "indexing_technique": IndexTechniqueType.HIGH_QUALITY,
+                "embedding_model_provider": "provider-a",
+                "embedding_model": "model-a",
+            },
+            account,
+            session=sqlite_session,
+            external_templates=external_templates,
+        ) as updated:
+            assert updated.embedding_model == "model-a"
+            assert updated.embedding_model_provider == "provider-a"
+            assert updated.collection_binding_id == "binding-a"
+
+        (intent_c_id,) = dispatched
+        assert intent_c_id != intent_b_id
+        with sqlite_session_factory() as observer:
+            current = observer.get_one(Dataset, stale_dataset.id)
+            assert current.embedding_model == "model-a"
+            assert current.embedding_model_provider == "provider-a"
+            assert current.collection_binding_id == "binding-a"
+            assert current.indexing_request_id is not None
+            row = observer.get_one(DatasetIndexingOutbox, intent_c_id)
+            target = DatasetIndexingRepresentation.model_validate_json(row.target_representation)
+            assert target.embedding_model == "model-a"
+            assert target.embedding_model_provider == "provider-a"
+            assert target.collection_binding_id == "binding-a"
+            assert set(observer.scalars(select(DatasetIndexingOutbox.id))) == {intent_b_id, intent_c_id}
+        _assert_only_current_generation_claims(
+            sqlite_session_factory,
+            stale_intent_id=intent_b_id,
+            current_intent_id=intent_c_id,
+        )
+
+    def test_patch_noop_uses_locked_current_fields_without_restoring_stale_model(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+        configuration_model_boundary: None,
+        *,
+        external_templates: ExternalKnowledgeTemplateLookup,
+    ) -> None:
+        del configuration_model_boundary
+        account = _account()
+        stale_dataset = _seed_configuration_a(sqlite_session)
+        assert stale_dataset.embedding_model == "model-a"
+        intent_b_id = _commit_configuration_b(sqlite_session_factory, account=account)
+        stale_dataset.embedding_model = "dirty-stale-model"
+        stale_dataset.embedding_model_provider = "dirty-stale-provider"
+        stale_dataset.collection_binding_id = "binding-a"
+        dispatched: list[str] = []
+        monkeypatch.setattr(dataset_service_module, "current_user", account)
+        monkeypatch.setattr(dataset_service_module, "enqueue_dataset_indexing_intent", dispatched.append)
+
+        with DatasetService.update_dataset(
+            stale_dataset.id,
+            {"name": "Renamed", "indexing_technique": IndexTechniqueType.HIGH_QUALITY},
+            account,
+            session=sqlite_session,
+            external_templates=external_templates,
+        ):
+            pass
+
+        assert dispatched == []
+        with sqlite_session_factory() as observer:
+            current = observer.get_one(Dataset, stale_dataset.id)
+            assert current.name == "Renamed"
+            assert current.embedding_model == "model-b"
+            assert current.embedding_model_provider == "provider-b"
+            assert current.collection_binding_id == "binding-b"
+            assert current.indexing_request_id == observer.get_one(DatasetIndexingOutbox, intent_b_id).generation_id
+            assert observer.scalars(select(DatasetIndexingOutbox.id)).all() == [intent_b_id]
+
+    @pytest.mark.parametrize("entry", ["rag", "dsl"])
+    @pytest.mark.parametrize("desired", ["a", "b"])
+    def test_rag_and_dsl_settings_refresh_stale_identity_before_comparison(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        monkeypatch: pytest.MonkeyPatch,
+        configuration_model_boundary: None,
+        entry: str,
+        desired: str,
+    ) -> None:
+        del configuration_model_boundary
+        account = _account()
+        monkeypatch.setattr(dataset_service_module, "current_user", _account(tenant_id="tenant-2"))
+        stale_dataset = _seed_configuration_a(sqlite_session)
+        assert stale_dataset.embedding_model == "model-a"
+        intent_b_id = _commit_configuration_b(sqlite_session_factory, account=account)
+        configuration = _make_knowledge_configuration(
+            chunk_structure="text_model",
+            indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+            embedding_model_provider=f"provider-{desired}",
+            embedding_model=f"model-{desired}",
+        )
+        if desired == "b":
+            stale_dataset.embedding_model = "dirty-stale-model"
+            stale_dataset.embedding_model_provider = "dirty-stale-provider"
+            stale_dataset.collection_binding_id = "binding-a"
+
+        if entry == "rag":
+            intent_ids = DatasetService.update_rag_pipeline_dataset_settings(
+                stale_dataset,
+                configuration,
+                has_published=True,
+                session=sqlite_session,
+                account=account,
+            )
+        else:
+            dsl_service = RagPipelineDslService(sqlite_session)
+            dsl_service._apply_dataset_configuration(
+                dataset=stale_dataset,
+                knowledge_configuration=configuration,
+                account=account,
+                has_published=True,
+            )
+            intent_ids = dsl_service.pending_dataset_indexing_intent_ids
+        sqlite_session.commit()
+
+        intent_c_id: str | None = None
+        with sqlite_session_factory() as observer:
+            current = observer.get_one(Dataset, stale_dataset.id)
+            if desired == "b":
+                assert intent_ids == ()
+                assert current.embedding_model == "model-b"
+                assert current.embedding_model_provider == "provider-b"
+                assert current.collection_binding_id == "binding-b"
+                assert observer.scalars(select(DatasetIndexingOutbox.id)).all() == [intent_b_id]
+            else:
+                (intent_c_id,) = intent_ids
+                assert intent_c_id != intent_b_id
+                assert current.embedding_model == "model-a"
+                assert current.embedding_model_provider == "provider-a"
+                assert current.collection_binding_id == "binding-a"
+                row = observer.get_one(DatasetIndexingOutbox, intent_c_id)
+                target = DatasetIndexingRepresentation.model_validate_json(row.target_representation)
+                assert target.embedding_model == "model-a"
+                assert target.embedding_model_provider == "provider-a"
+                assert target.collection_binding_id == "binding-a"
+                assert set(observer.scalars(select(DatasetIndexingOutbox.id))) == {intent_b_id, intent_c_id}
+        if desired == "a":
+            assert intent_c_id is not None
+            _assert_only_current_generation_claims(
+                sqlite_session_factory,
+                stale_intent_id=intent_b_id,
+                current_intent_id=intent_c_id,
+            )
+
+    def test_dsl_rechecks_false_unpublished_hint_after_concurrent_generation_install(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+        configuration_model_boundary: None,
+    ) -> None:
+        del configuration_model_boundary
+        account = _account()
+        stale_dataset = _seed_configuration_a(sqlite_session)
+        stale_dataset.indexing_applied_representation = None
+        stale_dataset.indexing_request_id = None
+        sqlite_session.commit()
+        # This is the state from which the DSL caller computed
+        # ``has_published=False`` before the concurrent transaction installed B.
+        assert stale_dataset.indexing_applied_representation is None
+        assert stale_dataset.indexing_request_id is None
+
+        intent_b_id = _commit_configuration_b(sqlite_session_factory, account=account)
+        stale_dataset.embedding_model = "dirty-stale-model"
+        stale_dataset.embedding_model_provider = "dirty-stale-provider"
+
+        dsl_service = RagPipelineDslService(sqlite_session)
+        dsl_service._apply_dataset_configuration(
+            dataset=stale_dataset,
+            knowledge_configuration=_make_knowledge_configuration(
+                chunk_structure="text_model",
+                indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+                embedding_model_provider="provider-a",
+                embedding_model="model-a",
+            ),
+            account=account,
+            has_published=False,
+        )
+        (intent_c_id,) = dsl_service.pending_dataset_indexing_intent_ids
+        sqlite_session.commit()
+
+        with sqlite_session_factory() as observer:
+            current = observer.get_one(Dataset, stale_dataset.id)
+            assert current.embedding_model == "model-a"
+            assert current.embedding_model_provider == "provider-a"
+            assert current.collection_binding_id == "binding-a"
+            assert current.indexing_request_id == observer.get_one(DatasetIndexingOutbox, intent_c_id).generation_id
+            row = observer.get_one(DatasetIndexingOutbox, intent_c_id)
+            source = DatasetIndexingRepresentation.model_validate_json(row.source_representation)
+            target = DatasetIndexingRepresentation.model_validate_json(row.target_representation)
+            assert (source.embedding_model_provider, source.embedding_model, source.collection_binding_id) == (
+                "provider-a",
+                "model-a",
+                "binding-a",
+            )
+            assert (target.embedding_model_provider, target.embedding_model, target.collection_binding_id) == (
+                "provider-a",
+                "model-a",
+                "binding-a",
+            )
+            assert set(observer.scalars(select(DatasetIndexingOutbox.id))) == {intent_b_id, intent_c_id}
+        _assert_only_current_generation_claims(
+            sqlite_session_factory,
+            stale_intent_id=intent_b_id,
+            current_intent_id=intent_c_id,
+        )
 
 
 class TestDatasetPermissions:

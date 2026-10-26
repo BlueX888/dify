@@ -13,6 +13,7 @@ Primary collaborators include ``PipelineRunner``,
 
 import json
 from collections.abc import Generator
+from unittest.mock import create_autospec
 
 import pytest
 from sqlalchemy import event
@@ -25,6 +26,7 @@ from core.app.apps.pipeline.pipeline_queue_manager import PipelineQueueManager
 from core.app.apps.pipeline.pipeline_runner import PipelineRunner
 from core.app.entities.app_invoke_entities import InvokeFrom, RagPipelineGenerateEntity
 from core.app.entities.queue_entities import AppQueueEvent, QueueWorkflowFailedEvent
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.workflow_entry import WorkflowEntry
 from graphon.engine_events import EngineEvent, GraphRunFailedEvent
 from graphon.graph import Graph
@@ -145,6 +147,7 @@ def _build_runner(
         workflow=workflow,
         system_user_id="sys",
         documents=SQLAlchemyDocumentRepository(session_factory=sessionmaker(bind=sqlite_engine)),
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
     )
 
 

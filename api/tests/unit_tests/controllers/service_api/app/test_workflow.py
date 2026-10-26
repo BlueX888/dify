@@ -20,7 +20,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from inspect import unwrap
 from types import SimpleNamespace
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, create_autospec
 
 import pytest
 from flask import Flask
@@ -45,7 +45,9 @@ from controllers.service_api.app.workflow import (
     WorkflowTaskStopApi,
 )
 from controllers.web.error import InvokeRateLimitError as InvokeRateLimitHttpError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from enums import CloudPlan, DeploymentEdition
+from extensions.ext_application_services import ApplicationServices
 from graphon.enums import WorkflowExecutionStatus
 from graphon.model_runtime.errors.invoke import InvokeRateLimitError as ProviderInvokeRateLimitError
 from models import Account
@@ -64,6 +66,19 @@ from services.errors.app import (
 )
 from services.errors.llm import InvokeRateLimitError
 from services.workflow_app_log_query_service import WorkflowAppLogQueryService
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    application_services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    application_services.knowledge.external_retrieval = external_retrieval
+    monkeypatch.setattr(
+        sys.modules["controllers.service_api.app.workflow"],
+        "application_services",
+        lambda: application_services,
+    )
+    return external_retrieval
 
 
 def _default_workflow_inputs() -> dict[str, object]:
@@ -519,6 +534,7 @@ class TestWorkflowRunApi:
         monkeypatch: pytest.MonkeyPatch,
         sqlite_session: Session,
         config_overrides: Callable[..., None],
+        external_retrieval: MagicMock,
     ) -> None:
         config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.CLOUD)
         sys.modules["controllers.service_api.app.workflow"]
@@ -542,6 +558,7 @@ class TestWorkflowRunApi:
         assert response.get_json() == {"result": "ok"}
         billing_get_info.assert_not_called()
         generate.assert_called_once()
+        assert generate.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
 class TestWorkflowRunByIdApi:
@@ -630,6 +647,7 @@ class TestWorkflowRunByIdApi:
         plan: CloudPlan,
         sqlite_session: Session,
         config_overrides: Callable[..., None],
+        external_retrieval: MagicMock,
     ) -> None:
         config_overrides(DEPLOYMENT_EDITION=deployment_edition)
 
@@ -653,6 +671,7 @@ class TestWorkflowRunByIdApi:
 
         assert response.get_json() == {"result": "ok"}
         generate.assert_called_once()
+        assert generate.call_args.kwargs["external_retrieval"] is external_retrieval
         if deployment_edition == DeploymentEdition.CLOUD:
             billing_get_info.assert_called_once_with(app_model.tenant_id, exclude_vector_space=True)
         else:

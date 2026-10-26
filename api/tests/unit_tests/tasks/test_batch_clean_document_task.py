@@ -3,13 +3,14 @@ from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
 import tasks.batch_clean_document_task as task_module
 from extensions.storage.storage_type import StorageType
 from models.dataset import Dataset, DocumentSegment, SegmentAttachmentBinding
 from models.enums import CreatorUserRole, DataSourceType
-from models.model import UploadFile
+from models.model import UploadFile, UploadFileCleanupOutbox
 from tasks.batch_clean_document_task import batch_clean_document_task
 
 
@@ -52,7 +53,6 @@ def test_successful_vector_cleanup_schedules_billing_refresh(cleanup_rows: tuple
     dataset_id, document_id, tenant_id = cleanup_rows
 
     with (
-        patch("tasks.batch_clean_document_task.get_image_upload_file_ids", return_value=[]),
         patch("tasks.batch_clean_document_task.clean_document_indexes", return_value=tenant_id) as index_cleanup,
         patch("tasks.batch_clean_document_task.schedule_billing_vector_space_refresh") as schedule_refresh,
     ):
@@ -71,17 +71,17 @@ def test_failed_vector_cleanup_does_not_schedule_billing_refresh(cleanup_rows: t
     dataset_id, document_id, _tenant_id = cleanup_rows
 
     with (
-        patch("tasks.batch_clean_document_task.get_image_upload_file_ids", return_value=[]),
         patch("tasks.batch_clean_document_task.clean_document_indexes") as index_cleanup,
         patch("tasks.batch_clean_document_task.schedule_billing_vector_space_refresh") as schedule_refresh,
     ):
         index_cleanup.side_effect = RuntimeError("vector cleanup failed")
-        batch_clean_document_task(
-            document_ids=[document_id],
-            dataset_id=dataset_id,
-            doc_form="paragraph",
-            file_ids=[],
-        )
+        with pytest.raises(RuntimeError, match="vector cleanup failed"):
+            batch_clean_document_task(
+                document_ids=[document_id],
+                dataset_id=dataset_id,
+                doc_form="paragraph",
+                file_ids=[],
+            )
 
     schedule_refresh.assert_not_called()
 
@@ -116,7 +116,6 @@ def test_cleans_segment_attachment_bindings_and_files(cleanup_rows: tuple[str, s
     binding_id = binding.id
 
     with (
-        patch("tasks.batch_clean_document_task.get_image_upload_file_ids", return_value=[]),
         patch("tasks.batch_clean_document_task.clean_document_indexes"),
         patch("tasks.batch_clean_document_task.schedule_billing_vector_space_refresh"),
         patch("tasks.batch_clean_document_task.storage.delete") as storage_delete,
@@ -132,3 +131,64 @@ def test_cleans_segment_attachment_bindings_and_files(cleanup_rows: tuple[str, s
     assert sqlite_session.get(SegmentAttachmentBinding, binding_id) is None
     assert sqlite_session.get(UploadFile, attachment_id) is None
     storage_delete.assert_called_once_with(attachment_key)
+
+
+def test_segment_delete_failure_retains_binding_and_file(
+    cleanup_rows: tuple[str, str, str], sqlite_session: Session
+) -> None:
+    dataset_id, document_id, tenant_id = cleanup_rows
+    segment = sqlite_session.query(DocumentSegment).filter_by(document_id=document_id).one()
+    attachment = UploadFile(
+        tenant_id=tenant_id,
+        storage_type=StorageType.LOCAL,
+        key="attachments/retained.png",
+        name="retained.png",
+        size=10,
+        extension="png",
+        mime_type="image/png",
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by=segment.created_by,
+        created_at=datetime.now(UTC),
+        used=True,
+    )
+    binding = SegmentAttachmentBinding(
+        tenant_id=tenant_id,
+        dataset_id=dataset_id,
+        document_id=document_id,
+        segment_id=segment.id,
+        attachment_id=attachment.id,
+    )
+    sqlite_session.add_all([attachment, binding])
+    sqlite_session.commit()
+    attachment_id = attachment.id
+    binding_id = binding.id
+    segment_id = segment.id
+
+    def fail_segment_delete(_connection, _cursor, statement: str, _parameters, _context, _executemany) -> None:
+        if statement.lower().startswith("delete from document_segments"):
+            raise RuntimeError("segment delete failed")
+
+    engine = sqlite_session.get_bind()
+    event.listen(engine, "before_cursor_execute", fail_segment_delete)
+    try:
+        with (
+            patch("tasks.batch_clean_document_task.clean_document_indexes"),
+            patch("tasks.batch_clean_document_task.schedule_billing_vector_space_refresh"),
+            patch("tasks.batch_clean_document_task.storage.delete") as storage_delete,
+            pytest.raises(RuntimeError, match="segment delete failed"),
+        ):
+            batch_clean_document_task(
+                document_ids=[document_id],
+                dataset_id=dataset_id,
+                doc_form="paragraph",
+                file_ids=[],
+            )
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_segment_delete)
+
+    sqlite_session.expire_all()
+    assert sqlite_session.get(DocumentSegment, segment_id) is not None
+    assert sqlite_session.get(SegmentAttachmentBinding, binding_id) is not None
+    assert sqlite_session.get(UploadFile, attachment_id) is not None
+    assert sqlite_session.query(UploadFileCleanupOutbox).count() == 0
+    storage_delete.assert_not_called()

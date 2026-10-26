@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import MagicMock
 
 import pytest
@@ -12,13 +13,18 @@ import core.db.session_factory as session_factory_module
 from core.repositories.human_input_repository import HumanInputFormSubmissionRepository
 from core.workflow.nodes.human_input.entities import FormDefinition
 from core.workflow.nodes.human_input.enums import HumanInputFormKind, HumanInputFormStatus
+from extensions.logstore.aliyun_logstore import AliyunLogStore
+from graphon.enums import WorkflowExecutionStatus, WorkflowType
+from models.enums import CreatorUserRole, WorkflowRunTriggeredFrom
 from models.human_input import HumanInputForm
+from models.workflow import WorkflowPause, WorkflowRun
 from tasks import human_input_timeout_tasks as task_module
+from tasks.workflow_run_history_sync_task import drain_pending_workflow_run_histories
 from tests.unit_tests.config_override import apply_config_overrides
 
 
 class _FakeService:
-    def __init__(self):
+    def __init__(self) -> None:
         self.enqueued: list[str] = []
         self.agent_app_resumed: list[tuple[str, str]] = []
 
@@ -28,6 +34,14 @@ class _FakeService:
 
     def enqueue_agent_app_resume(self, *, conversation_id: str, form_id: str) -> None:
         self.agent_app_resumed.append((conversation_id, form_id))
+
+
+class _RecordingLogstore:
+    def __init__(self) -> None:
+        self.records: list[dict[str, str]] = []
+
+    def put_log(self, _name: str, fields: list[tuple[str, str]]) -> None:
+        self.records.append(dict(fields))
 
 
 def _build_form(
@@ -72,7 +86,7 @@ def sqlite_task_database(
     monkeypatch.setattr(task_module, "db", SimpleNamespace(engine=sqlite_engine))
 
 
-def test_is_global_timeout_uses_created_at():
+def test_is_global_timeout_uses_created_at() -> None:
     now = datetime(2025, 1, 1, 12, 0, 0)
     form = _build_form(
         form_id="form-1",
@@ -95,13 +109,73 @@ def test_is_global_timeout_uses_created_at():
     assert task_module._is_global_timeout(form, 0, now=now) is False
 
 
+@pytest.mark.parametrize("sqlite_session", [(WorkflowRun, WorkflowPause)], indirect=True)
+def test_global_timeout_publishes_stopped_history_from_durable_projection(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: Engine,
+    sqlite_session: Session,
+) -> None:
+    now = datetime(2025, 1, 1, 12, 0, 0)
+    monkeypatch.setattr(task_module, "naive_utc_now", lambda: now)
+    monkeypatch.setattr(task_module.storage, "delete", lambda _key: None)
+    run = WorkflowRun(
+        id="run-timeout",
+        tenant_id="tenant-1",
+        app_id="app-1",
+        workflow_id="workflow-1",
+        type=WorkflowType.WORKFLOW,
+        triggered_from=WorkflowRunTriggeredFrom.APP_RUN,
+        version="1",
+        status=WorkflowExecutionStatus.PAUSED,
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by="account-1",
+        created_at=now - timedelta(minutes=10),
+    )
+    pause = WorkflowPause(
+        workflow_id="workflow-1",
+        workflow_run_id=run.id,
+        state_object_key="workflow-state-timeout.json",
+    )
+    sqlite_session.add_all([run, pause])
+    sqlite_session.commit()
+    database_client = sessionmaker(bind=sqlite_engine, expire_on_commit=False)
+
+    task_module._handle_global_timeout(
+        form_id="form-timeout",
+        workflow_run_id=run.id,
+        node_id="review",
+        session_factory=database_client,
+    )
+
+    with database_client() as session:
+        persisted_run = session.get(WorkflowRun, run.id)
+        persisted_pause = session.get(WorkflowPause, pause.id)
+        assert persisted_run is not None
+        assert persisted_run.status == WorkflowExecutionStatus.STOPPED
+        assert persisted_run.history_revision == 1
+        assert persisted_run.history_sync_pending is True
+        assert persisted_pause is not None
+        assert persisted_pause.resumed_at == now
+
+    logstore = _RecordingLogstore()
+    assert (
+        drain_pending_workflow_run_histories(
+            database_client=database_client,
+            logstore_client=cast(AliyunLogStore, logstore),
+            enable_graph=False,
+        )
+        == 1
+    )
+    assert [record["status"] for record in logstore.records] == ["stopped"]
+
+
 @pytest.mark.parametrize("sqlite_session", [(HumanInputForm,)], indirect=True)
 def test_check_and_handle_human_input_timeouts_marks_and_routes(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_task_database: None,
     sqlite_engine: Engine,
     sqlite_session: Session,
-):
+) -> None:
     now = datetime(2025, 1, 1, 12, 0, 0)
     monkeypatch.setattr(task_module, "naive_utc_now", lambda: now)
     apply_config_overrides(monkeypatch, HUMAN_INPUT_GLOBAL_TIMEOUT_SECONDS=3600)
@@ -178,7 +252,7 @@ def test_check_and_handle_human_input_timeouts_orders_by_id_before_limit(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_task_database: None,
     sqlite_session: Session,
-):
+) -> None:
     now = datetime(2025, 1, 1, 12, 0, 0)
     monkeypatch.setattr(task_module, "naive_utc_now", lambda: now)
     apply_config_overrides(monkeypatch, HUMAN_INPUT_GLOBAL_TIMEOUT_SECONDS=0)
@@ -220,7 +294,7 @@ def test_check_and_handle_human_input_timeouts_omits_global_filter_when_disabled
     monkeypatch: pytest.MonkeyPatch,
     sqlite_task_database: None,
     sqlite_session: Session,
-):
+) -> None:
     now = datetime(2025, 1, 1, 12, 0, 0)
     monkeypatch.setattr(task_module, "naive_utc_now", lambda: now)
     apply_config_overrides(monkeypatch, HUMAN_INPUT_GLOBAL_TIMEOUT_SECONDS=0)

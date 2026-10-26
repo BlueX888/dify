@@ -9,19 +9,19 @@ This module validates SQL-backed behavior for document sync flows:
 
 import json
 from unittest.mock import Mock, patch
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import delete, func, select, update
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from models import Account, AccountStatus, Tenant, TenantAccountJoin, TenantAccountRole, TenantStatus
 from models.dataset import Dataset, Document, DocumentSegment
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus, SegmentStatus
-from services.knowledge.indexing.adapters.execution import build_document_indexing_service
+from services.knowledge.entities.resource_scope import DatasetRef
+from services.knowledge.indexing.adapters.cleanup import clean_document_for_reindex as real_clean_document_for_reindex
 from services.knowledge.indexing.errors import DocumentIsPausedError
-from services.knowledge.resource_scope import DatasetRef
 from tasks.document_indexing_sync_task import document_indexing_sync_task
 
 
@@ -132,12 +132,18 @@ class TestDocumentIndexingSyncTask:
     """Integration tests for document_indexing_sync_task with real database assertions."""
 
     @pytest.fixture
-    def mock_external_dependencies(self, db_session_with_containers: Session):
+    def mock_external_dependencies(self):
         """Patch only external collaborators; keep DB access real."""
         with (
             patch("tasks.document_indexing_sync_task.build_data_source_credentials") as mock_credentials,
             patch("tasks.document_indexing_sync_task.NotionExtractor") as mock_notion_extractor_class,
-            patch("tasks.document_indexing_sync_task.IndexProcessorFactory") as mock_index_processor_factory,
+            patch(
+                "tasks.document_indexing_sync_task.clean_document_for_reindex",
+                autospec=True,
+                side_effect=real_clean_document_for_reindex,
+            ) as mock_cleanup,
+            patch("services.knowledge.indexing.adapters.cleanup.Vector", autospec=True),
+            patch("tasks.document_indexing_sync_task.storage", autospec=True),
             patch("tasks.document_indexing_sync_task.build_document_indexing_service") as mock_indexing_runner_class,
         ):
             datasource_service = Mock()
@@ -148,22 +154,14 @@ class TestDocumentIndexingSyncTask:
             notion_extractor.get_notion_last_edited_time.return_value = "2024-01-02T00:00:00Z"
             mock_notion_extractor_class.return_value = notion_extractor
 
-            index_processor = Mock()
-            index_processor.clean = Mock()
-            mock_index_processor_factory.return_value.init_index_processor.return_value = index_processor
-
-            indexing_runner = build_document_indexing_service(
-                session_factory=sessionmaker(bind=db_session_with_containers.get_bind(), expire_on_commit=False)
-            )
-            indexing_runner.run = Mock()
+            indexing_runner = mock_indexing_runner_class.return_value
             mock_indexing_runner_class.return_value = indexing_runner
 
             yield {
                 "datasource_service": datasource_service,
                 "notion_extractor": notion_extractor,
                 "notion_extractor_class": mock_notion_extractor_class,
-                "index_processor": index_processor,
-                "index_processor_factory": mock_index_processor_factory,
+                "cleanup": mock_cleanup,
                 "indexing_runner": indexing_runner,
             }
 
@@ -211,6 +209,19 @@ class TestDocumentIndexingSyncTask:
             "notion_info": notion_info,
         }
 
+    @staticmethod
+    def _assert_claimed_indexing(context, mock_external_dependencies) -> str:
+        runner = mock_external_dependencies["indexing_runner"]
+        runner.run_claimed.assert_called_once()
+        call = runner.run_claimed.call_args
+        expected_ref = DatasetRef(context["tenant"].id, context["dataset"].id).document(context["document"].id)
+        assert call.args == (expected_ref,)
+        assert set(call.kwargs) == {"claim_id"}
+        claim_id = call.kwargs["claim_id"]
+        assert isinstance(claim_id, str)
+        assert str(UUID(claim_id)) == claim_id
+        return claim_id
+
     def test_document_not_found(self, db_session_with_containers: Session, mock_external_dependencies):
         """Test that task handles missing document gracefully."""
         # Arrange
@@ -222,7 +233,7 @@ class TestDocumentIndexingSyncTask:
 
         # Assert
         mock_external_dependencies["datasource_service"].get_datasource_credentials.assert_not_called()
-        mock_external_dependencies["indexing_runner"].run.assert_not_called()
+        mock_external_dependencies["indexing_runner"].run_claimed.assert_not_called()
 
     def test_missing_notion_workspace_id(self, db_session_with_containers: Session, mock_external_dependencies):
         """Test that task raises error when notion_workspace_id is missing."""
@@ -287,7 +298,7 @@ class TestDocumentIndexingSyncTask:
         assert updated_document.indexing_status == IndexingStatus.ERROR
         assert "Datasource credential not found" in updated_document.error
         assert updated_document.stopped_at is not None
-        mock_external_dependencies["indexing_runner"].run.assert_not_called()
+        mock_external_dependencies["indexing_runner"].run_claimed.assert_not_called()
 
     def test_page_not_updated(self, db_session_with_containers: Session, mock_external_dependencies):
         """Test that task exits early when notion page is unchanged."""
@@ -312,8 +323,8 @@ class TestDocumentIndexingSyncTask:
         assert updated_document.indexing_status == IndexingStatus.COMPLETED
         assert updated_document.processing_started_at is None
         assert remaining_segments == 3
-        mock_external_dependencies["index_processor"].clean.assert_not_called()
-        mock_external_dependencies["indexing_runner"].run.assert_not_called()
+        mock_external_dependencies["cleanup"].assert_not_called()
+        mock_external_dependencies["indexing_runner"].run_claimed.assert_not_called()
 
     def test_successful_sync_when_page_updated(self, db_session_with_containers: Session, mock_external_dependencies):
         """Test full successful sync flow with SQL state updates and side effects."""
@@ -340,20 +351,20 @@ class TestDocumentIndexingSyncTask:
         assert updated_document.data_source_info_dict.get("last_edited_time") == "2024-01-02T00:00:00Z"
         assert remaining_segments == 0
 
-        clean_call_args = mock_external_dependencies["index_processor"].clean.call_args
-        assert clean_call_args is not None
-        clean_args, clean_kwargs = clean_call_args
-        assert clean_args[0].id == context["dataset"].id
-        assert set(clean_args[1]) == set(context["node_ids"])
-        assert clean_kwargs.get("with_keywords") is True
-        assert clean_kwargs.get("delete_child_chunks") is True
+        cleanup_call = mock_external_dependencies["cleanup"].call_args
+        assert cleanup_call is not None
+        assert cleanup_call.kwargs["tenant_id"] == context["tenant"].id
+        assert cleanup_call.kwargs["dataset_id"] == context["dataset"].id
+        assert cleanup_call.kwargs["document_ids"] == [context["document"].id]
+        assert cleanup_call.kwargs["doc_form"] == IndexStructureType.PARAGRAPH_INDEX
+        assert callable(cleanup_call.kwargs["new_session"])
+        assert callable(cleanup_call.kwargs["mutation_guard"])
 
-        mock_external_dependencies["indexing_runner"].run.assert_called_once_with(
-            [DatasetRef(context["tenant"].id, context["dataset"].id).document(context["document"].id)]
-        )
+        claim_id = self._assert_claimed_indexing(context, mock_external_dependencies)
+        assert updated_document.indexing_claim_id == claim_id
 
     def test_dataset_not_found_during_cleaning(self, db_session_with_containers: Session, mock_external_dependencies):
-        """Test that task still updates document and reindexes if dataset vanishes before clean."""
+        """Test that task does not clean or reindex if the owner dataset vanishes."""
         # Arrange
         context = self._create_notion_sync_context(db_session_with_containers)
 
@@ -374,18 +385,18 @@ class TestDocumentIndexingSyncTask:
         updated_document = db_session_with_containers.scalar(
             select(Document).where(Document.id == context["document"].id).limit(1)
         )
-        assert updated_document is not None
-        assert updated_document.indexing_status == IndexingStatus.PARSING
-        mock_external_dependencies["index_processor"].clean.assert_not_called()
-        mock_external_dependencies["indexing_runner"].run.assert_called_once()
+        if updated_document is not None:
+            assert updated_document.indexing_status == IndexingStatus.COMPLETED
+        mock_external_dependencies["cleanup"].assert_not_called()
+        mock_external_dependencies["indexing_runner"].run_claimed.assert_not_called()
 
-    def test_cleaning_error_continues_to_indexing(
+    def test_cleaning_error_fails_without_indexing(
         self, db_session_with_containers: Session, mock_external_dependencies
     ):
-        """Test that indexing continues when index cleanup fails."""
+        """Test that cleanup failure preserves rows and fails the claim owner."""
         # Arrange
         context = self._create_notion_sync_context(db_session_with_containers)
-        mock_external_dependencies["index_processor"].clean.side_effect = Exception("Cleaning error")
+        mock_external_dependencies["cleanup"].side_effect = Exception("Cleaning error")
 
         # Act
         document_indexing_sync_task(context["dataset"].id, context["document"].id)
@@ -401,9 +412,11 @@ class TestDocumentIndexingSyncTask:
             .where(DocumentSegment.document_id == context["document"].id)
         )
         assert updated_document is not None
-        assert updated_document.indexing_status == IndexingStatus.PARSING
-        assert remaining_segments == 0
-        mock_external_dependencies["indexing_runner"].run.assert_called_once()
+        assert updated_document.indexing_status == IndexingStatus.ERROR
+        assert updated_document.error == "Cleaning error"
+        assert updated_document.indexing_claim_id is None
+        assert remaining_segments == 3
+        mock_external_dependencies["indexing_runner"].run_claimed.assert_not_called()
 
     def test_indexing_runner_document_paused_error(
         self, db_session_with_containers: Session, mock_external_dependencies
@@ -411,7 +424,7 @@ class TestDocumentIndexingSyncTask:
         """Test that DocumentIsPausedError does not flip document into error state."""
         # Arrange
         context = self._create_notion_sync_context(db_session_with_containers)
-        mock_external_dependencies["indexing_runner"].run.side_effect = DocumentIsPausedError("Document paused")
+        mock_external_dependencies["indexing_runner"].run_claimed.side_effect = DocumentIsPausedError("Document paused")
 
         # Act
         document_indexing_sync_task(context["dataset"].id, context["document"].id)
@@ -424,12 +437,14 @@ class TestDocumentIndexingSyncTask:
         assert updated_document is not None
         assert updated_document.indexing_status == IndexingStatus.PARSING
         assert updated_document.error is None
+        assert updated_document.indexing_claim_id is None
+        self._assert_claimed_indexing(context, mock_external_dependencies)
 
     def test_indexing_runner_general_error(self, db_session_with_containers: Session, mock_external_dependencies):
         """Test that indexing errors are persisted to document state."""
         # Arrange
         context = self._create_notion_sync_context(db_session_with_containers)
-        mock_external_dependencies["indexing_runner"].run.side_effect = Exception("Indexing error")
+        mock_external_dependencies["indexing_runner"].run_claimed.side_effect = Exception("Indexing error")
 
         # Act
         document_indexing_sync_task(context["dataset"].id, context["document"].id)
@@ -443,13 +458,15 @@ class TestDocumentIndexingSyncTask:
         assert updated_document.indexing_status == IndexingStatus.ERROR
         assert "Indexing error" in updated_document.error
         assert updated_document.stopped_at is not None
+        assert updated_document.indexing_claim_id is None
+        self._assert_claimed_indexing(context, mock_external_dependencies)
 
-    def test_index_processor_clean_called_with_correct_params(
+    def test_document_index_cleanup_called_with_claim_guard(
         self,
         db_session_with_containers,
         mock_external_dependencies,
     ):
-        """Test that clean is called with dataset instance and collected node ids."""
+        """Test that cleanup receives the claimed document scope and mutation guard."""
         # Arrange
         context = self._create_notion_sync_context(db_session_with_containers)
 
@@ -457,10 +474,12 @@ class TestDocumentIndexingSyncTask:
         document_indexing_sync_task(context["dataset"].id, context["document"].id)
 
         # Assert
-        clean_call_args = mock_external_dependencies["index_processor"].clean.call_args
-        assert clean_call_args is not None
-        clean_args, clean_kwargs = clean_call_args
-        assert clean_args[0].id == context["dataset"].id
-        assert set(clean_args[1]) == set(context["node_ids"])
-        assert clean_kwargs.get("with_keywords") is True
-        assert clean_kwargs.get("delete_child_chunks") is True
+        cleanup_call = mock_external_dependencies["cleanup"].call_args
+        assert cleanup_call is not None
+        assert cleanup_call.args == ()
+        assert cleanup_call.kwargs["tenant_id"] == context["tenant"].id
+        assert cleanup_call.kwargs["dataset_id"] == context["dataset"].id
+        assert cleanup_call.kwargs["document_ids"] == [context["document"].id]
+        assert cleanup_call.kwargs["doc_form"] == IndexStructureType.PARAGRAPH_INDEX
+        assert callable(cleanup_call.kwargs["new_session"])
+        assert callable(cleanup_call.kwargs["mutation_guard"])

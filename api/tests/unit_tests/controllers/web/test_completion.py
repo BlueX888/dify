@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import dataclass
 from inspect import unwrap
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from flask import Flask
 from sqlalchemy.orm import Session
 from werkzeug.exceptions import InternalServerError
 
+from controllers.web import completion as completion_module
 from controllers.web.completion import ChatApi, ChatStopApi, CompletionApi, CompletionStopApi
 from controllers.web.error import (
     AgentNotPublishedError,
@@ -23,9 +25,28 @@ from controllers.web.error import (
 )
 from core.app.apps.agent_app.errors import AgentAppNotPublishedError
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.model_runtime.errors.invoke import InvokeError
 from models.model import App, AppMode, EndUser
 from tests.unit_tests.model_factories import make_app, make_end_user
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeServicesStub:
+    external_retrieval: ExternalDatasetRetriever
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationServicesStub:
+    knowledge: _KnowledgeServicesStub
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> ExternalDatasetRetriever:
+    port = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = _ApplicationServicesStub(knowledge=_KnowledgeServicesStub(external_retrieval=port))
+    monkeypatch.setattr(completion_module, "application_services", lambda: services)
+    return port
 
 
 def _app(mode: AppMode) -> App:
@@ -82,7 +103,14 @@ class TestCompletionApi:
     @patch("controllers.web.completion.helper.compact_generate_response", return_value={"answer": "hi"})
     @patch("controllers.web.completion.AppGenerateService.generate")
     @patch("controllers.web.completion.web_ns")
-    def test_happy_path(self, mock_ns: MagicMock, mock_gen: MagicMock, mock_compact: MagicMock, app: Flask) -> None:
+    def test_happy_path(
+        self,
+        mock_ns: MagicMock,
+        mock_gen: MagicMock,
+        mock_compact: MagicMock,
+        app: Flask,
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         mock_ns.payload = {"inputs": {}, "query": "test"}
         mock_gen.return_value = "response-obj"
 
@@ -90,6 +118,7 @@ class TestCompletionApi:
             result = CompletionApi().post(_completion_app(), _end_user())
 
         assert result == {"answer": "hi"}
+        assert mock_gen.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch(
         "controllers.web.completion.AppGenerateService.generate",
@@ -158,7 +187,14 @@ class TestChatApi:
     @patch("controllers.web.completion.helper.compact_generate_response", return_value={"answer": "reply"})
     @patch("controllers.web.completion.AppGenerateService.generate")
     @patch("controllers.web.completion.web_ns")
-    def test_happy_path(self, mock_ns: MagicMock, mock_gen: MagicMock, mock_compact: MagicMock, app: Flask) -> None:
+    def test_happy_path(
+        self,
+        mock_ns: MagicMock,
+        mock_gen: MagicMock,
+        mock_compact: MagicMock,
+        app: Flask,
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         mock_ns.payload = {"inputs": {}, "query": "hi"}
         mock_gen.return_value = "response"
 
@@ -166,6 +202,7 @@ class TestChatApi:
             result = ChatApi().post(_chat_app(), _end_user())
 
         assert result == {"answer": "reply"}
+        assert mock_gen.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch(
         "controllers.web.completion.AppGenerateService.generate",
@@ -202,6 +239,7 @@ class TestChatApi:
         mock_generate: MagicMock,
         app: Flask,
         unbound_session: Session,
+        external_retrieval: ExternalDatasetRetriever,
     ) -> None:
         mock_ns.payload = {"inputs": {}, "query": "hi", "conversation_id": str(uuid.uuid4())}
         session = unbound_session
@@ -210,6 +248,7 @@ class TestChatApi:
             unwrap(ChatApi.post)(ChatApi(), session, _chat_app(), _end_user())
 
         assert mock_get_conversation.call_args.kwargs["session"] is session
+        assert mock_generate.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
 # ---------------------------------------------------------------------------

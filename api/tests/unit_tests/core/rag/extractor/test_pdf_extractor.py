@@ -1,4 +1,5 @@
 import io
+from collections.abc import Iterator
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 from uuid import uuid4
@@ -8,6 +9,8 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 import core.rag.extractor.pdf_extractor as pe
+from core.rag.extractor.entity.extract_setting import CreatedUploadArtifact
+from core.rag.models.document import Document
 from models.model import UploadFile
 from tests.unit_tests.config_override import apply_config_overrides
 
@@ -17,12 +20,17 @@ USER_ID = str(uuid4())
 
 class _Storage:
     saves: list[tuple[str, bytes]]
+    deletes: list[str]
 
     def __init__(self) -> None:
         self.saves = []
+        self.deletes = []
 
     def save(self, key: str, data: bytes) -> None:
         self.saves.append((key, data))
+
+    def delete(self, key: str) -> None:
+        self.deletes.append(key)
 
 
 @dataclass(eq=False, repr=False)
@@ -200,6 +208,39 @@ def test_extract_images_failures(mock_dependencies: _Dependencies) -> None:
     assert mock_dependencies.storage.saves == [(upload_file.key, jpeg_bytes)]
 
 
+@pytest.mark.parametrize("sqlite_session", [(UploadFile,)], indirect=True)
+def test_storage_failure_exposes_the_fresh_pdf_image_artifact(
+    mock_dependencies: _Dependencies,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_bytes = b"\x89PNG\r\n\x1a\nimage"
+    registered: list[CreatedUploadArtifact] = []
+
+    class Image:
+        def extract(self, target: io.BytesIO, **_kwargs: object) -> None:
+            target.write(image_bytes)
+
+    class Page:
+        def get_objects(self, **_kwargs: object) -> list[Image]:
+            return [Image()]
+
+    def fail_after_write(key: str, data: bytes) -> None:
+        assert [artifact.key for artifact in registered] == [key]
+        mock_dependencies.storage.saves.append((key, data))
+        raise RuntimeError("storage response lost")
+
+    monkeypatch.setattr(mock_dependencies.storage, "save", fail_after_write)
+    extractor = pe.PdfExtractor(file_path="test.pdf", tenant_id=TENANT_ID, user_id=USER_ID)
+    extractor.on_upload_artifact_created = registered.append
+
+    with pytest.raises(RuntimeError):
+        extractor._extract_images(Page())
+    assert mock_dependencies.storage.deletes == []
+    assert tuple(registered) == extractor.created_upload_artifacts
+    assert mock_dependencies.session.scalars(select(UploadFile)).all() == []
+    assert [artifact.key for artifact in extractor.created_upload_artifacts] == [mock_dependencies.storage.saves[0][0]]
+
+
 def test_extract_images_skipped_without_tenant_context() -> None:
     """PDFs loaded from a URL have no tenant/user context; image extraction must be skipped."""
     mock_page = MagicMock()
@@ -210,3 +251,53 @@ def test_extract_images_skipped_without_tenant_context() -> None:
 
     assert result == ""
     mock_page.get_objects.assert_not_called()
+
+
+def test_text_only_extraction_skips_pdf_images(monkeypatch: pytest.MonkeyPatch) -> None:
+    class TextPage:
+        def get_text_range(self) -> str:
+            return "preview text"
+
+        def close(self) -> None:
+            pass
+
+    class Page:
+        def get_textpage(self) -> TextPage:
+            return TextPage()
+
+        def close(self) -> None:
+            pass
+
+    class PdfDocument:
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def __iter__(self) -> Iterator[Page]:
+            return iter([Page()])
+
+        def close(self) -> None:
+            pass
+
+    class Blob:
+        source = "preview.pdf"
+
+        def as_bytes_io(self) -> io.BytesIO:
+            return io.BytesIO(b"pdf")
+
+    extractor = pe.PdfExtractor(
+        file_path="preview.pdf",
+        tenant_id=TENANT_ID,
+        user_id=USER_ID,
+        persist_images=False,
+    )
+
+    def fail_if_called(_page: object) -> str:
+        pytest.fail("text-only extraction must not persist PDF images")
+
+    monkeypatch.setattr(pe.pypdfium2, "PdfDocument", PdfDocument)
+    monkeypatch.setattr(extractor, "_extract_images", fail_if_called)
+
+    documents = list(extractor.parse(Blob()))  # type: ignore[arg-type]
+
+    assert documents == [Document(page_content="preview text", metadata={"source": "preview.pdf", "page": 0})]
+    assert extractor.created_upload_file_ids == ()

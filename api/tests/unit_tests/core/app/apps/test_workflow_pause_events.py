@@ -1,7 +1,7 @@
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from sqlalchemy.orm import Session
@@ -13,6 +13,7 @@ from core.app.apps.workflow.app_runner import WorkflowAppRunner
 from core.app.entities.app_invoke_entities import InvokeFrom, WorkflowAppGenerateEntity
 from core.app.entities.queue_entities import QueueWorkflowPausedEvent
 from core.app.entities.task_entities import HumanInputRequiredResponse, WorkflowPauseStreamResponse
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.nodes.human_input.entities import (
     ParagraphInputConfig,
     SelectInputConfig,
@@ -110,6 +111,7 @@ def _build_runner():
     return _RecordingWorkflowAppRunner(
         application_generate_entity=app_entity,
         queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         variable_loader=MagicMock(),
         workflow=workflow,
         system_user_id="sys-user",

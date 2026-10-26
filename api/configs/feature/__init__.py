@@ -234,6 +234,11 @@ class AsyncWorkflowConfig(BaseSettings):
         default=120,
         ge=1,
     )
+    ASYNC_WORKFLOW_EXECUTION_LEASE_SECONDS: int = Field(
+        description="How long an async workflow worker owns a trigger log without a successful heartbeat.",
+        default=300,
+        ge=3,
+    )
 
 
 class PluginConfig(BaseSettings):

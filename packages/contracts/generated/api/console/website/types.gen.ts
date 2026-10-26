@@ -13,7 +13,13 @@ export type WebsiteCrawlPayload = {
 }
 
 export type WebsiteCrawlResponse = {
-  [key: string]: unknown
+  current?: number | null
+  data?: unknown
+  job_id?: string | null
+  source_handle?: string | null
+  status: string
+  time_consuming?: string | number | null
+  total?: number | null
 }
 
 export type ErrorResponse = {
@@ -59,6 +65,7 @@ export type GetWebsiteCrawlStatusByJobIdData = {
   }
   query: {
     provider: 'firecrawl' | 'jinareader' | 'watercrawl'
+    source_handle: string
   }
   url: '/website/crawl/status/{job_id}'
 }

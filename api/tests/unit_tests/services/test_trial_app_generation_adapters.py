@@ -1,6 +1,7 @@
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field, replace
 from typing import cast, override
+from unittest.mock import create_autospec
 from uuid import uuid4
 
 import pytest
@@ -10,6 +11,7 @@ from sqlalchemy.pool import QueuePool
 
 from core.app.apps.chat.app_generator import ChatAppGenerator
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models import Account, App, AppMode, Conversation
 from models.enums import ConversationFromSource
 from models.model import AccountTrialAppRecord
@@ -29,6 +31,7 @@ _ARGS: dict[str, object] = {"inputs": {"count": 0}, "query": "hello", "auto_gene
 @dataclass
 class _Harness:
     runtime: AppGenerateServiceRuntime
+    external_retrieval: ExternalDatasetRetriever
     app: TrialAppRef
     account_id: str
     closed_sessions: list[Session]
@@ -63,8 +66,13 @@ def harness(sqlite_engine: Engine, sqlite_session_factory: sessionmaker[Session]
                 raise failure
 
     factory = sessionmaker(bind=sqlite_engine, class_=TrackedSession, expire_on_commit=True)
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
     return _Harness(
-        runtime=AppGenerateServiceRuntime(session_factory=cast(sessionmaker[Session], factory)),
+        runtime=AppGenerateServiceRuntime(
+            session_factory=cast(sessionmaker[Session], factory),
+            external_retrieval=external_retrieval,
+        ),
+        external_retrieval=external_retrieval,
         app=TrialAppRef(app_id=app.id, tenant_id=app.tenant_id, app_mode=app.mode),
         account_id=account.id,
         closed_sessions=closed_sessions,
@@ -111,6 +119,7 @@ def _patch_generation(
         args: Mapping[str, object],
         invoke_from: InvokeFrom,
         streaming: bool,
+        external_retrieval: ExternalDatasetRetriever,
     ) -> GenerationResponse:
         assert len(harness.closed_sessions) == 1
         read_session = harness.closed_sessions[0]
@@ -127,6 +136,7 @@ def _patch_generation(
         )
         assert (app_model.name, user.name) == ("Trial app", "Viewer")
         assert invoke_from == InvokeFrom.EXPLORE
+        assert external_retrieval is harness.external_retrieval
         assert streaming is expected_streaming
         assert args == expected_args
         return generate(session)
@@ -359,12 +369,16 @@ def _patch_chat_generation(monkeypatch: pytest.MonkeyPatch, harness: _Harness) -
         args: Mapping[str, object],
         invoke_from: InvokeFrom,
         streaming: bool,
+        external_retrieval: ExternalDatasetRetriever,
     ) -> GenerationResponse:
         assert len(harness.closed_sessions) == 1
         assert not harness.closed_sessions[0].in_transaction()
         assert session is not harness.closed_sessions[0]
         assert not session.in_transaction()
-        response = ChatAppGenerator().generate(
+        assert external_retrieval is harness.external_retrieval
+        response = ChatAppGenerator(
+            external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+        ).generate(
             app_model=app_model, user=user, args=args, invoke_from=invoke_from, streaming=streaming, session=session
         )
         return cast(GenerationResponse, ChatAppGenerator.convert_to_event_stream(response))

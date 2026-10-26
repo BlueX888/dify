@@ -1,5 +1,6 @@
 from typing import override
 
+from core.rag.extractor.entity.extract_setting import WebsiteJobRef
 from core.rag.extractor.extractor_base import BaseExtractor
 from core.rag.models.document import Document
 from services.data_source.website_service import WebsiteService
@@ -20,8 +21,7 @@ class FirecrawlWebExtractor(BaseExtractor):
     def __init__(
         self,
         url: str,
-        job_id: str,
-        tenant_id: str,
+        job_ref: WebsiteJobRef,
         mode: str = "crawl",
         only_main_content: bool = True,
         *,
@@ -30,8 +30,7 @@ class FirecrawlWebExtractor(BaseExtractor):
         """Initialize with url, api_key, base_url and mode."""
         self._website_service = website_service
         self._url = url
-        self.job_id = job_id
-        self.tenant_id = tenant_id
+        self.job_ref = job_ref
         self.mode = mode
         self.only_main_content = only_main_content
 
@@ -40,7 +39,7 @@ class FirecrawlWebExtractor(BaseExtractor):
         """Extract content from the URL."""
         documents = []
         if self.mode == "crawl":
-            crawl_data = self._website_service.get_crawl_url_data(self.job_id, "firecrawl", self._url, self.tenant_id)
+            crawl_data = self._website_service.get_crawl_url_data_by_ref(self.job_ref, self._url)
             if crawl_data is None:
                 return []
             document = Document(
@@ -53,8 +52,8 @@ class FirecrawlWebExtractor(BaseExtractor):
             )
             documents.append(document)
         elif self.mode == "scrape":
-            scrape_data = self._website_service.get_scrape_url_data(
-                "firecrawl", self._url, self.tenant_id, self.only_main_content
+            scrape_data = self._website_service.get_scrape_url_data_by_ref(
+                self.job_ref, self._url, self.only_main_content
             )
 
             document = Document(

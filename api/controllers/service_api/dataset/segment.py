@@ -1,4 +1,3 @@
-from typing import cast
 from uuid import UUID
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
@@ -46,8 +45,8 @@ from services.errors.chunk import ChildChunkDeleteIndexError as ChildChunkDelete
 from services.errors.chunk import ChildChunkIndexingError as ChildChunkIndexingServiceError
 from services.knowledge.dataset_read_service import load_segment_detail, load_segment_details
 from services.knowledge.dataset_service import DatasetService, DocumentService, SegmentService
+from services.knowledge.entities.resource_scope import DatasetRef, SegmentRef
 from services.knowledge.entities.segments import SegmentUpdateArgs
-from services.knowledge.resource_scope import DatasetRef, SegmentRef
 from services.knowledge.summaries.adapters import SummaryIndexAdapter
 
 
@@ -188,7 +187,7 @@ class SegmentApi(DatasetApiResource):
     )
     @cloud_edition_billing_resource_check("vector_space", "dataset")
     @cloud_edition_billing_knowledge_limit_check("add_segment", "dataset")
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     def post(self, session: Session, tenant_id: str, dataset_id: UUID, document_id: UUID):
         _, current_tenant_id = current_account_with_tenant()
@@ -237,15 +236,12 @@ class SegmentApi(DatasetApiResource):
 
         for args_item in segment_items:
             SegmentService.segment_create_args_validate(args_item, document)
-        segments = cast(
-            list[DocumentSegment],
-            SegmentService.multi_create_segment(
-                segment_items,
-                document,
-                dataset,
-                session,
-                mutations=application_services().knowledge.segments.mutations,
-            ),
+        segments = SegmentService.multi_create_segment(
+            segment_items,
+            document,
+            dataset,
+            session,
+            mutations=application_services().knowledge.segments.mutations,
         )
         segment_ids = [segment.id for segment in segments]
         summaries: dict[str, str | None] = {}
@@ -376,7 +372,7 @@ class DatasetSegmentApi(DatasetApiResource):
             404: "Dataset, document, or segment not found",
         }
     )
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     def delete(self, session: Session, tenant_id: str, dataset_id: UUID, document_id: UUID, segment_id: UUID):
         current_account_with_tenant()
@@ -387,8 +383,6 @@ class DatasetSegmentApi(DatasetApiResource):
         )
         if not dataset:
             raise NotFound("Dataset not found.")
-        # check user's model setting
-        DatasetService.check_dataset_model_setting(dataset)
         document_id_str = str(document_id)
         # check document
         document = DocumentService.get_document(dataset_id_str, document_id_str, session=session)
@@ -424,7 +418,7 @@ class DatasetSegmentApi(DatasetApiResource):
     )
     @service_api_ns.response(200, "Segment updated successfully", service_api_ns.models[SegmentDetailResponse.__name__])
     @cloud_edition_billing_resource_check("vector_space", "dataset")
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(SegmentUpdatePayload)
     def post(
@@ -444,14 +438,14 @@ class DatasetSegmentApi(DatasetApiResource):
         )
         if not dataset:
             raise NotFound("Dataset not found.")
-        # check user's model setting
-        DatasetService.check_dataset_model_setting(dataset)
+        if payload.segment.enabled is not False:
+            DatasetService.check_dataset_model_setting(dataset)
         document_id_str = str(document_id)
         # check document
         document = DocumentService.get_document(dataset_id_str, document_id_str, session=session)
         if not document:
             raise NotFound("Document not found.")
-        if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
+        if payload.segment.enabled is not False and dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
             # check embedding model setting
             try:
                 model_manager = ModelManager.for_tenant(tenant_id=current_tenant_id)
@@ -579,7 +573,7 @@ class ChildChunkApi(DatasetApiResource):
     )
     @cloud_edition_billing_resource_check("vector_space", "dataset")
     @cloud_edition_billing_knowledge_limit_check("add_segment", "dataset")
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(ChildChunkCreatePayload)
     def post(
@@ -739,7 +733,7 @@ class DatasetChildChunkApi(DatasetApiResource):
         }
     )
     @cloud_edition_billing_knowledge_limit_check("add_segment", "dataset")
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     def delete(
         self,
@@ -811,7 +805,7 @@ class DatasetChildChunkApi(DatasetApiResource):
     )
     @cloud_edition_billing_resource_check("vector_space", "dataset")
     @cloud_edition_billing_knowledge_limit_check("add_segment", "dataset")
-    @cloud_edition_billing_rate_limit_check("knowledge", "dataset")
+    @cloud_edition_billing_rate_limit_check("knowledge")
     @with_session
     @model_validate(ChildChunkUpdatePayload)
     def patch(

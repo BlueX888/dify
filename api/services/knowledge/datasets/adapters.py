@@ -19,15 +19,20 @@ from repositories.knowledge.dataset_repository import _get_dataset
 from services.app.query_service import RelatedApps
 from services.enterprise import rbac_service
 from services.errors.base import NoPermissionError
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
 from services.knowledge.dataset_read_service import get_dataset_queries, load_dataset_detail, load_dataset_details
-from services.knowledge.dataset_service import DatasetPermissionService, DatasetService, DocumentService
+from services.knowledge.dataset_service import (
+    DatasetPermissionService,
+    DatasetService,
+    DocumentService,
+    ExternalKnowledgeTemplateLookup,
+)
 from services.knowledge.datasets.application import (
     DatasetListFilter,
     DatasetVisibility,
 )
 from services.knowledge.entities.datasets import DatasetDetailRecord, DatasetPage
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 from services.rbac import contracts as rbac_contracts
 from services.rbac.members import MemberService
 from services.tag_application_service import TagTargetQuery
@@ -87,11 +92,13 @@ class SQLAlchemyDatasetOperations:
         session_factory: sessionmaker[Session],
         tags: TagTargetQuery,
         app_queries: RelatedApps,
+        external_templates: ExternalKnowledgeTemplateLookup,
         members: MemberService,
     ) -> None:
         self._sessions = session_factory
         self._tags = tags
         self._app_queries = app_queries
+        self._external_templates = external_templates
         self._members_service = members
 
     def visibility(self, context: RequestContext) -> DatasetVisibility:
@@ -193,6 +200,7 @@ class SQLAlchemyDatasetOperations:
         with _translate_permissions(), self._sessions() as session:
             dataset = DatasetService.create_empty_dataset(
                 session=session,
+                external_templates=self._external_templates,
                 tenant_id=context.active_workspace_id,
                 account=load_actor(session, context),
                 **dict(values),
@@ -231,30 +239,27 @@ class SQLAlchemyDatasetOperations:
                 )
             # The legacy updater consumes fields from its input; retain the
             # member selection for the permission update in this transaction.
-            dataset = DatasetService.update_dataset(ref.dataset_id, dict(data), account, session=session)
-            if dataset is None:
-                raise DatasetNotFoundError()
-            result = self._detail(session, context, dataset)
-            if (
-                data.get("partial_member_list") is not None
-                and data.get("permission") == DatasetPermissionEnum.PARTIAL_TEAM
-            ):
-                DatasetPermissionService.update_partial_member_list(
-                    ref.tenant_id, ref.dataset_id, data["partial_member_list"], session
-                )
-            elif data.get("permission") in {DatasetPermissionEnum.ONLY_ME, DatasetPermissionEnum.ALL_TEAM}:
-                DatasetPermissionService.clear_partial_member_list(ref.dataset_id, session)
-            result["partial_member_list"] = self._members(session, ref)
-            session.commit()
-            return result
+            with DatasetService.update_dataset(
+                ref.dataset_id, dict(data), account, session=session, external_templates=self._external_templates
+            ) as dataset:
+                result = self._detail(session, context, dataset)
+                if (
+                    data.get("partial_member_list") is not None
+                    and data.get("permission") == DatasetPermissionEnum.PARTIAL_TEAM
+                ):
+                    DatasetPermissionService.update_partial_member_list(
+                        ref.tenant_id, ref.dataset_id, data["partial_member_list"], session
+                    )
+                elif data.get("permission") in {DatasetPermissionEnum.ONLY_ME, DatasetPermissionEnum.ALL_TEAM}:
+                    DatasetPermissionService.clear_partial_member_list(ref.dataset_id, session)
+                result["partial_member_list"] = self._members(session, ref)
+        return result
 
     def delete_dataset(self, context: RequestContext, ref: DatasetRef) -> None:
         with _translate_permissions(), self._sessions() as session:
             require_dataset(session, ref)
             if not DatasetService.delete_dataset(ref.dataset_id, load_actor(session, context), session):
                 raise DatasetNotFoundError()
-            DatasetPermissionService.clear_partial_member_list(ref.dataset_id, session)
-            session.commit()
 
     def is_in_use(self, ref: DatasetRef) -> bool:
         with self._sessions() as session:

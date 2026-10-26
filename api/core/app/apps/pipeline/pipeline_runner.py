@@ -1,6 +1,6 @@
 import logging
 import time
-from typing import Protocol, cast, override
+from typing import TYPE_CHECKING, Protocol, cast, override
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -17,6 +17,7 @@ from core.app.entities.app_invoke_entities import (
 from core.credit_usage import CreditUsageAppType
 from core.db.session_factory import create_session
 from core.workflow.node_factory import DifyGraphInitContext, DifyNodeFactory, get_default_root_node_id
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.system_variables import build_bootstrap_variables, build_system_variables
 from core.workflow.variable_pool_initializer import add_node_inputs_to_pool, add_variables_to_pool
 from core.workflow.workflow_entry import WorkflowEntry
@@ -30,17 +31,29 @@ from models.dataset import Dataset, Pipeline
 from models.model import EndUser
 from models.workflow import Workflow
 
+if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+
 logger = logging.getLogger(__name__)
 
 
 class PipelineDocumentStore(Protocol):
     """Knowledge state required by a pipeline run, with explicit session ownership."""
 
-    def get_pipeline_dataset(self, pipeline: Pipeline, *, session: Session) -> Dataset | None: ...
+    def get_pipeline_dataset(self, pipeline: Pipeline, *, session: Session, lock: bool) -> Dataset | None: ...
 
     def exists(self, *, workspace_id: str, dataset_id: str, document_id: str) -> bool: ...
 
-    def mark_failed(self, *, workspace_id: str, dataset_id: str, document_id: str, error: str) -> None: ...
+    def mark_failed(
+        self,
+        *,
+        workspace_id: str,
+        dataset_id: str,
+        document_id: str,
+        error: str,
+        indexing_request_id: str | None = None,
+        claim_id: str | None = None,
+    ) -> None: ...
 
 
 class PipelineRunner(WorkflowBasedAppRunner):
@@ -56,22 +69,21 @@ class PipelineRunner(WorkflowBasedAppRunner):
         workflow: Workflow,
         system_user_id: str,
         documents: PipelineDocumentStore,
-        workflow_thread_pool_id: str | None = None,
+        external_retrieval: "ExternalDatasetRetriever",
         execution_driver: WorkflowRunDriver | None = None,
     ) -> None:
         """
         :param application_generate_entity: application generate entity
         :param queue_manager: application queue manager
-        :param workflow_thread_pool_id: workflow thread pool id
         """
         super().__init__(
             queue_manager=queue_manager,
+            external_retrieval=external_retrieval,
             execution_driver=execution_driver,
             variable_loader=variable_loader,
             app_id=application_generate_entity.app_config.app_id,
         )
         self.application_generate_entity = application_generate_entity
-        self.workflow_thread_pool_id = workflow_thread_pool_id
         self._workflow = workflow
         self._sys_user_id = system_user_id
         self._documents = documents
@@ -104,7 +116,7 @@ class PipelineRunner(WorkflowBasedAppRunner):
             if not pipeline or pipeline.tenant_id != app_config.tenant_id:
                 raise ValueError("Pipeline not found")
 
-            dataset = self._documents.get_pipeline_dataset(pipeline, session=session)
+            dataset = self._documents.get_pipeline_dataset(pipeline, session=session, lock=False)
             if (
                 not dataset
                 or dataset.tenant_id != pipeline.tenant_id
@@ -159,6 +171,9 @@ class PipelineRunner(WorkflowBasedAppRunner):
                 workflow_execution_id=self.application_generate_entity.workflow_execution_id,
                 document_id=self.application_generate_entity.document_id,
                 original_document_id=self.application_generate_entity.original_document_id,
+                enforce_projected_capacity=self.application_generate_entity.enforce_projected_capacity,
+                indexing_request_id=self.application_generate_entity.indexing_request_id,
+                indexing_claim_id=self.application_generate_entity.indexing_claim_id,
                 batch=self.application_generate_entity.batch,
                 dataset_id=self.application_generate_entity.dataset_id,
                 datasource_type=self.application_generate_entity.datasource_type,
@@ -304,6 +319,8 @@ class PipelineRunner(WorkflowBasedAppRunner):
             app_type=CreditUsageAppType.RAG_PIPELINE,
         )
         graph_init_context = DifyGraphInitContext(
+            external_retrieval=self._external_retrieval,
+            knowledge_index_runtime=build_knowledge_index_runtime(),
             execution_driver=self._execution_driver,
             workflow_id=workflow.id,
             graph_config=graph_config,
@@ -341,4 +358,6 @@ class PipelineRunner(WorkflowBasedAppRunner):
             dataset_id=dataset_id,
             document_id=document_id,
             error=event.error or "Unknown error",
+            indexing_request_id=self.application_generate_entity.indexing_request_id,
+            claim_id=self.application_generate_entity.indexing_claim_id,
         )

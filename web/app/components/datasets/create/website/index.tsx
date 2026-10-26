@@ -29,7 +29,7 @@ type Props = Readonly<{
   checkedCrawlResult: CrawlResultItem[]
   onCheckedCrawlResultChange: (payload: CrawlResultItem[]) => void
   onCrawlProviderChange: (provider: DataSourceProvider) => void
-  onJobIdChange: (jobId: string) => void
+  onJobIdChange: (jobId: string, sourceHandle?: string) => void
   crawlOptions: CrawlOptions
   onCrawlOptionsChange: (payload: CrawlOptions) => void
   authedDataSourceList: DatasourceProviderAuthResponse[]

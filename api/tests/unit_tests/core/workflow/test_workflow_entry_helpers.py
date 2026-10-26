@@ -24,6 +24,7 @@ from graphon.runtime import VariablePool
 from graphon.variables.variables import StringVariable
 from models.workflow import Workflow
 from tests.unit_tests.config_override import config_overrides_context
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.unit_tests.core.workflow.test_workflow_tool_container import (
     _outer_graph,
     _workflow_tool_node,
@@ -81,7 +82,7 @@ class TestWorkflowEntryInit:
         with config_overrides_context(WORKFLOW_MAX_EXECUTION_STEPS=2, GRAPH_ENGINE_MAX_WORKERS=1):
             entry = workflow_entry.WorkflowEntry(
                 graph_config=tool.init_params.graph_config,
-                graph=_outer_graph(tool),
+                graph=_outer_graph(tool, external_retrieval=make_external_dataset_retriever()),
                 call_depth=0,
                 graph_runtime_state=tool.runtime_state,
             )
@@ -194,6 +195,7 @@ class TestWorkflowEntrySingleStepRun:
                 user_inputs={},
                 variable_pool=sentinel.variable_pool,
                 execution_driver=None,
+                external_retrieval=make_external_dataset_retriever(),
             )
 
     def test_preloads_constructor_variables_before_creating_memory_node(self):
@@ -259,6 +261,7 @@ class TestWorkflowEntrySingleStepRun:
                 variable_pool=variable_pool,
                 variable_loader=variable_loader,
                 execution_driver=None,
+                external_retrieval=make_external_dataset_retriever(),
             )
 
         assert node.id == "node-id"
@@ -312,6 +315,7 @@ class TestWorkflowEntrySingleStepRun:
                 user_inputs={"question": "hello"},
                 variable_pool=sentinel.variable_pool,
                 execution_driver=None,
+                external_retrieval=make_external_dataset_retriever(),
             )
 
         assert node.id == "node-id"
@@ -380,6 +384,7 @@ class TestWorkflowEntrySingleStepRun:
                 user_inputs={"question": "hello"},
                 variable_pool=sentinel.variable_pool,
                 execution_driver=None,
+                external_retrieval=make_external_dataset_retriever(),
             )
 
         assert node.id == "node-id"
@@ -437,6 +442,7 @@ class TestWorkflowEntrySingleStepRun:
                     user_inputs={},
                     variable_pool=sentinel.variable_pool,
                     execution_driver=None,
+                    external_retrieval=make_external_dataset_retriever(),
                 )
 
 
@@ -470,6 +476,7 @@ class TestWorkflowEntryHelpers:
                 tenant_id="tenant-id",
                 user_id="user-id",
                 user_inputs={},
+                external_retrieval=make_external_dataset_retriever(),
             )
 
     def test_run_free_node_rejects_missing_node_class(self, monkeypatch: pytest.MonkeyPatch):
@@ -486,6 +493,7 @@ class TestWorkflowEntryHelpers:
                 tenant_id="tenant-id",
                 user_id="user-id",
                 user_inputs={},
+                external_retrieval=make_external_dataset_retriever(),
             )
 
     def test_run_free_node_uses_empty_mapping_when_selector_extraction_is_not_implemented(
@@ -507,10 +515,17 @@ class TestWorkflowEntryHelpers:
 
         dify_node_factory = MagicMock()
         dify_node_factory.create_node.return_value = FakeNode()
+        external_retrieval = make_external_dataset_retriever()
+        knowledge_index_runtime = workflow_entry.build_knowledge_index_runtime()
         monkeypatch.setattr(
             workflow_entry,
             "resolve_workflow_node_class",
             MagicMock(return_value=FakeNodeClass),
+        )
+        monkeypatch.setattr(
+            workflow_entry,
+            "build_knowledge_index_runtime",
+            lambda: knowledge_index_runtime,
         )
 
         with (
@@ -546,6 +561,7 @@ class TestWorkflowEntryHelpers:
                 tenant_id="tenant-id",
                 user_id="user-id",
                 user_inputs={"question": "hello"},
+                external_retrieval=external_retrieval,
             )
 
         assert node.id == "node-id"
@@ -567,6 +583,8 @@ class TestWorkflowEntryHelpers:
             ),
             run_context={"_dify": "context"},
             call_depth=0,
+            external_retrieval=external_retrieval,
+            knowledge_index_runtime=knowledge_index_runtime,
         )
         dify_node_factory_cls.assert_called_once_with(
             graph_init_context=sentinel.graph_init_context,
@@ -628,6 +646,7 @@ class TestWorkflowEntryHelpers:
                     tenant_id="tenant-id",
                     user_id="user-id",
                     user_inputs={"question": "hello"},
+                    external_retrieval=make_external_dataset_retriever(),
                 )
 
     def test_handle_special_values_serializes_nested_files(self):

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from core.callback_handler.index_tool_callback_handler import DatasetIndexToolCallbackHandler
 from core.model_manager import ModelManager
 from core.rag.datasource.retrieval_service import DefaultRetrievalModelDict, RetrievalService
+from core.rag.embedding.retrieval import FinalizedInternalRetrieval
 from core.rag.entities import RetrievalSourceMetadata
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
 from core.rag.models.document import Document as RagDocument
@@ -17,8 +18,8 @@ from core.rag.retrieval.retrieval_methods import RetrievalMethod
 from core.tools.utils.dataset_retriever.dataset_retriever_base_tool import DatasetRetrieverBaseTool
 from extensions.ext_database import db
 from graphon.model_runtime.entities.model_entities import ModelType
-from models.dataset import Dataset, Document, DocumentSegment
-from repositories.knowledge.segment_read_adapter import sign_segment_content
+from models.dataset import Dataset
+from repositories.knowledge.retrieval_source_repository import get_retrieval_source_documents
 
 default_retrieval_model: DefaultRetrievalModelDict = {
     "search_method": RetrievalMethod.SEMANTIC_SEARCH,
@@ -78,79 +79,74 @@ class DatasetMultiRetrieverTool(DatasetRetrieverBaseTool):
         )
 
         rerank_runner = RerankModelRunner(rerank_model_instance, session=session)
-        all_documents = rerank_runner.run(query, all_documents, self.score_threshold, self.top_k)
-
-        for hit_callback in self.hit_callbacks:
-            hit_callback.on_tool_end(all_documents, session)
-
-        document_score_list = {}
-        for item in all_documents:
-            if item.metadata and item.metadata.get("score"):
-                document_score_list[item.metadata["doc_id"]] = item.metadata["score"]
-
-        document_context_list = []
-        index_node_ids = [document.metadata["doc_id"] for document in all_documents if document.metadata]
-        document_segment_stmt = select(DocumentSegment).where(
-            DocumentSegment.dataset_id.in_(self.dataset_ids),
-            DocumentSegment.completed_at.isnot(None),
-            DocumentSegment.status == "completed",
-            DocumentSegment.enabled.is_(True),
-            DocumentSegment.index_node_id.in_(index_node_ids),
-        )
-        segments = session.scalars(document_segment_stmt).all()
-
-        if segments:
-            index_node_id_to_position = {id: position for position, id in enumerate(index_node_ids)}
-            sorted_segments = sorted(
-                segments, key=lambda segment: index_node_id_to_position.get(segment.index_node_id, float("inf"))
+        all_documents = rerank_runner.run(query, all_documents, self.score_threshold, len(all_documents))
+        with Session(bind=session.get_bind()) as format_session:
+            finalized = self.retrieval_finalizer.finalize(
+                format_session=format_session,
+                authorization_session=format_session,
+                candidates=all_documents,
+                tenant_id=self.tenant_id,
+                dataset_ids=self.dataset_ids,
+                top_k=self.top_k,
             )
-            for segment in sorted_segments:
-                if segment.answer:
-                    document_context_list.append(
-                        f"question:{sign_segment_content(segment, session=session)} answer:{segment.answer}"
-                    )
-                else:
-                    document_context_list.append(sign_segment_content(segment, session=session))
-            if self.return_resource:
-                context_list: list[RetrievalSourceMetadata] = []
-                for resource_number, segment in enumerate(sorted_segments, start=1):
-                    dataset = session.get(Dataset, segment.dataset_id)
-                    document_stmt = select(Document).where(
-                        Document.id == segment.document_id,
-                        Document.enabled.is_(True),
-                        Document.archived.is_(False),
-                    )
-                    document = session.scalar(document_stmt)
-                    if dataset and document:
-                        source = RetrievalSourceMetadata(
-                            position=resource_number,
-                            dataset_id=dataset.id,
-                            dataset_name=dataset.name,
-                            document_id=document.id,
-                            document_name=document.name,
-                            data_source_type=document.data_source_type,
-                            segment_id=segment.id,
-                            retriever_from=self.retriever_from,
-                            score=document_score_list.get(segment.index_node_id),
-                            doc_metadata=document.doc_metadata,
-                        )
 
-                        if self.retriever_from == "dev":
-                            source.hit_count = segment.hit_count
-                            source.word_count = segment.word_count
-                            source.segment_position = segment.position
-                            source.index_node_hash = segment.index_node_hash
-                        if segment.answer:
-                            source.content = f"question:{segment.content} \nanswer:{segment.answer}"
-                        else:
-                            source.content = segment.content
-                        context_list.append(source)
+        if finalized.segment_ids:
+            for hit_callback in self.hit_callbacks:
+                hit_callback.on_tool_end(finalized.trace_documents, session)
 
-                for hit_callback in self.hit_callbacks:
-                    hit_callback.return_retriever_resource_info(context_list)
+        internal_items = [item for item in finalized.items if isinstance(item, FinalizedInternalRetrieval)]
+        datasets = session.scalars(
+            select(Dataset).where(Dataset.tenant_id == self.tenant_id, Dataset.id.in_(self.dataset_ids))
+        ).all()
+        dataset_map = {dataset.id: dataset for dataset in datasets}
+        documents = get_retrieval_source_documents(
+            tenant_id=self.tenant_id,
+            dataset_ids=self.dataset_ids,
+            document_ids=[item.record.segment.document_id for item in internal_items],
+            session=session,
+        )
+        document_map = {document.id: document for document in documents}
+        contents: list[str] = []
+        resources: list[RetrievalSourceMetadata] = []
+        for position, item in enumerate(finalized.items, start=1):
+            if isinstance(item, RagDocument):
+                contents.append(item.page_content)
+                continue
+            record = item.record
+            segment = record.segment
+            segment_content = f"question:{item.content} answer:{segment.answer}" if segment.answer else item.content
+            contents.append(f"{record.summary}\n{segment_content}" if record.summary else segment_content)
+            dataset = dataset_map.get(segment.dataset_id)
+            document = document_map.get(segment.document_id)
+            if dataset is None or document is None:
+                continue
+            source = RetrievalSourceMetadata(
+                position=position,
+                dataset_id=dataset.id,
+                dataset_name=dataset.name,
+                document_id=document.id,
+                document_name=document.name,
+                data_source_type=document.data_source_type,
+                segment_id=segment.id,
+                retriever_from=self.retriever_from,
+                score=record.score or 0.0,
+                doc_metadata=document.doc_metadata,
+                content=(
+                    f"question:{segment.content} \nanswer:{segment.answer}" if segment.answer else segment.content
+                ),
+                summary=record.summary,
+            )
+            if self.retriever_from == "dev":
+                source.hit_count = segment.hit_count
+                source.word_count = segment.word_count
+                source.segment_position = segment.position
+                source.index_node_hash = segment.index_node_hash
+            resources.append(source)
 
-            return "\n".join(document_context_list)
-        return ""
+        if self.return_resource and resources:
+            for hit_callback in self.hit_callbacks:
+                hit_callback.return_retriever_resource_info(resources)
+        return "\n".join(contents)
 
     def _retriever(
         self,

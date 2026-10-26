@@ -1,21 +1,43 @@
 import threading
 from collections.abc import Callable
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 from uuid import uuid4
 
 import pytest
 from opentelemetry.trace import StatusCode, get_current_span, get_tracer
 from sqlalchemy.orm import Session
 
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.rerank.rerank_type import RerankMode
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from models.dataset import Dataset
+
+
+def _dataset_retrieval() -> DatasetRetrieval:
+    return DatasetRetrieval(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
 
 
 @pytest.fixture(autouse=True)
 def _otel_enabled(config_overrides: Callable[..., None]) -> None:
     config_overrides(ENABLE_OTEL=True)
+
+
+@pytest.fixture
+def retrieval_dataset(sqlite_session: Session) -> Dataset:
+    dataset = Dataset(
+        tenant_id=str(uuid4()),
+        name="Tracing test dataset",
+        created_by=str(uuid4()),
+        indexing_technique="high_quality",
+    )
+    sqlite_session.add(dataset)
+    sqlite_session.commit()
+    return dataset
 
 
 def test_knowledge_retrieval_creates_a_child_otel_span(
@@ -33,7 +55,7 @@ def test_knowledge_retrieval_creates_a_child_otel_span(
         retrieval_mode="multiple",
         query="test query",
     )
-    retrieval = DatasetRetrieval()
+    retrieval = _dataset_retrieval()
 
     with (
         patch.object(retrieval, "_check_knowledge_rate_limit"),
@@ -58,7 +80,7 @@ def test_multiple_retrieve_preserves_otel_context_in_dataset_thread(
     tracer_provider_with_memory_exporter,
 ) -> None:
     """Per-dataset retrieval spans must remain in the workflow node trace."""
-    retrieval = DatasetRetrieval()
+    retrieval = _dataset_retrieval()
     dataset = Dataset(
         id=str(uuid4()),
         indexing_technique="high_quality",
@@ -96,8 +118,9 @@ def test_retriever_thread_exception_sets_error_span_and_is_collected(
     app,
     memory_span_exporter,
     tracer_provider_with_memory_exporter,
+    retrieval_dataset: Dataset,
 ) -> None:
-    retrieval = DatasetRetrieval()
+    retrieval = _dataset_retrieval()
     cancel_event = threading.Event()
     thread_exceptions: list[Exception] = []
     expected_error = RuntimeError("retrieval failed")
@@ -107,7 +130,7 @@ def test_retriever_thread_exception_sets_error_span_and_is_collected(
     ):
         retrieval._run_retriever_thread_safely(
             flask_app=app,
-            dataset_id=str(uuid4()),
+            dataset_id=retrieval_dataset.id,
             query="test query",
             top_k=4,
             all_documents=[],
@@ -132,12 +155,13 @@ def test_retriever_thread_exception_emits_skip_event_when_requested(
     app,
     memory_span_exporter,
     tracer_provider_with_memory_exporter,
+    retrieval_dataset: Dataset,
 ) -> None:
-    retrieval = DatasetRetrieval()
+    retrieval = _dataset_retrieval()
     cancel_event = threading.Event()
     thread_exceptions: list[Exception] = []
     expected_error = RuntimeError("retrieval failed")
-    dataset_id = str(uuid4())
+    dataset_id = retrieval_dataset.id
 
     with (
         patch.object(retrieval, "_retriever", side_effect=expected_error),

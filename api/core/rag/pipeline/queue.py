@@ -44,6 +44,17 @@ class TenantIsolatedTaskQueue:
     def delete_task_key(self):
         redis_client.delete(self._task_key)
 
+    def mark_request_queued(self, request_id: str, ttl: int = _DEFAULT_TASK_TTL) -> bool:
+        """Reserve one queued or running delivery for an indexing request."""
+        marker_key = self._request_marker_key(request_id)
+        return bool(redis_client.set(marker_key, 1, ex=ttl, nx=True))
+
+    def clear_request_marker(self, request_id: str) -> None:
+        redis_client.delete(self._request_marker_key(request_id))
+
+    def _request_marker_key(self, request_id: str) -> str:
+        return f"tenant_{self._unique_key}_request:{self._tenant_id}:{request_id}"
+
     def push_tasks(self, tasks: Sequence[Any]):
         serialized_tasks = []
         for task in tasks:

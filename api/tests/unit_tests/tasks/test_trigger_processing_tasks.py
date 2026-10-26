@@ -1,17 +1,25 @@
 from collections.abc import Generator, Mapping
+from typing import cast
 from unittest.mock import MagicMock, patch
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.orm import Session, sessionmaker
 from typing_extensions import TypedDict
 
 import tasks.trigger_processing_tasks as trigger_processing_tasks_module
 from core.plugin.entities.plugin_daemon import CredentialType
+from extensions.logstore.aliyun_logstore import AliyunLogStore
+from extensions.logstore.repositories.logstore_api_workflow_run_repository import LogstoreAPIWorkflowRunRepository
+from graphon.enums import WorkflowExecutionStatus
 from models.enums import EndUserType
 from models.model import EndUser
-from models.trigger import TriggerSubscription, WorkflowPluginTrigger
-from models.workflow import Workflow
+from models.trigger import TriggerSubscription, WorkflowPluginTrigger, WorkflowTriggerLog
+from models.workflow import Workflow, WorkflowAppLog, WorkflowRun
 from services.errors.app import QuotaExceededError
-from tasks.trigger_processing_tasks import dispatch_triggered_workflow
+from services.workflow.entities import PluginTriggerMetadata
+from tasks.trigger_processing_tasks import _record_trigger_failure_log, dispatch_triggered_workflow
+from tasks.workflow_run_history_sync_task import drain_pending_workflow_run_histories
 from tests.unit_tests.model_factories import make_end_user, make_workflow
 
 
@@ -58,6 +66,95 @@ class _EndUserServiceStub:
     ) -> Mapping[str, EndUser]:
         self.calls.append((type, tenant_id, app_ids, user_id))
         return self.result
+
+
+class _RecordingLogstore:
+    supports_pg_protocol = False
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, str]] = []
+
+    def put_log(self, _name: str, fields: list[tuple[str, str]]) -> None:
+        self.records.append(dict(fields))
+
+    def get_logs(self, **_kwargs: object) -> list[dict[str, str]]:
+        return self.records
+
+
+@pytest.mark.parametrize("sqlite_session", [(WorkflowRun, WorkflowAppLog, WorkflowTriggerLog)], indirect=True)
+def test_plugin_trigger_failure_registers_and_publishes_history_projection(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workflow = _workflow()
+    subscription = TriggerSubscription(
+        tenant_id=workflow.tenant_id,
+        user_id="account-123",
+        name="Failure Subscription",
+        endpoint_id="endpoint-123",
+        provider_id="langgenius/test_plugin/test_plugin",
+        parameters={},
+        properties={},
+        credentials={},
+        credential_type=CredentialType.API_KEY,
+    )
+    subscription.id = "subscription-failure"
+    plugin_trigger = WorkflowPluginTrigger(
+        app_id=workflow.app_id,
+        node_id="node-123",
+        tenant_id=workflow.tenant_id,
+        provider_id=subscription.provider_id,
+        event_name="test_event",
+        subscription_id=subscription.id,
+    )
+    plugin_trigger.id = "plugin-trigger-failure"
+    metadata = PluginTriggerMetadata(
+        endpoint_id=subscription.endpoint_id,
+        plugin_unique_identifier="langgenius/test_plugin:0.0.1",
+        provider_id=subscription.provider_id,
+        event_name="test_event",
+        icon_filename="icon.svg",
+        icon_dark_filename="icon-dark.svg",
+    )
+
+    _record_trigger_failure_log(
+        session=sqlite_session,
+        workflow=workflow,
+        plugin_trigger=plugin_trigger,
+        subscription=subscription,
+        trigger_metadata=metadata,
+        end_user=None,
+        error_message="plugin invocation failed",
+        event_name="test_event",
+        request_id="request-failure",
+    )
+
+    with sqlite_session_factory() as session:
+        workflow_run = session.scalar(select(WorkflowRun))
+        assert workflow_run is not None
+        assert workflow_run.status == WorkflowExecutionStatus.FAILED
+        assert workflow_run.history_revision == 1
+        assert workflow_run.history_published_revision == 0
+        assert workflow_run.history_sync_pending is True
+
+    logstore = _RecordingLogstore()
+    assert (
+        drain_pending_workflow_run_histories(
+            database_client=sqlite_session_factory,
+            logstore_client=cast(AliyunLogStore, logstore),
+            enable_graph=False,
+        )
+        == 1
+    )
+    assert [record["status"] for record in logstore.records] == [WorkflowExecutionStatus.FAILED.value]
+    monkeypatch.setattr(AliyunLogStore, "_instance", cast(AliyunLogStore, logstore))
+    monkeypatch.setattr(AliyunLogStore, "_initialized", True)
+    history_reader = LogstoreAPIWorkflowRunRepository(sqlite_session_factory)  # pyrefly: ignore[bad-instantiation]
+    history_reader._enable_dual_read = False
+    found = history_reader.get_workflow_run_by_id(workflow.tenant_id, workflow.app_id, workflow_run.id)
+    assert found is not None
+    assert found.status == WorkflowExecutionStatus.FAILED
 
 
 class _DispatchMocks(TypedDict, closed=True):

@@ -26,7 +26,7 @@ type Props = Readonly<{
   onPreview: (payload: CrawlResultItem) => void
   checkedCrawlResult: CrawlResultItem[]
   onCheckedCrawlResultChange: (payload: CrawlResultItem[]) => void
-  onJobIdChange: (jobId: string) => void
+  onJobIdChange: (jobId: string, sourceHandle?: string) => void
   crawlOptions: CrawlOptions
   onCrawlOptionsChange: (payload: CrawlOptions) => void
 }>
@@ -100,9 +100,9 @@ const WaterCrawl: FC<Props> = ({
   const [crawlErrorMessage, setCrawlErrorMessage] = useState('')
   const showError = isCrawlFinished && crawlErrorMessage
   const waitForCrawlFinished = useCallback(
-    async (jobId: string): Promise<any> => {
+    async (jobId: string, sourceHandle: string): Promise<any> => {
       try {
-        const res = (await checkWatercrawlTaskStatus(jobId)) as any
+        const res = (await checkWatercrawlTaskStatus(jobId, sourceHandle)) as any
         if (res.status === 'completed') {
           return {
             isError: false,
@@ -129,7 +129,7 @@ const WaterCrawl: FC<Props> = ({
         })
         onCheckedCrawlResultChange(res.data || []) // default select the crawl result
         await sleep(2500)
-        return await waitForCrawlFinished(jobId)
+        return await waitForCrawlFinished(jobId, sourceHandle)
       } catch (error: unknown) {
         const errorMessage = error instanceof Error ? error.message : ''
         return {
@@ -161,8 +161,9 @@ const WaterCrawl: FC<Props> = ({
           options: passToServerCrawlOptions,
         })) as any
         const jobId = res.job_id
-        onJobIdChange(jobId)
-        const { isError, data, errorMessage } = await waitForCrawlFinished(jobId)
+        const sourceHandle = res.source_handle
+        onJobIdChange(jobId, sourceHandle)
+        const { isError, data, errorMessage } = await waitForCrawlFinished(jobId, sourceHandle)
         if (isError) {
           setCrawlErrorMessage(
             errorMessage || t(($) => $[`${I18N_PREFIX}.unknownError`], { ns: 'datasetCreation' }),

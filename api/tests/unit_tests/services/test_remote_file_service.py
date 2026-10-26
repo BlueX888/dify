@@ -230,6 +230,7 @@ def test_upload_reuses_get_fallback_content_and_returns_signed_result(
         user=account,
         tenant_id="tenant-id",
         source_url=REMOTE_URL,
+        temporary=False,
     )
     upload_file = sqlite_session.get(UploadFile, result.id)
     assert upload_file is not None

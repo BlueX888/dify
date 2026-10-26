@@ -1,9 +1,10 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 
 from core.app.apps.workflow_app_runner import WorkflowBasedAppRunner
 from core.app.entities.queue_entities import QueueWorkflowPausedEvent
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.nodes.human_input.pause_reason import HumanInputRequired
 from graphon.engine_events import GraphRunPausedEvent
 from graphon.entities.pause_reason import HitlRequired
@@ -33,7 +34,11 @@ class _DummyWorkflowEntry:
 
 def test_handle_pause_event_enqueues_email_task(monkeypatch: pytest.MonkeyPatch):
     queue_manager = _DummyQueueManager()
-    runner = WorkflowBasedAppRunner(queue_manager=queue_manager, app_id="app-id")
+    runner = WorkflowBasedAppRunner(
+        queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        app_id="app-id",
+    )
     workflow_entry = _DummyWorkflowEntry()
 
     graph_reason = HitlRequired(session_id="form-123", node_id="node-1", node_title="Review")

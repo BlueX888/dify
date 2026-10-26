@@ -25,6 +25,8 @@ from core.model_manager import ModelInstance, QuotaManagedModelInstance
 from core.plugin.impl.exc import PluginDaemonClientSideError, PluginInvokeError
 from core.plugin.impl.plugin import PluginInstaller
 from core.prompt.utils.prompt_message_util import PromptMessageUtil
+from core.rag.embedding.retrieval import RetrievalFinalizer
+from core.rag.index_processor.index_processor_base import KnowledgeIndexRuntime
 from core.repositories.human_input_repository import (
     FormCreateParams,
     HumanInputFormEntity,
@@ -77,6 +79,12 @@ from graphon.nodes.tool_runtime_entities import (
 from graphon.workflow_type_encoder import WorkflowRuntimeTypeConverter
 from models.dataset import SegmentAttachmentBinding
 from models.model import UploadFile
+from services import (
+    build_knowledge_index_runtime as _build_knowledge_index_runtime,
+)
+from services import (
+    build_retrieval_finalizer as _build_retrieval_finalizer,
+)
 from services.tools.builtin_tools_manage_service import BuiltinToolManageService
 
 from .human_input_adapter import (
@@ -120,6 +128,7 @@ class PollingLLMRuntimeProtocol(Protocol):
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
     from core.tools.__base.tool import Tool
     from core.tools.entities.tool_entities import ToolInvokeMessage as CoreToolInvokeMessage
     from core.tools.workflow_as_tool.tool import WorkflowTool
@@ -128,6 +137,16 @@ if TYPE_CHECKING:
 
 
 _file_access_controller = DatabaseFileAccessController()
+
+
+def build_knowledge_index_runtime() -> KnowledgeIndexRuntime:
+    """Centralize the legacy core-to-application composition bridge."""
+    return _build_knowledge_index_runtime()
+
+
+def build_retrieval_finalizer() -> RetrievalFinalizer:
+    """Build the retrieval final-result owner at the existing runtime bridge."""
+    return _build_retrieval_finalizer()
 
 
 def resolve_dify_run_context(run_context: Mapping[str, Any] | DifyRunContext) -> DifyRunContext:
@@ -531,6 +550,8 @@ class DifyToolNodeRuntime(ToolNodeRuntimeProtocol):
     def __init__(
         self,
         run_context: Mapping[str, Any] | DifyRunContext,
+        *,
+        external_retrieval: ExternalDatasetRetriever,
         session_maker: sessionmaker[Session] | None = None,
         execution_driver: WorkflowRunDriver | None = None,
         workflow_tools: Mapping[str, WorkflowTool] | None = None,
@@ -539,6 +560,7 @@ class DifyToolNodeRuntime(ToolNodeRuntimeProtocol):
         self._file_reference_factory = DifyFileReferenceFactory(self._run_context)
         self._session_maker = session_maker
         self._execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
         self._workflow_tools = workflow_tools if workflow_tools is not None else {}
 
     @property
@@ -573,6 +595,7 @@ class DifyToolNodeRuntime(ToolNodeRuntimeProtocol):
                     if self._is_workflow_tool_provider(node_data)
                     else None
                 ),
+                external_retrieval=self._external_retrieval,
             )
         except ToolNodeError:
             raise

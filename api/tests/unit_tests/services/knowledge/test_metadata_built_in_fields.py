@@ -156,7 +156,9 @@ def test_fractional_built_in_dates_keep_integer_second_boundary_semantics(
     with sqlite_session_factory.begin() as session:
         session.add(make_document(document_id="document-1", doc_metadata=doc_metadata))
 
-    filters = DatasetRetrieval.process_metadata_filter_func(0, condition, field, CREATED_AT_EPOCH, [])
+    filters = DatasetRetrieval.process_metadata_filter_func(
+        0, condition, field, CREATED_AT_EPOCH, [], dialect_name="sqlite"
+    )
     with sqlite_session_factory() as session:
         found = session.scalars(select(Document.id).where(*filters)).all()
 

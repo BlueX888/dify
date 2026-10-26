@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from configs import dify_config
 from core.rag.extractor.blob.blob import Blob
+from core.rag.extractor.entity.extract_setting import CreatedUploadArtifact
 from core.rag.extractor.extractor_base import BaseExtractor
 from core.rag.models.document import Document
 from extensions.ext_database import db
@@ -23,6 +24,10 @@ from models.enums import CreatorUserRole
 from models.model import UploadFile
 
 logger = logging.getLogger(__name__)
+
+
+class _ImagePersistenceError(RuntimeError):
+    """Preserve created object identity for the adapter-owned compensation path."""
 
 
 class PdfExtractor(BaseExtractor):
@@ -51,6 +56,8 @@ class PdfExtractor(BaseExtractor):
     )
     MAX_MAGIC_LEN = max(len(m) for m, _, _ in IMAGE_FORMATS)
     _session: Session | None
+    _persist_images: bool
+    _created_upload_files: list[UploadFile]
 
     def __init__(
         self,
@@ -60,6 +67,7 @@ class PdfExtractor(BaseExtractor):
         file_cache_key: str | None = None,
         *,
         session: Session | None = None,
+        persist_images: bool = True,
     ):
         """Initialize PdfExtractor."""
         self._file_path = file_path
@@ -67,9 +75,12 @@ class PdfExtractor(BaseExtractor):
         self._user_id = user_id
         self._file_cache_key = file_cache_key
         self._session = session
+        self._persist_images = persist_images
+        self._created_upload_files = []
 
     @override
     def extract(self) -> list[Document]:
+        self._created_upload_files = []
         plaintext_file_exists = False
         if self._file_cache_key:
             with contextlib.suppress(FileNotFoundError):
@@ -87,6 +98,11 @@ class PdfExtractor(BaseExtractor):
             storage.save(self._file_cache_key, text.encode("utf-8"))
 
         return documents
+
+    @property
+    @override
+    def created_upload_artifacts(self) -> tuple[CreatedUploadArtifact, ...]:
+        return tuple(CreatedUploadArtifact(id=upload.id, key=upload.key) for upload in self._created_upload_files)
 
     def load(
         self,
@@ -106,7 +122,7 @@ class PdfExtractor(BaseExtractor):
                     content = text_page.get_text_range()
                     text_page.close()
 
-                    image_content = self._extract_images(page)
+                    image_content = self._extract_images(page) if self._persist_images else ""
                     if image_content:
                         content += "\n" + image_content
 
@@ -166,9 +182,6 @@ class PdfExtractor(BaseExtractor):
                     file_uuid = str(uuid.uuid4())
                     file_key = "image_files/" + self._tenant_id + "/" + file_uuid + "." + image_ext
 
-                    storage.save(file_key, img_bytes)
-
-                    # save file to db
                     upload_file = UploadFile(
                         tenant_id=self._tenant_id,
                         storage_type=StorageType(dify_config.STORAGE_TYPE),
@@ -184,11 +197,21 @@ class PdfExtractor(BaseExtractor):
                         used_by=self._user_id,
                         used_at=naive_utc_now(),
                     )
+                    self._created_upload_files.append(upload_file)
+                    self.register_created_upload_artifact(CreatedUploadArtifact(id=upload_file.id, key=upload_file.key))
+                    try:
+                        storage.save(file_key, img_bytes)
+                    except Exception as error:
+                        raise _ImagePersistenceError(file_key) from error
                     upload_files.append(upload_file)
                     image_content.append(f"![image]({base_url}/files/{upload_file.id}/file-preview)")
+                except _ImagePersistenceError:
+                    raise
                 except Exception as e:
                     logger.warning("Failed to extract image from PDF: %s", e)
                     continue
+        except _ImagePersistenceError:
+            raise
         except Exception as e:
             logger.warning("Failed to get objects from PDF page: %s", e)
         if upload_files:

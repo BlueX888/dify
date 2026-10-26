@@ -22,7 +22,6 @@ from repositories.knowledge.dataset_read_repository import (
     get_document_segment_count,
     get_next_segment,
     get_previous_segment,
-    get_segment_dataset,
     get_segment_document,
 )
 
@@ -292,53 +291,6 @@ class TestDocumentSegmentNavigationProperties:
         """Automatically rollback session changes after each test."""
         yield
         db_session_with_containers.rollback()
-
-    def test_document_segment_dataset_property(self, db_session_with_containers: Session) -> None:
-        """Test segment can access its parent dataset."""
-        # Arrange
-        tenant_id = str(uuid4())
-        created_by = str(uuid4())
-        dataset = Dataset(
-            tenant_id=tenant_id,
-            name="Test Dataset",
-            data_source_type=DataSourceType.UPLOAD_FILE,
-            created_by=created_by,
-        )
-        db_session_with_containers.add(dataset)
-        db_session_with_containers.flush()
-
-        document = Document(
-            tenant_id=tenant_id,
-            dataset_id=dataset.id,
-            position=1,
-            data_source_type=DataSourceType.UPLOAD_FILE,
-            batch="batch_001",
-            name="test.pdf",
-            created_from=DocumentCreatedFrom.WEB,
-            created_by=created_by,
-        )
-        db_session_with_containers.add(document)
-        db_session_with_containers.flush()
-
-        segment = DocumentSegment(
-            tenant_id=tenant_id,
-            dataset_id=dataset.id,
-            document_id=document.id,
-            position=1,
-            content="Test",
-            word_count=1,
-            tokens=2,
-            created_by=created_by,
-        )
-        db_session_with_containers.add(segment)
-        db_session_with_containers.flush()
-
-        # Act
-        related_dataset = get_segment_dataset(segment, session=db_session_with_containers)
-
-        # Assert
-        assert related_dataset is not None
-        assert related_dataset.id == dataset.id
 
     def test_document_segment_document_property(self, db_session_with_containers: Session) -> None:
         """Test segment can access its parent document."""

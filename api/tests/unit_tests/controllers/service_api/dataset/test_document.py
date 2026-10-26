@@ -19,12 +19,14 @@ import inspect
 import json
 import uuid
 from collections.abc import Iterator
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from unittest.mock import Mock, PropertyMock, patch
+from uuid import UUID
 
 import pytest
 from flask import Flask
-from sqlalchemy import Engine, event
+from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session
 from werkzeug.exceptions import Forbidden, NotFound
 
@@ -50,7 +52,7 @@ from core.rag.index_processor.constant.index_type import IndexStructureType
 from enums import DeploymentEdition
 from libs.pagination import PaginatedResult, clamp_pagination
 from models.account import Account
-from models.dataset import Dataset, Document, DocumentSegment
+from models.dataset import Dataset, DatasetProcessRule, Document, DocumentSegment
 from models.enums import (
     ApiTokenType,
     DataSourceType,
@@ -62,10 +64,17 @@ from models.enums import (
 from models.model import ApiToken, UploadFile
 from services.errors.file import FileTooLargeError as FileTooLargeServiceError
 from services.knowledge.dataset_service import DocumentService
-from services.knowledge.entities.knowledge_entities import ProcessRule, RetrievalModel
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.knowledge_entities import (
+    DataSource,
+    InfoList,
+    KnowledgeConfig,
+    ProcessRule,
+    RetrievalModel,
+    WebsiteInfo,
+)
+from services.knowledge.entities.resource_scope import DatasetRef
 from tests.unit_tests.config_override import config_overrides_context
-from tests.unit_tests.model_factories import make_account, make_upload_file
+from tests.unit_tests.model_factories import make_account, make_tenant, make_upload_file
 
 
 def _document_data_source_info() -> dict[str, str]:
@@ -74,6 +83,15 @@ def _document_data_source_info() -> dict[str, str]:
 
 def _account() -> Account:
     return make_account(account_id="user-1", name="Document API User", email=f"document-api-{uuid.uuid4()}@example.com")
+
+
+def _account_for_tenant(tenant_id: str) -> Account:
+    return make_account(
+        account_id="user-1",
+        name="Document API User",
+        email=f"document-api-{uuid.uuid4()}@example.com",
+        tenant=make_tenant(tenant_id=tenant_id),
+    )
 
 
 def _upload_file() -> UploadFile:
@@ -238,6 +256,39 @@ def _persist_segments(session: Session, document: Document, count: int = 5) -> N
     session.flush()
 
 
+def _persist_document_for_update(
+    session: Session,
+    dataset: Dataset,
+    *,
+    doc_form: str,
+    process_rule_id: str,
+) -> Document:
+    tenant = make_tenant(tenant_id=dataset.tenant_id)
+    dataset_creator = make_account(
+        account_id=dataset.created_by,
+        name="Dataset Creator",
+        email=f"dataset-creator-{uuid.uuid4()}@example.com",
+        tenant=tenant,
+    )
+    dataset.indexing_technique = "economy"
+    dataset.chunk_structure = None
+    document = make_serializable_document(
+        id=str(uuid.uuid4()),
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        dataset_process_rule_id=process_rule_id,
+        data_source_type=DataSourceType.UPLOAD_FILE,
+        data_source_info={"upload_file_id": str(uuid.uuid4())},
+        name="Original Name",
+        indexing_status=IndexingStatus.COMPLETED,
+        doc_form=doc_form,
+    )
+    session.add_all([tenant, dataset_creator, dataset, document])
+    _persist_segments(session, document, count=2)
+    session.commit()
+    return document
+
+
 class TestDocumentTextCreatePayload:
     """Test suite for DocumentTextCreatePayload Pydantic model."""
 
@@ -348,16 +399,18 @@ class TestDocumentTextUpdate:
         payload = DocumentTextUpdate(doc_form=IndexStructureType.QA_INDEX)
         assert payload.doc_form == IndexStructureType.QA_INDEX
 
-    def test_payload_with_language_update(self):
+    def test_payload_with_language_update(self) -> None:
         """Test payload with doc_language update."""
         payload = DocumentTextUpdate(doc_language="Japanese")
         assert payload.doc_language == "Japanese"
+        assert "doc_language" in payload.model_fields_set
 
-    def test_payload_default_values(self):
+    def test_payload_default_values(self) -> None:
         """Test payload default values."""
         payload = DocumentTextUpdate()
         assert payload.doc_form == IndexStructureType.PARAGRAPH_INDEX
         assert payload.doc_language == "English"
+        assert "doc_language" not in payload.model_fields_set
 
 
 class TestDocumentListQuery:
@@ -402,10 +455,6 @@ class TestDocumentService:
     def test_get_document_method_exists(self):
         """Test DocumentService.get_document exists."""
         assert hasattr(DocumentService, "get_document")
-
-    def test_update_document_with_dataset_id_method_exists(self):
-        """Test DocumentService.update_document_with_dataset_id exists."""
-        assert hasattr(DocumentService, "update_document_with_dataset_id")
 
     def test_delete_document_method_exists(self):
         """Test DocumentService.delete_document exists."""
@@ -662,30 +711,37 @@ class TestDocumentServiceSaveValidation:
 
     @config_overrides_context(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
     @patch("services.knowledge.dataset_service.DatasetService.check_doc_form")
-    @patch("services.knowledge.dataset_service.FeatureService.get_features")
-    def test_save_document_validates_doc_form(self, mock_features, mock_check_form, sqlite_session: Session):
+    def test_save_document_validates_doc_form(self, mock_check_form, sqlite_session: Session):
         """Test that doc_form is validated during save."""
-        dataset = make_dataset(tenant_id="tenant_id")
-        config = Mock()
-        features = Mock()
-        mock_features.return_value = features
+        tenant = make_tenant(tenant_id="tenant_id")
+        dataset = make_dataset(tenant_id=tenant.id)
+        sqlite_session.add_all([tenant, dataset])
+        sqlite_session.commit()
+        config = KnowledgeConfig(
+            indexing_technique="economy",
+            data_source=DataSource(
+                info_list=InfoList(
+                    data_source_type="website_crawl",
+                    website_info_list=WebsiteInfo(
+                        provider="test",
+                        job_id="job-1",
+                        urls=["https://example.com/docs"],
+                    ),
+                )
+            ),
+        )
+        account = _account_for_tenant(tenant.id)
 
         class TestStopError(Exception):
             pass
 
         mock_check_form.side_effect = TestStopError()
-        session = sqlite_session
 
-        # Skip actual logic by mocking dependent calls or raising error to stop early
         with pytest.raises(TestStopError):
-            # We just want to check check_doc_form is called early
-            DocumentService.save_document_with_dataset_id(dataset, config, _account(), session=session)
+            with DocumentService.save_document_with_dataset_id(dataset, config, account, session=sqlite_session):
+                pass
 
-        # This will fail if we raise exception before check_doc_form,
-        # but check_doc_form is the first thing called.
-        # Ideally we'd mock everything to completion, but for unit validation:
-        # We can just verify check_doc_form was called if we mock it to not raise.
-        mock_check_form.assert_called_once_with(dataset, config.doc_form, session=session)
+        mock_check_form.assert_called_once_with(dataset, config.doc_form, session=sqlite_session)
 
 
 # =============================================================================
@@ -1633,7 +1689,7 @@ class TestDocumentAddByTextApi(SQLiteControllerTest):
         mock_knowledge_config.model_validate.return_value = mock_config
 
         mock_doc = make_serializable_document(id="doc-create-text", name="Test Document")
-        mock_doc_svc.save_document_with_dataset_id.return_value = ([mock_doc], "batch_123")
+        mock_doc_svc.save_document_with_dataset_id.return_value = nullcontext(([mock_doc], "batch_123"))
         mock_doc_svc.document_create_args_validate.return_value = None
 
         # Act
@@ -1782,6 +1838,257 @@ class TestDocumentUpdateByTextApiPost(SQLiteControllerTest):
     ``@cloud_edition_billing_rate_limit_check``.
     """
 
+    def test_name_only_updates_metadata_without_reindexing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=IndexStructureType.PARAGRAPH_INDEX,
+            process_rule_id="existing-rule",
+        )
+        account = _account_for_tenant(mock_tenant)
+        monkeypatch.setattr(document_module, "current_user", account)
+        monkeypatch.setattr("services.knowledge.dataset_service.current_user", account)
+
+        def unexpected_dispatch(_jobs: object) -> None:
+            raise AssertionError("name-only updates must not dispatch indexing")
+
+        class UnexpectedFileService:
+            def __init__(self, _engine: Engine) -> None:
+                raise AssertionError("name-only updates must not upload text")
+
+        monkeypatch.setattr(DocumentService, "dispatch_document_indexing", unexpected_dispatch)
+        monkeypatch.setattr(document_module, "FileService", UnexpectedFileService)
+
+        with app.test_request_context(method="POST", json={"name": "Renamed"}):
+            response = document_module._update_document_by_text(
+                self.session,
+                mock_tenant,
+                UUID(mock_dataset.id),
+                UUID(document.id),
+            )
+
+        segments = self.session.scalars(
+            select(DocumentSegment).where(DocumentSegment.document_id == document.id).order_by(DocumentSegment.position)
+        ).all()
+        assert response["document"]["name"] == "Renamed"
+        assert response["batch"] == document.batch
+        assert document.name == "Renamed"
+        assert document.indexing_status == IndexingStatus.COMPLETED
+        assert document.dataset_process_rule_id == "existing-rule"
+        assert [segment.status for segment in segments] == [SegmentStatus.COMPLETED, SegmentStatus.COMPLETED]
+
+    def test_explicit_empty_text_reindexes_document(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=IndexStructureType.PARAGRAPH_INDEX,
+            process_rule_id="existing-rule",
+        )
+        account = _account_for_tenant(mock_tenant)
+        upload = make_upload_file(
+            file_id=str(uuid.uuid4()),
+            tenant_id=mock_tenant,
+            name="Empty Document",
+            size=0,
+            created_by=account.id,
+            used=True,
+        )
+        self.session.add(upload)
+        self.session.commit()
+        uploaded_text: list[str] = []
+        dispatched: list[object] = []
+
+        class EmptyTextFileService:
+            def __init__(self, _engine: Engine) -> None:
+                pass
+
+            def upload_text(self, text: str, text_name: str, user_id: str, tenant_id: str) -> UploadFile:
+                assert text_name == "Empty Document"
+                assert user_id == account.id
+                assert tenant_id == mock_tenant
+                uploaded_text.append(text)
+                return upload
+
+        monkeypatch.setattr(document_module, "current_user", account)
+        monkeypatch.setattr(document_module, "FileService", EmptyTextFileService)
+        monkeypatch.setattr(DocumentService, "dispatch_document_indexing", dispatched.append)
+
+        with app.test_request_context(method="POST", json={"name": "Empty Document", "text": ""}):
+            response = document_module._update_document_by_text(
+                self.session,
+                mock_tenant,
+                UUID(mock_dataset.id),
+                UUID(document.id),
+            )
+
+        self.session.refresh(document)
+        segments = self.session.scalars(
+            select(DocumentSegment).where(DocumentSegment.document_id == document.id).order_by(DocumentSegment.position)
+        ).all()
+        assert uploaded_text == [""]
+        assert len(dispatched) == 1
+        assert response["document"]["name"] == "Empty Document"
+        assert document.indexing_status == IndexingStatus.WAITING
+        assert document.dataset_process_rule_id == "existing-rule"
+        assert [segment.status for segment in segments] == [SegmentStatus.RE_SEGMENT, SegmentStatus.RE_SEGMENT]
+
+    @pytest.mark.parametrize(
+        "doc_form",
+        [IndexStructureType.PARENT_CHILD_INDEX, IndexStructureType.QA_INDEX],
+    )
+    def test_process_rule_only_preserves_omitted_doc_form(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+        doc_form: str,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=doc_form,
+            process_rule_id="existing-rule",
+        )
+        document.doc_language = "Japanese"
+        self.session.commit()
+        account = _account_for_tenant(mock_tenant)
+        dispatched: list[object] = []
+
+        class UnexpectedFileService:
+            def __init__(self, _engine: Engine) -> None:
+                raise AssertionError("process-rule-only updates must not upload text")
+
+        monkeypatch.setattr(document_module, "current_user", account)
+        monkeypatch.setattr(document_module, "FileService", UnexpectedFileService)
+        monkeypatch.setattr(DocumentService, "dispatch_document_indexing", dispatched.append)
+
+        with app.test_request_context(
+            f"/datasets/{mock_dataset.id}/documents/{document.id}/update-by-text",
+            method="POST",
+            json={"process_rule": {"mode": "automatic"}},
+        ):
+            api = DocumentUpdateByTextApi()
+            response, status = _unwrap_non_wrapped_controller(type(api).post)(
+                api,
+                self.session,
+                tenant_id=mock_tenant,
+                dataset_id=mock_dataset.id,
+                document_id=document.id,
+            )
+
+        self.session.refresh(document)
+        process_rule = self.session.get(DatasetProcessRule, document.dataset_process_rule_id)
+        segments = self.session.scalars(
+            select(DocumentSegment).where(DocumentSegment.document_id == document.id).order_by(DocumentSegment.position)
+        ).all()
+        assert status == 200
+        assert len(dispatched) == 1
+        assert response["document"]["name"] == "Original Name"
+        assert document.name == "Original Name"
+        assert document.doc_form == doc_form
+        assert document.doc_language == "Japanese"
+        assert document.indexing_status == IndexingStatus.WAITING
+        assert document.dataset_process_rule_id != "existing-rule"
+        assert process_rule is not None
+        assert process_rule.mode == "automatic"
+        assert [segment.status for segment in segments] == [SegmentStatus.RE_SEGMENT, SegmentStatus.RE_SEGMENT]
+
+    def test_explicit_mismatched_doc_form_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=IndexStructureType.QA_INDEX,
+            process_rule_id="existing-rule",
+        )
+        account = _account_for_tenant(mock_tenant)
+
+        def unexpected_dispatch(_jobs: object) -> None:
+            raise AssertionError("a rejected update must not dispatch indexing")
+
+        monkeypatch.setattr(document_module, "current_user", account)
+        monkeypatch.setattr(DocumentService, "dispatch_document_indexing", unexpected_dispatch)
+
+        with app.test_request_context(
+            f"/datasets/{mock_dataset.id}/documents/{document.id}/update-by-text",
+            method="POST",
+            json={
+                "doc_form": IndexStructureType.PARAGRAPH_INDEX,
+                "process_rule": {"mode": "automatic"},
+            },
+        ):
+            api = DocumentUpdateByTextApi()
+            with pytest.raises(ValueError, match="doc_form is different from the dataset doc_form"):
+                _unwrap_non_wrapped_controller(type(api).post)(
+                    api,
+                    self.session,
+                    tenant_id=mock_tenant,
+                    dataset_id=mock_dataset.id,
+                    document_id=document.id,
+                )
+
+        self.session.refresh(document)
+        assert document.doc_form == IndexStructureType.QA_INDEX
+        assert document.indexing_status == IndexingStatus.COMPLETED
+
+    def test_name_only_response_failure_rolls_back_in_callers_transaction(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=IndexStructureType.PARAGRAPH_INDEX,
+            process_rule_id="existing-rule",
+        )
+        account = _account_for_tenant(mock_tenant)
+        monkeypatch.setattr(document_module, "current_user", account)
+        monkeypatch.setattr("services.knowledge.dataset_service.current_user", account)
+
+        def fail_response(_document: Document, *, session: Session) -> dict[str, object]:
+            raise RuntimeError("response failed")
+
+        monkeypatch.setattr(document_module, "load_document_detail", fail_response)
+
+        with app.test_request_context(method="POST", json={"name": "Renamed"}):
+            with pytest.raises(RuntimeError, match="response failed"):
+                # The HTTP admission layer owns commit/rollback. Keep the
+                # private parsing helper inside an explicit caller transaction.
+                with self.session.begin_nested():
+                    document_module._update_document_by_text(
+                        self.session,
+                        mock_tenant,
+                        UUID(mock_dataset.id),
+                        UUID(document.id),
+                    )
+
+        self.session.expire_all()
+        stored = self.session.get(Document, document.id)
+        assert stored is not None
+        assert stored.name == "Original Name"
+        assert stored.indexing_status == IndexingStatus.COMPLETED
+
     @patch("controllers.service_api.dataset.document.DocumentService")
     @patch("controllers.service_api.dataset.document.FileService")
     @patch("controllers.service_api.wraps.FeatureService")
@@ -1807,13 +2114,17 @@ class TestDocumentUpdateByTextApiPost(SQLiteControllerTest):
 
         mock_document = make_serializable_document(id="doc-update-text", name="Updated Doc")
         mock_doc_svc.document_create_args_validate.return_value = None
-        mock_doc_svc.save_document_with_dataset_id.return_value = ([mock_document], "batch-1")
+        mock_doc_svc.save_document_with_dataset_id.return_value = nullcontext(([mock_document], "batch-1"))
 
         doc_id = str(uuid.uuid4())
         with app.test_request_context(
             f"/datasets/{mock_dataset.id}/documents/{doc_id}/update-by-text",
             method="POST",
-            json={"name": "Updated Doc", "text": "New content"},
+            json={
+                "name": "Updated Doc",
+                "text": "New content",
+                "doc_form": IndexStructureType.PARAGRAPH_INDEX,
+            },
             headers={"Authorization": "Bearer test_token"},
         ):
             api = DocumentUpdateByTextApi()
@@ -1829,6 +2140,8 @@ class TestDocumentUpdateByTextApiPost(SQLiteControllerTest):
             {"document": _expected_document_response(mock_document), "batch": "batch-1"},
             200,
         )
+        knowledge_config = mock_doc_svc.save_document_with_dataset_id.call_args.kwargs["knowledge_config"]
+        assert "doc_language" not in knowledge_config.model_fields_set
 
     @patch("controllers.service_api.wraps.FeatureService")
     @patch("controllers.service_api.wraps.validate_and_get_api_token")
@@ -1872,21 +2185,37 @@ class TestDocumentAddByFileApiPost(SQLiteControllerTest):
     @patch("controllers.service_api.dataset.document.FileService")
     @patch("controllers.service_api.wraps.FeatureService")
     @patch("controllers.service_api.wraps.validate_and_get_api_token")
-    def test_add_by_file_success_serializes_document_and_batch_shape(
+    def test_add_by_file_keeps_upload_actor_separate_from_document_creator(
         self,
         mock_validate_token,
         mock_feature_svc,
         mock_file_svc_cls,
         mock_doc_svc,
+        monkeypatch: pytest.MonkeyPatch,
         app: Flask,
         mock_tenant,
         mock_dataset,
     ):
         """Test successful document creation by file."""
         _setup_billing_mocks(mock_validate_token, mock_feature_svc, mock_tenant)
+        workspace_owner = make_account(
+            account_id="workspace-owner-id",
+            name="Workspace Owner",
+            email="workspace-owner@example.com",
+            tenant=make_tenant(tenant_id=mock_tenant),
+        )
+        dataset_creator = make_account(
+            account_id="dataset-creator-id",
+            name="Dataset Creator",
+            email="dataset-creator@example.com",
+            tenant=make_tenant(tenant_id=mock_tenant),
+        )
+        monkeypatch.setattr(document_module, "current_user", workspace_owner)
+        mock_dataset.created_by = dataset_creator.id
         mock_dataset.provider = "vendor"
         mock_dataset.indexing_technique = "economy"
         mock_dataset.chunk_structure = None
+        self.session.add(dataset_creator)
         self._persist_dataset(mock_dataset)
 
         mock_upload = _upload_file()
@@ -1894,7 +2223,7 @@ class TestDocumentAddByFileApiPost(SQLiteControllerTest):
 
         mock_document = make_serializable_document(id="doc-create-file", name="File Document")
         mock_doc_svc.document_create_args_validate.return_value = None
-        mock_doc_svc.save_document_with_dataset_id.return_value = ([mock_document], "batch-file")
+        mock_doc_svc.save_document_with_dataset_id.return_value = nullcontext(([mock_document], "batch-file"))
 
         from io import BytesIO
 
@@ -1918,6 +2247,8 @@ class TestDocumentAddByFileApiPost(SQLiteControllerTest):
             {"document": _expected_document_response(mock_document), "batch": "batch-file"},
             200,
         )
+        assert mock_file_svc_cls.return_value.upload_file.call_args.kwargs["user"] is workspace_owner
+        assert mock_doc_svc.save_document_with_dataset_id.call_args.kwargs["account"] is dataset_creator
 
     @patch(
         "controllers.service_api.dataset.document.FeatureService.get_knowledge_file_size_limit",
@@ -2110,10 +2441,11 @@ class TestDocumentUpdateByFileApiPatch(SQLiteControllerTest):
     ):
         """Test legacy POST aliases still dispatch while marked deprecated."""
         _setup_billing_mocks(mock_validate_token, mock_feature_svc, mock_tenant)
-        mock_update_document_by_file.return_value = (
-            make_serializable_document(id="doc-1", batch="batch-1"),
-            "batch-1",
-        )
+        document = make_serializable_document(id="doc-1", batch="batch-1")
+        mock_update_document_by_file.return_value = {
+            "document": _expected_document_response(document),
+            "batch": "batch-1",
+        }
 
         doc_id = str(uuid.uuid4())
         session = sqlite_session
@@ -2132,7 +2464,7 @@ class TestDocumentUpdateByFileApiPatch(SQLiteControllerTest):
             )
 
         assert (response, status) == (
-            {"document": _expected_document_response(mock_update_document_by_file.return_value[0]), "batch": "batch-1"},
+            {"document": _expected_document_response(document), "batch": "batch-1"},
             200,
         )
         mock_update_document_by_file.assert_called_once_with(
@@ -2212,25 +2544,159 @@ class TestDocumentUpdateByFileApiPatch(SQLiteControllerTest):
                     document_id=doc_id,
                 )
 
+    @pytest.mark.parametrize(
+        "doc_form",
+        [IndexStructureType.PARENT_CHILD_INDEX, IndexStructureType.QA_INDEX],
+    )
+    def test_process_rule_only_preserves_omitted_doc_form(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+        doc_form: str,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=doc_form,
+            process_rule_id="existing-rule",
+        )
+        document.doc_language = "Japanese"
+        self.session.commit()
+        workspace_owner = make_account(
+            account_id="workspace-owner-id",
+            name="Workspace Owner",
+            email="workspace-owner@example.com",
+            tenant=make_tenant(tenant_id=mock_tenant),
+        )
+        dispatched: list[object] = []
+
+        class UnexpectedFileService:
+            def __init__(self, _engine: Engine) -> None:
+                raise AssertionError("process-rule-only updates must not upload a file")
+
+        monkeypatch.setattr(document_module, "current_user", workspace_owner)
+        monkeypatch.setattr(document_module, "FileService", UnexpectedFileService)
+        monkeypatch.setattr(DocumentService, "dispatch_document_indexing", dispatched.append)
+
+        with app.test_request_context(
+            f"/datasets/{mock_dataset.id}/documents/{document.id}",
+            method="PATCH",
+            content_type="multipart/form-data",
+            data={"data": json.dumps({"process_rule": {"mode": "automatic"}})},
+        ):
+            api = DocumentApi()
+            response, status = _unwrap_non_wrapped_controller(type(api).patch)(
+                api,
+                self.session,
+                tenant_id=mock_tenant,
+                dataset_id=mock_dataset.id,
+                document_id=document.id,
+            )
+
+        self.session.refresh(document)
+        process_rule = self.session.get(DatasetProcessRule, document.dataset_process_rule_id)
+        segments = self.session.scalars(
+            select(DocumentSegment).where(DocumentSegment.document_id == document.id).order_by(DocumentSegment.position)
+        ).all()
+        assert status == 200
+        assert len(dispatched) == 1
+        assert response["document"]["name"] == "Original Name"
+        assert document.name == "Original Name"
+        assert document.created_by == mock_dataset.created_by
+        assert document.created_by != workspace_owner.id
+        assert document.doc_form == doc_form
+        assert document.doc_language == "Japanese"
+        assert document.indexing_status == IndexingStatus.WAITING
+        assert document.dataset_process_rule_id != "existing-rule"
+        assert process_rule is not None
+        assert process_rule.mode == "automatic"
+        assert [segment.status for segment in segments] == [SegmentStatus.RE_SEGMENT, SegmentStatus.RE_SEGMENT]
+
+    def test_explicit_mismatched_doc_form_is_rejected(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        app: Flask,
+        mock_tenant: str,
+        mock_dataset: Dataset,
+    ) -> None:
+        document = _persist_document_for_update(
+            self.session,
+            mock_dataset,
+            doc_form=IndexStructureType.PARENT_CHILD_INDEX,
+            process_rule_id="existing-rule",
+        )
+        account = _account_for_tenant(mock_tenant)
+
+        def unexpected_dispatch(_jobs: object) -> None:
+            raise AssertionError("a rejected update must not dispatch indexing")
+
+        monkeypatch.setattr(document_module, "current_user", account)
+        monkeypatch.setattr(DocumentService, "dispatch_document_indexing", unexpected_dispatch)
+
+        with app.test_request_context(
+            f"/datasets/{mock_dataset.id}/documents/{document.id}",
+            method="PATCH",
+            content_type="multipart/form-data",
+            data={
+                "data": json.dumps(
+                    {
+                        "doc_form": IndexStructureType.PARAGRAPH_INDEX,
+                        "process_rule": {"mode": "automatic"},
+                    }
+                )
+            },
+        ):
+            api = DocumentApi()
+            with pytest.raises(ValueError, match="doc_form is different from the dataset doc_form"):
+                _unwrap_non_wrapped_controller(type(api).patch)(
+                    api,
+                    self.session,
+                    tenant_id=mock_tenant,
+                    dataset_id=mock_dataset.id,
+                    document_id=document.id,
+                )
+
+        self.session.refresh(document)
+        assert document.doc_form == IndexStructureType.PARENT_CHILD_INDEX
+        assert document.indexing_status == IndexingStatus.COMPLETED
+
     @patch("controllers.service_api.dataset.document.DocumentService")
     @patch("controllers.service_api.dataset.document.FileService")
     @patch("controllers.service_api.wraps.FeatureService")
     @patch("controllers.service_api.wraps.validate_and_get_api_token")
-    def test_update_by_file_success(
+    def test_update_by_file_keeps_upload_actor_separate_from_document_creator(
         self,
         mock_validate_token,
         mock_feature_svc,
         mock_file_svc_cls,
         mock_doc_svc,
+        monkeypatch: pytest.MonkeyPatch,
         app: Flask,
         mock_tenant,
         mock_dataset,
     ):
         """Test successful document update by file."""
         _setup_billing_mocks(mock_validate_token, mock_feature_svc, mock_tenant)
+        workspace_owner = make_account(
+            account_id="workspace-owner-id",
+            name="Workspace Owner",
+            email="workspace-owner@example.com",
+            tenant=make_tenant(tenant_id=mock_tenant),
+        )
+        dataset_creator = make_account(
+            account_id="dataset-creator-id",
+            name="Dataset Creator",
+            email="dataset-creator@example.com",
+            tenant=make_tenant(tenant_id=mock_tenant),
+        )
+        monkeypatch.setattr(document_module, "current_user", workspace_owner)
+        mock_dataset.created_by = dataset_creator.id
         mock_dataset.indexing_technique = "economy"
         mock_dataset.provider = "vendor"
         mock_dataset.chunk_structure = None
+        self.session.add(dataset_creator)
         self._persist_dataset(mock_dataset)
 
         mock_upload = _upload_file()
@@ -2238,12 +2704,15 @@ class TestDocumentUpdateByFileApiPatch(SQLiteControllerTest):
 
         mock_document = make_serializable_document(id="doc-update-file", name="File Document", batch="batch-1")
         mock_doc_svc.document_create_args_validate.return_value = None
-        mock_doc_svc.save_document_with_dataset_id.return_value = ([mock_document], None)
+        mock_doc_svc.save_document_with_dataset_id.return_value = nullcontext(([mock_document], None))
 
         from io import BytesIO
 
         doc_id = str(uuid.uuid4())
-        data = {"file": (BytesIO(b"file content"), "test.pdf", "application/pdf")}
+        data = {
+            "data": json.dumps({"doc_form": IndexStructureType.PARAGRAPH_INDEX}),
+            "file": (BytesIO(b"file content"), "test.pdf", "application/pdf"),
+        }
         with app.test_request_context(
             f"/datasets/{mock_dataset.id}/documents/{doc_id}",
             method="PATCH",
@@ -2264,3 +2733,7 @@ class TestDocumentUpdateByFileApiPatch(SQLiteControllerTest):
             {"document": _expected_document_response(mock_document), "batch": "batch-1"},
             200,
         )
+        knowledge_config = mock_doc_svc.save_document_with_dataset_id.call_args.kwargs["knowledge_config"]
+        assert "doc_language" not in knowledge_config.model_fields_set
+        assert mock_file_svc_cls.return_value.upload_file.call_args.kwargs["user"] is workspace_owner
+        assert mock_doc_svc.save_document_with_dataset_id.call_args.kwargs["account"] is dataset_creator

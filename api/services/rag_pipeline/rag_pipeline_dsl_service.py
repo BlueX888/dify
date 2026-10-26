@@ -14,7 +14,7 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad, unpad
 from flask_login import current_user
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import exists, or_, select
 from sqlalchemy.orm import Session
 
 from core.file import remote_fetcher
@@ -39,8 +39,8 @@ from graphon.nodes.parameter_extractor.entities import ParameterExtractorNodeDat
 from graphon.nodes.question_classifier.entities import QuestionClassifierNodeData
 from graphon.nodes.tool.entities import ToolNodeData
 from models import Account
-from models.dataset import Dataset, DatasetCollectionBinding, Pipeline
-from models.enums import CollectionBindingType, DatasetRuntimeMode
+from models.dataset import Dataset, Document, DocumentSegment, Pipeline
+from models.enums import DatasetRuntimeMode, IndexingStatus
 from models.workflow import Workflow, WorkflowType
 from repositories.knowledge.dataset_read_repository import get_pipeline_dataset
 from services.dsl_content import DSL_MAX_SIZE, dsl_content_size
@@ -88,12 +88,84 @@ class RagPipelineDslService:
     """Import, export, and inspect RAG pipeline DSL using the caller-owned session.
 
     Callers pass a plain ``Session`` (not wrapped in ``.begin()``) and are responsible for calling
-    ``session.commit()`` on success or ``session.rollback()`` on failure.  Methods here only flush
-    when generated IDs are needed mid-operation; they never commit or rollback.
+    ``session.commit()`` on success or ``session.rollback()`` on failure. Import methods only flush
+    when generated IDs are needed; they never commit, rollback, or publish tasks. After a successful
+    commit, callers invoke ``finalize_committed_import`` for best-effort task dispatch and confirmation
+    consumption.
     """
 
     def __init__(self, session: Session):
         self._session = session
+        self._pending_dataset_indexing_intent_ids: list[str] = []
+        self._pending_confirmed_import_keys: list[str] = []
+
+    @property
+    def pending_dataset_indexing_intent_ids(self) -> tuple[str, ...]:
+        """Durable rebuild intents that may be dispatched only after caller commit."""
+        return tuple(self._pending_dataset_indexing_intent_ids)
+
+    def finalize_committed_import(self) -> None:
+        """Run best-effort side effects after the caller commits the import transaction."""
+        # dataset_service imports RagPipelineService, so defer this reverse dependency.
+        from services.knowledge.dataset_service import DatasetService
+
+        DatasetService.dispatch_dataset_indexing(self._pending_dataset_indexing_intent_ids)
+        for redis_key in self._pending_confirmed_import_keys:
+            try:
+                redis_client.delete(redis_key)
+            except Exception:
+                logger.exception("Failed to consume committed RAG pipeline import confirmation, key=%s", redis_key)
+        self._pending_dataset_indexing_intent_ids.clear()
+        self._pending_confirmed_import_keys.clear()
+
+    def _begin_import(self) -> None:
+        self._pending_dataset_indexing_intent_ids.clear()
+        self._pending_confirmed_import_keys.clear()
+
+    def _apply_dataset_configuration(
+        self,
+        *,
+        dataset: Dataset,
+        knowledge_configuration: KnowledgeConfiguration,
+        account: Account,
+        has_published: bool,
+    ) -> None:
+        """Apply desired settings and persist any required rebuild intent in this session."""
+        # dataset_service imports RagPipelineService, so defer this reverse dependency.
+        from services.knowledge.dataset_service import DatasetService
+
+        intent_ids = DatasetService.update_rag_pipeline_dataset_settings(
+            dataset=dataset,
+            knowledge_configuration=knowledge_configuration,
+            has_published=has_published,
+            session=self._session,
+            account=account,
+        )
+        self._pending_dataset_indexing_intent_ids.extend(intent_ids)
+
+    def _dataset_requires_rebuild(self, *, dataset: Dataset, pipeline: Pipeline, dataset_created: bool) -> bool:
+        """Distinguish an unmaterialized new dataset from every existing index owner."""
+        if dataset_created:
+            return False
+        if pipeline.is_published or dataset.indexing_applied_representation or dataset.indexing_request_id:
+            return True
+        return bool(
+            self._session.scalar(
+                select(
+                    or_(
+                        exists().where(
+                            Document.tenant_id == dataset.tenant_id,
+                            Document.dataset_id == dataset.id,
+                            Document.indexing_status == IndexingStatus.COMPLETED,
+                        ),
+                        exists().where(
+                            DocumentSegment.tenant_id == dataset.tenant_id,
+                            DocumentSegment.dataset_id == dataset.id,
+                        ),
+                    )
+                )
+            )
+        )
 
     def import_rag_pipeline(
         self,
@@ -108,6 +180,7 @@ class RagPipelineDslService:
         icon_info: IconInfo | None = None,
     ) -> RagPipelineImportInfo:
         """Import an app from YAML content or URL."""
+        self._begin_import()
         import_id = str(uuid.uuid4())
 
         # Validate import mode
@@ -311,40 +384,20 @@ class RagPipelineDslService:
                             runtime_mode=DatasetRuntimeMode.RAG_PIPELINE,
                             chunk_structure=knowledge_configuration.chunk_structure,
                         )
-                    if knowledge_configuration.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
-                        dataset_collection_binding = self._session.scalar(
-                            select(DatasetCollectionBinding)
-                            .where(
-                                DatasetCollectionBinding.provider_name
-                                == knowledge_configuration.embedding_model_provider,
-                                DatasetCollectionBinding.model_name == knowledge_configuration.embedding_model,
-                                DatasetCollectionBinding.type == CollectionBindingType.DATASET,
-                            )
-                            .order_by(DatasetCollectionBinding.created_at)
-                            .limit(1)
-                        )
-
-                        if not dataset_collection_binding:
-                            dataset_collection_binding = DatasetCollectionBinding(
-                                provider_name=knowledge_configuration.embedding_model_provider,
-                                model_name=knowledge_configuration.embedding_model,
-                                collection_name=Dataset.gen_collection_name_by_id(str(uuid.uuid4())),
-                                type=CollectionBindingType.DATASET,
-                            )
-                            self._session.add(dataset_collection_binding)
-                            self._session.flush()
-                        dataset_collection_binding_id = dataset_collection_binding.id
-                        dataset.collection_binding_id = dataset_collection_binding_id
-                        dataset.embedding_model = knowledge_configuration.embedding_model
-                        dataset.embedding_model_provider = knowledge_configuration.embedding_model_provider
-                    elif knowledge_configuration.indexing_technique == IndexTechniqueType.ECONOMY:
-                        dataset.keyword_number = knowledge_configuration.keyword_number
-                    # Update summary_index_setting if provided
-                    if knowledge_configuration.summary_index_setting is not None:
-                        dataset.summary_index_setting = knowledge_configuration.summary_index_setting
                     dataset.pipeline_id = pipeline.id
+                    dataset.runtime_mode = DatasetRuntimeMode.RAG_PIPELINE
                     self._session.add(dataset)
                     self._session.flush()
+                    self._apply_dataset_configuration(
+                        dataset=dataset,
+                        knowledge_configuration=knowledge_configuration,
+                        account=account,
+                        has_published=self._dataset_requires_rebuild(
+                            dataset=dataset,
+                            pipeline=pipeline,
+                            dataset_created=dataset_created,
+                        ),
+                    )
                     dataset_id = dataset.id
             if not dataset_id:
                 raise ValueError("DSL is not valid, please check the Knowledge Index node.")
@@ -377,6 +430,7 @@ class RagPipelineDslService:
         """
         Confirm an import that requires confirmation
         """
+        self._begin_import()
         redis_key = f"{IMPORT_INFO_REDIS_KEY_PREFIX}{import_id}"
         pending_data = redis_client.get(redis_key)
 
@@ -456,51 +510,26 @@ class RagPipelineDslService:
                             runtime_mode=DatasetRuntimeMode.RAG_PIPELINE,
                             chunk_structure=knowledge_configuration.chunk_structure,
                         )
-                    else:
-                        dataset.indexing_technique = IndexTechniqueType(knowledge_configuration.indexing_technique)
-                        dataset.retrieval_model = knowledge_configuration.retrieval_model.model_dump()
-                        dataset.runtime_mode = DatasetRuntimeMode.RAG_PIPELINE
-                        dataset.chunk_structure = knowledge_configuration.chunk_structure
-                    if knowledge_configuration.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
-                        dataset_collection_binding = self._session.scalar(
-                            select(DatasetCollectionBinding)
-                            .where(
-                                DatasetCollectionBinding.provider_name
-                                == knowledge_configuration.embedding_model_provider,
-                                DatasetCollectionBinding.model_name == knowledge_configuration.embedding_model,
-                                DatasetCollectionBinding.type == CollectionBindingType.DATASET,
-                            )
-                            .order_by(DatasetCollectionBinding.created_at)
-                            .limit(1)
-                        )
-
-                        if not dataset_collection_binding:
-                            dataset_collection_binding = DatasetCollectionBinding(
-                                provider_name=knowledge_configuration.embedding_model_provider,
-                                model_name=knowledge_configuration.embedding_model,
-                                collection_name=Dataset.gen_collection_name_by_id(str(uuid.uuid4())),
-                                type=CollectionBindingType.DATASET,
-                            )
-                            self._session.add(dataset_collection_binding)
-                            self._session.flush()
-                        dataset_collection_binding_id = dataset_collection_binding.id
-                        dataset.collection_binding_id = dataset_collection_binding_id
-                        dataset.embedding_model = knowledge_configuration.embedding_model
-                        dataset.embedding_model_provider = knowledge_configuration.embedding_model_provider
-                    elif knowledge_configuration.indexing_technique == IndexTechniqueType.ECONOMY:
-                        dataset.keyword_number = knowledge_configuration.keyword_number
-                    # Update summary_index_setting if provided
-                    if knowledge_configuration.summary_index_setting is not None:
-                        dataset.summary_index_setting = knowledge_configuration.summary_index_setting
                     dataset.pipeline_id = pipeline.id
+                    dataset.runtime_mode = DatasetRuntimeMode.RAG_PIPELINE
                     self._session.add(dataset)
                     self._session.flush()
+                    self._apply_dataset_configuration(
+                        dataset=dataset,
+                        knowledge_configuration=knowledge_configuration,
+                        account=account,
+                        has_published=self._dataset_requires_rebuild(
+                            dataset=dataset,
+                            pipeline=pipeline,
+                            dataset_created=dataset_created,
+                        ),
+                    )
                     dataset_id = dataset.id
             if not dataset_id:
                 raise ValueError("DSL is not valid, please check the Knowledge Index node.")
 
-            # Delete import info from Redis
-            redis_client.delete(redis_key)
+            # Consume the confirmation only after the caller commits the database transaction.
+            self._pending_confirmed_import_keys.append(redis_key)
 
             return RagPipelineImportInfo(
                 id=import_id,

@@ -1,6 +1,8 @@
 """Document cleanup keeps SQL transactions closed during external index deletion."""
 
 import json
+import logging
+from collections.abc import Callable
 from unittest.mock import MagicMock
 from uuid import uuid4
 
@@ -10,11 +12,34 @@ from sqlalchemy.orm import Session, sessionmaker
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from models.dataset import ChildChunk, Dataset, DatasetKeywordTable, Document, DocumentSegment, DocumentSegmentSummary
 from models.enums import DataSourceType, DocumentCreatedFrom
+from repositories.knowledge.upload_file_repository import SQLAlchemyKnowledgeUploadRepository
 from services.knowledge.indexing.adapters import cleanup
 from services.knowledge.summaries import adapters as summaries
 from tasks.batch_clean_document_task import batch_clean_document_task
 from tasks.clean_document_task import clean_document_task
 from tasks.clean_notion_document_task import clean_notion_document_task
+
+
+def _clean_for_reindex(
+    *,
+    tenant_id: str,
+    dataset_id: str,
+    document_ids: list[str],
+    doc_form: str,
+    new_session: sessionmaker[Session],
+    mutation_guard: Callable[[Session], None] | None = None,
+) -> str | None:
+    return cleanup.clean_document_for_reindex(
+        tenant_id=tenant_id,
+        dataset_id=dataset_id,
+        document_ids=document_ids,
+        doc_form=doc_form,
+        new_session=new_session,
+        uploads=SQLAlchemyKnowledgeUploadRepository(session_factory=new_session),
+        delete_blob=lambda _key: None,
+        logger=logging.getLogger(__name__),
+        mutation_guard=mutation_guard,
+    )
 
 
 @pytest.fixture
@@ -111,7 +136,6 @@ def test_tasks_delete_summary_and_body_indexes_without_an_open_transaction(
     if task_kind != "notion":
         sqlite_session.delete(document)
     sqlite_session.commit()
-    monkeypatch.setattr("tasks.clean_document_task.schedule_billing_vector_space_refresh", lambda _tenant_id: None)
     monkeypatch.setattr(
         "tasks.batch_clean_document_task.schedule_billing_vector_space_refresh", lambda _tenant_id: None
     )
@@ -142,8 +166,77 @@ def test_failed_vector_cleanup_preserves_records_for_retry(
     vector.delete_by_ids.side_effect = RuntimeError("unavailable")
     with pytest.raises(RuntimeError, match="unavailable"):
         cleanup.clean_document_indexes(
-            dataset_id=dataset.id, document_ids=[document.id], doc_form="text_model", new_session=sqlite_session_factory
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            document_ids=[document.id],
+            doc_form="text_model",
+            new_session=sqlite_session_factory,
         )
+    assert sqlite_session.get(DocumentSegmentSummary, summary.id) is not None
+    assert sqlite_session.get(ChildChunk, child.id) is not None
+
+
+def test_claim_guard_is_rechecked_after_external_cleanup_before_relational_writes(
+    graph: tuple[Dataset, Document, DocumentSegment, DocumentSegmentSummary, ChildChunk],
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    vector: MagicMock,
+) -> None:
+    dataset, document, _, summary, child = graph
+    guard_calls = 0
+    vector.delete_by_ids.side_effect = None
+
+    def guard(_session: Session) -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls > 2:
+            raise RuntimeError("claim lost")
+
+    with pytest.raises(RuntimeError, match="claim lost"):
+        _clean_for_reindex(
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            document_ids=[document.id],
+            doc_form="text_model",
+            new_session=sqlite_session_factory,
+            mutation_guard=guard,
+        )
+
+    vector.delete_by_ids.assert_called_once_with(["summary-node", "body-node"])
+    assert guard_calls == 3
+    sqlite_session.expire_all()
+    assert sqlite_session.get(DocumentSegmentSummary, summary.id) is not None
+    assert sqlite_session.get(ChildChunk, child.id) is not None
+
+
+def test_claim_guard_is_rechecked_before_external_vector_cleanup(
+    graph: tuple[Dataset, Document, DocumentSegment, DocumentSegmentSummary, ChildChunk],
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    vector: MagicMock,
+) -> None:
+    dataset, document, _, summary, child = graph
+    guard_calls = 0
+
+    def guard(_session: Session) -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 2:
+            raise RuntimeError("claim lost")
+
+    with pytest.raises(RuntimeError, match="claim lost"):
+        cleanup.clean_document_indexes(
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            document_ids=[document.id],
+            doc_form="text_model",
+            new_session=sqlite_session_factory,
+            mutation_guard=guard,
+        )
+
+    vector.delete_by_ids.assert_not_called()
+    assert guard_calls == 2
+    sqlite_session.expire_all()
     assert sqlite_session.get(DocumentSegmentSummary, summary.id) is not None
     assert sqlite_session.get(ChildChunk, child.id) is not None
 
@@ -159,8 +252,9 @@ def test_cleanup_retries_summaries_after_segments_have_been_deleted(
     dataset, document, segment, summary, _ = graph
     summary_id = summary.id
     sqlite_session.delete(segment)
+    if task_kind != "notion":
+        sqlite_session.delete(document)
     sqlite_session.commit()
-    monkeypatch.setattr("tasks.clean_document_task.schedule_billing_vector_space_refresh", lambda _tenant_id: None)
     monkeypatch.setattr(
         "tasks.batch_clean_document_task.schedule_billing_vector_space_refresh", lambda _tenant_id: None
     )
@@ -202,8 +296,12 @@ def test_cleanup_keeps_other_documents_and_datasets(
     sqlite_session.commit()
     backend = MagicMock()
     monkeypatch.setattr(cleanup, "Vector", MagicMock(return_value=backend))
-    cleanup.clean_document_indexes(
-        dataset_id=dataset.id, document_ids=[document.id], doc_form="text_model", new_session=sqlite_session_factory
+    _clean_for_reindex(
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        document_ids=[document.id],
+        doc_form="text_model",
+        new_session=sqlite_session_factory,
     )
     backend.delete_by_ids.assert_called_once_with(["summary-node", "body-node"])
     sqlite_session.expire_all()
@@ -226,13 +324,71 @@ def test_economy_cleanup_preserves_unrelated_keyword_entries(
     )
     sqlite_session.add(keyword_table)
     sqlite_session.commit()
-    cleanup.clean_document_indexes(
-        dataset_id=dataset.id, document_ids=[document.id], doc_form="text_model", new_session=sqlite_session_factory
+    _clean_for_reindex(
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        document_ids=[document.id],
+        doc_form="text_model",
+        new_session=sqlite_session_factory,
     )
     sqlite_session.refresh(keyword_table)
     assert json.loads(keyword_table.keyword_table)["__data__"]["table"] == {"term": ["unrelated-node"]}
     sqlite_session.expire_all()
     assert sqlite_session.get(DocumentSegmentSummary, summary_id) is None
+
+
+def test_economy_cleanup_lost_claim_does_not_overwrite_file_keyword_table(
+    graph: tuple[Dataset, Document, DocumentSegment, DocumentSegmentSummary, ChildChunk],
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, document, _, _, _ = graph
+    dataset.indexing_technique = IndexTechniqueType.ECONOMY
+    sqlite_session.add(DatasetKeywordTable(dataset_id=dataset.id, data_source_type="file", keyword_table=""))
+    sqlite_session.commit()
+    original = json.dumps({"__data__": {"table": {"term": ["body-node", "unrelated-node"]}}}).encode()
+
+    class KeywordStorage:
+        def __init__(self) -> None:
+            self.writes: list[tuple[str, bytes]] = []
+            self.deletes: list[str] = []
+
+        def load_once(self, _key: str) -> bytes:
+            return original
+
+        def exists(self, _key: str) -> bool:
+            return True
+
+        def delete(self, key: str) -> None:
+            self.deletes.append(key)
+
+        def save(self, key: str, data: bytes) -> None:
+            self.writes.append((key, data))
+
+    storage = KeywordStorage()
+    monkeypatch.setattr("core.rag.datasource.keyword.jieba.jieba.storage", storage)
+    guard_calls = 0
+
+    def guard(_session: Session) -> None:
+        nonlocal guard_calls
+        guard_calls += 1
+        if guard_calls == 2:
+            raise RuntimeError("claim lost")
+
+    with pytest.raises(RuntimeError, match="claim lost"):
+        cleanup.clean_document_indexes(
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            document_ids=[document.id],
+            doc_form="text_model",
+            new_session=sqlite_session_factory,
+            mutation_guard=guard,
+        )
+
+    assert guard_calls == 2
+    assert storage.deletes == []
+    assert storage.writes == []
 
 
 def test_legacy_summary_delete_does_not_commit_callers_transaction(
@@ -269,10 +425,39 @@ def test_empty_document_selection_does_not_clear_the_dataset_index(
     dataset, _, segment, summary, child = graph
     assert (
         cleanup.clean_document_indexes(
-            dataset_id=dataset.id, document_ids=[], doc_form="text_model", new_session=sqlite_session_factory
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            document_ids=[],
+            doc_form="text_model",
+            new_session=sqlite_session_factory,
         )
         is None
     )
+    vector.delete_by_ids.assert_not_called()
+    assert sqlite_session.get(DocumentSegment, segment.id) is not None
+    assert sqlite_session.get(DocumentSegmentSummary, summary.id) is not None
+    assert sqlite_session.get(ChildChunk, child.id) is not None
+
+
+def test_cleanup_rejects_a_dataset_owned_by_another_tenant(
+    graph: tuple[Dataset, Document, DocumentSegment, DocumentSegmentSummary, ChildChunk],
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    vector: MagicMock,
+) -> None:
+    dataset, document, segment, summary, child = graph
+
+    assert (
+        cleanup.clean_document_indexes(
+            tenant_id=str(uuid4()),
+            dataset_id=dataset.id,
+            document_ids=[document.id],
+            doc_form="text_model",
+            new_session=sqlite_session_factory,
+        )
+        is None
+    )
+
     vector.delete_by_ids.assert_not_called()
     assert sqlite_session.get(DocumentSegment, segment.id) is not None
     assert sqlite_session.get(DocumentSegmentSummary, summary.id) is not None

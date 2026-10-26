@@ -7,10 +7,24 @@ and don't contain implementation details like tenant_id, app_id, etc.
 """
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
 
 from core.workflow.nodes.human_input.pause_reason import PauseReason as DifyPauseReason
+
+
+@dataclass(frozen=True)
+class WorkflowTriggerPausePublication:
+    """Owner-fenced trigger fields committed with one durable workflow pause."""
+
+    trigger_log_id: str
+    owner_id: str
+    workflow_run_id: str
+    outputs: str
+    elapsed_time: float
+    total_tokens: int
+    finished_at: datetime
 
 
 class WorkflowPauseEntity(Protocol):
@@ -36,6 +50,16 @@ class WorkflowPauseEntity(Protocol):
         """The identifier of the workflow execution record the pause associated with.
         Correspond to `WorkflowExecution.id`.
         """
+        ...
+
+    @property
+    def history_revision(self) -> int | None:
+        """Committed history revision, when this pause published one."""
+        ...
+
+    @property
+    def history_claim_id(self) -> str | None:
+        """Exact history publication claim owned by the current caller."""
         ...
 
     def get_state(self) -> bytes:

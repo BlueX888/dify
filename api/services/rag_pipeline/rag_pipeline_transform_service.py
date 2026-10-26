@@ -108,7 +108,9 @@ class RagPipelineTransformService:
         dataset.pipeline_id = pipeline.id
 
         # deal document data
-        self._deal_document_data(dataset, session)
+        if pipeline.workflow_id is None:
+            raise ValueError("Published pipeline workflow is required")
+        self._deal_document_data(dataset, workflow_id=pipeline.workflow_id, session=session)
 
         session.commit()
         return {
@@ -343,7 +345,7 @@ class RagPipelineTransformService:
             "status": "success",
         }
 
-    def _deal_document_data(self, dataset: Dataset, session: Session):
+    def _deal_document_data(self, dataset: Dataset, *, workflow_id: str, session: Session):
         file_node_id = "1752479895761"
         notion_node_id = "1752489759475"
         jina_node_id = "1752491761974"
@@ -386,6 +388,8 @@ class RagPipelineTransformService:
                             input_data={},
                             created_by=document.created_by,
                             datasource_node_id=file_node_id,
+                            workflow_id=workflow_id,
+                            original_document_id=document.id,
                         )
                         document_pipeline_execution_log.created_at = document.created_at
                         session.add(document)
@@ -414,6 +418,8 @@ class RagPipelineTransformService:
                     input_data={},
                     created_by=document.created_by,
                     datasource_node_id=notion_node_id,
+                    workflow_id=workflow_id,
+                    original_document_id=document.id,
                 )
                 document_pipeline_execution_log.created_at = document.created_at
                 session.add(document)
@@ -442,6 +448,8 @@ class RagPipelineTransformService:
                     input_data={},
                     created_by=document.created_by,
                     datasource_node_id=datasource_node_id,
+                    workflow_id=workflow_id,
+                    original_document_id=document.id,
                 )
                 document_pipeline_execution_log.created_at = document.created_at
                 session.add(document)

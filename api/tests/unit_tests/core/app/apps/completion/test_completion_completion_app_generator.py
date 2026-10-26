@@ -1,7 +1,7 @@
 import contextlib
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +12,7 @@ import core.app.apps.completion.app_generator as module
 from core.app.apps.completion.app_generator import CompletionAppGenerator
 from core.app.apps.exc import GenerateTaskStoppedError
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError
 from models import Account
 from models.enums import ConversationFromSource
@@ -24,7 +25,9 @@ TABLES = (AppModelConfig, Conversation, Message)
 
 @pytest.fixture
 def generator(mocker: MockerFixture):
-    gen = CompletionAppGenerator()
+    gen = CompletionAppGenerator(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    )
 
     mocker.patch.object(module, "copy_current_request_context", side_effect=lambda fn: fn)
 

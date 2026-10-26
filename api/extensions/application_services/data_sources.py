@@ -13,6 +13,7 @@ from core.plugin.impl.oauth import OAuthHandler
 from repositories.data_source.api_key_auth_repository import SQLAlchemyDataSourceApiKeyAuthBindingRepository
 from repositories.data_source.credential_repository import SQLAlchemyDatasourceCredentialRepository
 from repositories.data_source.oauth_binding_repository import SQLAlchemyDataSourceOAuthBindingRepository
+from repositories.data_source.website_crawl_job_repository import SQLAlchemyWebsiteCrawlJobRepository
 from repositories.knowledge.dataset_repository import SQLAlchemyDatasetRepository
 from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
 from services.data_source.auth.api_key_gateways import (
@@ -42,6 +43,7 @@ from services.knowledge.dataset_access import DatasetAccessService
 @dataclass(frozen=True, slots=True)
 class DataSourceServices:
     providers: DatasourceProviderService
+    website: WebsiteService
     api_key_auth: DataSourceApiKeyAuthService
     oauth: Mapping[str, DataSourceOAuthService]
     bindings: DataSourceBindingApplicationService
@@ -94,6 +96,10 @@ def build_data_source_services(
     )
     return DataSourceServices(
         providers=providers,
+        website=WebsiteService(
+            providers=providers,
+            crawl_jobs=SQLAlchemyWebsiteCrawlJobRepository(session_factory=database_client),
+        ),
         api_key_auth=DataSourceApiKeyAuthService(
             bindings=SQLAlchemyDataSourceApiKeyAuthBindingRepository(session_factory=database_client),
             validator=ProviderApiKeyAuthCredentialValidator(),
@@ -121,4 +127,7 @@ def build_data_source_services(
 
 
 def build_website_service(*, database_client: sessionmaker[Session]) -> WebsiteService:
-    return WebsiteService(providers=build_data_source_credentials(database_client=database_client).providers)
+    return WebsiteService(
+        providers=build_data_source_credentials(database_client=database_client).providers,
+        crawl_jobs=SQLAlchemyWebsiteCrawlJobRepository(session_factory=database_client),
+    )

@@ -12,6 +12,7 @@ from core.tools.utils.message_transformer import ToolFileMessageTransformer
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 
 class PluginToolBackwardsInvocation(BaseBackwardsInvocation):
@@ -32,6 +33,7 @@ class PluginToolBackwardsInvocation(BaseBackwardsInvocation):
         credential_id: str | None = None,
         *,
         execution_driver: "WorkflowRunDriver",
+        external_retrieval: "ExternalDatasetRetriever",
     ) -> Generator[ToolInvokeMessage]:
         """
         invoke tool
@@ -47,6 +49,7 @@ class PluginToolBackwardsInvocation(BaseBackwardsInvocation):
                 user_id=user_id,
                 credential_id=credential_id,
                 execution_driver=execution_driver,
+                external_retrieval=external_retrieval,
             )
             response = ToolEngine.generic_invoke(
                 session, tool_runtime, tool_parameters, user_id, DifyWorkflowCallbackHandler(), workflow_call_depth=1

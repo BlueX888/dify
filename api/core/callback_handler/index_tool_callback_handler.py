@@ -68,6 +68,18 @@ class DatasetIndexToolCallbackHandler:
                             document_id,
                         )
                         continue
+                    segment_id = document.metadata.get("segment_id")
+                    if isinstance(segment_id, str) and segment_id:
+                        independent_session.execute(
+                            update(DocumentSegment)
+                            .where(
+                                DocumentSegment.id == segment_id,
+                                DocumentSegment.dataset_id == dataset_document.dataset_id,
+                                DocumentSegment.document_id == dataset_document.id,
+                            )
+                            .values(hit_count=DocumentSegment.hit_count + 1)
+                        )
+                        continue
                     if dataset_document.doc_form == IndexStructureType.PARENT_CHILD_INDEX:
                         child_chunk_stmt = select(ChildChunk).where(
                             ChildChunk.index_node_id == document.metadata["doc_id"],

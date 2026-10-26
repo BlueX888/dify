@@ -3,20 +3,86 @@ import json
 import logging
 import sys
 import types
+from collections.abc import Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from typing import cast
+from unittest.mock import MagicMock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
 from sqlalchemy.orm import Session
 
+from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom
+from core.app.file_access import FileAccessScope, bind_file_access_scope
+from core.rag.datasource.vdb.vector_base import BaseVector
+from core.rag.embedding.embedding_base import Embeddings
 from core.rag.models.document import Document
 from extensions.storage.storage_type import StorageType
 from models.dataset import Dataset, Whitelist
 from models.enums import CreatorUserRole
 from models.model import UploadFile
 from tests.unit_tests.config_override import apply_config_overrides
+
+
+class _EventEmbeddings:
+    def __init__(self, events: list[str], *, error: Exception | None = None) -> None:
+        self._events = events
+        self._error = error
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        if self._error is not None:
+            raise self._error
+        self._events.append("embedded")
+        return [[0.1] for _ in texts]
+
+
+@dataclass(frozen=True)
+class _VectorCreateCall:
+    texts: tuple[Document, ...]
+    embeddings: tuple[tuple[float, ...], ...]
+    duplicate_check: bool
+
+
+class _RecordingVectorProcessor:
+    def __init__(self, events: list[str]) -> None:
+        self._events = events
+        self.create_calls: list[_VectorCreateCall] = []
+
+    def create(
+        self,
+        *,
+        texts: Sequence[Document],
+        embeddings: Sequence[Sequence[float]],
+        duplicate_check: bool = False,
+    ) -> None:
+        self._events.append("processor-write")
+        self.create_calls.append(
+            _VectorCreateCall(
+                texts=tuple(texts),
+                embeddings=tuple(tuple(embedding) for embedding in embeddings),
+                duplicate_check=duplicate_check,
+            )
+        )
+
+
+class _MultimodalEmbeddings:
+    def __init__(self) -> None:
+        self.calls: list[tuple[dict[str, object], ...]] = []
+
+    def embed_multimodal_documents(self, documents: list[dict[str, object]]) -> list[list[float]]:
+        self.calls.append(tuple(documents))
+        return [[0.1] for _ in documents]
+
+
+class _RecordingMultimodalProcessor:
+    def __init__(self) -> None:
+        self.create_calls: list[tuple[Document, ...]] = []
+
+    def create(self, *, texts: Sequence[Document], embeddings: Sequence[Sequence[float]]) -> None:
+        assert len(texts) == len(embeddings)
+        self.create_calls.append(tuple(texts))
 
 
 def _dataset(**overrides) -> Dataset:
@@ -451,29 +517,178 @@ def test_create_multimodal_filters_missing_uploads(
     vector._session = sqlite_session
     vector._dataset = Dataset(tenant_id=upload_file.tenant_id, name="dataset", created_by=upload_file.created_by)
     monkeypatch.setattr(vector_factory_module.storage, "load_once", MagicMock(return_value=b"abc"))
+    events: list[object] = []
+    vector._embeddings.embed_multimodal_documents.side_effect = lambda _documents: (
+        events.append("embedded") or [[0.1, 0.2]]
+    )
+    vector._vector_processor.create.side_effect = lambda **_kwargs: events.append("processor-write")
 
     docs = [
-        Document(page_content="file-1", metadata={"doc_id": upload_file.id, "doc_type": "image"}),
+        Document(
+            page_content="file-1",
+            metadata={"doc_id": upload_file.id, "doc_type": "image", "document_id": "logical-document"},
+        ),
         Document(page_content="file-2", metadata={"doc_id": str(uuid4()), "doc_type": "image"}),
     ]
 
-    vector.create_multimodal(file_documents=docs, request_id="r-1")
+    vector.create_multimodal(
+        file_documents=docs,
+        before_write=lambda attachment_ids: events.append(("before-write", attachment_ids)),
+        after_write=lambda attachment_ids: events.append(("after-write", attachment_ids)),
+        request_id="r-1",
+    )
 
     file_base64 = base64.b64encode(b"abc").decode()
     vector._embeddings.embed_multimodal_documents.assert_called_once_with(
         [{"content": file_base64, "content_type": "image", "file_id": upload_file.id}]
     )
-    vector._vector_processor.create.assert_called_once_with(
-        texts=[docs[0]],
-        embeddings=[[0.1, 0.2]],
-        request_id="r-1",
-    )
+    create_call = vector._vector_processor.create.call_args
+    assert create_call.kwargs["embeddings"] == [[0.1, 0.2]]
+    assert create_call.kwargs["request_id"] == "r-1"
+    assert [document.metadata["document_id"] for document in create_call.kwargs["texts"]] == [upload_file.id]
+    assert docs[0].metadata["document_id"] == "logical-document"
+    assert events == [
+        "embedded",
+        ("before-write", (upload_file.id,)),
+        "processor-write",
+        ("after-write", (upload_file.id,)),
+    ]
 
     vector._embeddings.embed_multimodal_documents.reset_mock()
     vector._vector_processor.create.reset_mock()
     vector.create_multimodal(file_documents=None)
     vector._embeddings.embed_multimodal_documents.assert_not_called()
     vector._vector_processor.create.assert_not_called()
+
+    started: list[tuple[str, ...]] = []
+    completed: list[tuple[str, ...]] = []
+    vector._vector_processor.create.side_effect = RuntimeError("backend write failed")
+    with pytest.raises(RuntimeError, match="backend write failed"):
+        vector.create_multimodal(
+            file_documents=[docs[0]],
+            upload_files={upload_file.id: upload_file},
+            before_write=started.append,
+            after_write=completed.append,
+        )
+    assert started == [(upload_file.id,)]
+    assert completed == []
+
+
+def test_create_multimodal_reports_only_batches_that_reach_the_backend_before_later_local_failure(
+    vector_factory_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = str(uuid4())
+    creator_id = str(uuid4())
+    attachment_ids = [str(uuid4()) for _ in range(1001)]
+    uploads: dict[str, UploadFile] = {}
+    documents: list[Document] = []
+    for position, attachment_id in enumerate(attachment_ids):
+        upload = UploadFile(
+            tenant_id=tenant_id,
+            storage_type=StorageType.LOCAL,
+            key=f"key-{position}",
+            name=f"image-{position}.png",
+            size=3,
+            extension="png",
+            mime_type="image/png",
+            created_by_role=CreatorUserRole.ACCOUNT,
+            created_by=creator_id,
+            created_at=datetime.now(UTC),
+            used=True,
+        )
+        upload.id = attachment_id
+        uploads[attachment_id] = upload
+        documents.append(Document(page_content="image", metadata={"doc_id": attachment_id, "doc_type": "image"}))
+
+    load_count = 0
+
+    def load_until_second_batch(_key: str) -> bytes:
+        nonlocal load_count
+        load_count += 1
+        if load_count > 1000:
+            raise OSError("second batch local read failed")
+        return b"abc"
+
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    embeddings = _MultimodalEmbeddings()
+    processor = _RecordingMultimodalProcessor()
+    vector._embeddings = cast(Embeddings, embeddings)
+    vector._vector_processor = cast(BaseVector, processor)
+    vector._session = None
+    vector._dataset = Dataset(tenant_id=tenant_id, name="dataset", created_by=creator_id)
+    monkeypatch.setattr(vector_factory_module.storage, "load_once", load_until_second_batch)
+    submitted_batches: list[tuple[str, ...]] = []
+    completed_batches: list[tuple[str, ...]] = []
+
+    with pytest.raises(OSError, match="second batch local read failed"):
+        vector.create_multimodal(
+            file_documents=documents,
+            upload_files=uploads,
+            before_write=submitted_batches.append,
+            after_write=completed_batches.append,
+        )
+
+    assert submitted_batches == [tuple(attachment_ids[:1000])]
+    assert completed_batches == [tuple(attachment_ids[:1000])]
+    assert len(processor.create_calls) == 1
+    first_batch = processor.create_calls[0]
+    assert [document.metadata["doc_id"] for document in first_batch] == attachment_ids[:1000]
+    assert [document.metadata["document_id"] for document in first_batch] == attachment_ids[:1000]
+
+
+def test_create_multimodal_stably_deduplicates_attachment_ids_before_batching(
+    vector_factory_module,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = str(uuid4())
+    creator_id = str(uuid4())
+    attachment_ids = [str(uuid4()) for _ in range(1000)]
+    uploads: dict[str, UploadFile] = {}
+    documents: list[Document] = []
+    for position, attachment_id in enumerate(attachment_ids):
+        upload = UploadFile(
+            tenant_id=tenant_id,
+            storage_type=StorageType.LOCAL,
+            key=f"key-{position}",
+            name=f"image-{position}.png",
+            size=3,
+            extension="png",
+            mime_type="image/png",
+            created_by_role=CreatorUserRole.ACCOUNT,
+            created_by=creator_id,
+            created_at=datetime.now(UTC),
+            used=True,
+        )
+        upload.id = attachment_id
+        uploads[attachment_id] = upload
+        documents.append(Document(page_content="image", metadata={"doc_id": attachment_id, "doc_type": "image"}))
+    documents.append(Document(page_content="duplicate", metadata={"doc_id": attachment_ids[0], "doc_type": "image"}))
+
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    embeddings = _MultimodalEmbeddings()
+    processor = _RecordingMultimodalProcessor()
+    vector._embeddings = cast(Embeddings, embeddings)
+    vector._vector_processor = cast(BaseVector, processor)
+    vector._session = None
+    vector._dataset = Dataset(tenant_id=tenant_id, name="dataset", created_by=creator_id)
+    monkeypatch.setattr(vector_factory_module.storage, "load_once", lambda _key: b"abc")
+    submitted_batches: list[tuple[str, ...]] = []
+    completed_batches: list[tuple[str, ...]] = []
+
+    vector.create_multimodal(
+        file_documents=documents,
+        upload_files=uploads,
+        before_write=submitted_batches.append,
+        after_write=completed_batches.append,
+    )
+
+    expected_batch = tuple(attachment_ids)
+    assert submitted_batches == [expected_batch]
+    assert completed_batches == [expected_batch]
+    assert len(processor.create_calls) == 1
+    assert [document.metadata["doc_id"] for document in processor.create_calls[0]] == attachment_ids
+    assert [document.metadata["document_id"] for document in processor.create_calls[0]] == attachment_ids
 
 
 def test_add_texts_with_optional_duplicate_check(vector_factory_module):
@@ -504,6 +719,45 @@ def test_add_texts_with_optional_duplicate_check(vector_factory_module):
 
     vector._filter_duplicate_texts.assert_not_called()
     vector._vector_processor.create.assert_called_once()
+
+
+def test_add_texts_marks_boundary_after_embedding_and_before_processor_write(
+    vector_factory_module: types.ModuleType,
+) -> None:
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    events: list[str] = []
+    vector._embeddings = _EventEmbeddings(events)
+    vector._vector_processor = _RecordingVectorProcessor(events)
+    document = Document(page_content="summary", metadata={"doc_id": "node-1"})
+
+    vector.add_texts(
+        [document],
+        before_write=lambda: events.append("write-started"),
+        duplicate_check=False,
+    )
+
+    assert events == ["embedded", "write-started", "processor-write"]
+    assert vector._vector_processor.create_calls == [
+        _VectorCreateCall(texts=(document,), embeddings=((0.1,),), duplicate_check=False)
+    ]
+
+
+def test_add_texts_does_not_mark_boundary_when_embedding_fails(vector_factory_module: types.ModuleType) -> None:
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    events: list[str] = []
+    vector._embeddings = _EventEmbeddings(events, error=ValueError("embedding configuration is invalid"))
+    vector._vector_processor = _RecordingVectorProcessor(events)
+
+    def before_write() -> None:
+        events.append("write-started")
+
+    document = Document(page_content="summary", metadata={"doc_id": "node-1"})
+
+    with pytest.raises(ValueError, match="configuration is invalid"):
+        vector.add_texts([document], before_write=before_write)
+
+    assert events == []
+    assert vector._vector_processor.create_calls == []
 
 
 def test_add_texts_skips_empty_text_documents(vector_factory_module):
@@ -567,23 +821,36 @@ def test_vector_delegation_methods(vector_factory_module):
     vector._vector_processor.delete_by_metadata_field.assert_called_once_with("doc_id", "doc-1")
 
 
-def test_search_by_file_handles_missing_and_existing_upload(
-    vector_factory_module, monkeypatch: pytest.MonkeyPatch, sqlite_session: Session
-):
+def test_search_by_file_rejects_missing_upload_before_io(vector_factory_module, sqlite_session: Session):
     vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
-    vector._embeddings = MagicMock()
-    vector._vector_processor = MagicMock()
-
+    vector._dataset = _dataset()
+    vector._embeddings = create_autospec(vector_factory_module.Embeddings, instance=True, spec_set=True)
+    vector._vector_processor = create_autospec(vector_factory_module.BaseVector, instance=True, spec_set=True)
     vector._session = sqlite_session
-    missing_id = str(uuid4())
 
-    assert vector.search_by_file(missing_id) == []
+    with (
+        patch.object(vector_factory_module.storage, "load_once", autospec=True) as load_once,
+        pytest.raises(ValueError, match="Attachment file is not accessible"),
+    ):
+        vector.search_by_file(str(uuid4()))
 
+    load_once.assert_not_called()
+    vector._embeddings.embed_multimodal_query.assert_not_called()
+    vector._vector_processor.search_by_vector.assert_not_called()
+
+
+def test_search_by_file_rejects_foreign_tenant_before_io(vector_factory_module, sqlite_session: Session):
+    dataset_tenant_id = str(uuid4())
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    vector._dataset = _dataset(tenant_id=dataset_tenant_id)
+    vector._embeddings = create_autospec(vector_factory_module.Embeddings, instance=True, spec_set=True)
+    vector._vector_processor = create_autospec(vector_factory_module.BaseVector, instance=True, spec_set=True)
+    vector._session = sqlite_session
     upload_file = UploadFile(
         tenant_id=str(uuid4()),
         storage_type=StorageType.LOCAL,
-        key="blob-key",
-        name="query.png",
+        key="foreign-blob-key",
+        name="foreign-query.png",
         size=10,
         extension="png",
         mime_type="image/png",
@@ -594,16 +861,146 @@ def test_search_by_file_handles_missing_and_existing_upload(
     )
     sqlite_session.add(upload_file)
     sqlite_session.commit()
-    monkeypatch.setattr(vector_factory_module.storage, "load_once", MagicMock(return_value=b"file-bytes"))
+    with (
+        patch.object(vector_factory_module.storage, "load_once", autospec=True) as load_once,
+        pytest.raises(ValueError, match="Attachment file is not accessible"),
+    ):
+        vector.search_by_file(upload_file.id)
+
+    load_once.assert_not_called()
+    vector._embeddings.embed_multimodal_query.assert_not_called()
+    vector._vector_processor.search_by_vector.assert_not_called()
+
+
+def test_search_by_file_rejects_other_end_user_before_io(vector_factory_module, sqlite_session: Session):
+    tenant_id = str(uuid4())
+    requesting_user_id = str(uuid4())
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    vector._dataset = _dataset(tenant_id=tenant_id)
+    vector._embeddings = create_autospec(vector_factory_module.Embeddings, instance=True, spec_set=True)
+    vector._vector_processor = create_autospec(vector_factory_module.BaseVector, instance=True, spec_set=True)
+    vector._session = sqlite_session
+    upload_file = UploadFile(
+        tenant_id=tenant_id,
+        storage_type=StorageType.LOCAL,
+        key="other-user-blob-key",
+        name="other-user-query.png",
+        size=10,
+        extension="png",
+        mime_type="image/png",
+        created_by_role=CreatorUserRole.END_USER,
+        created_by=str(uuid4()),
+        created_at=datetime.now(UTC),
+        used=True,
+    )
+    sqlite_session.add(upload_file)
+    sqlite_session.commit()
+    scope = FileAccessScope(
+        tenant_id=tenant_id,
+        user_id=requesting_user_id,
+        user_from=UserFrom.END_USER,
+        invoke_from=InvokeFrom.SERVICE_API,
+    )
+
+    with (
+        bind_file_access_scope(scope),
+        patch.object(vector_factory_module.storage, "load_once", autospec=True) as load_once,
+        pytest.raises(ValueError, match="Attachment file is not accessible"),
+    ):
+        vector.search_by_file(upload_file.id)
+
+    load_once.assert_not_called()
+    vector._embeddings.embed_multimodal_query.assert_not_called()
+    vector._vector_processor.search_by_vector.assert_not_called()
+
+
+def test_search_by_file_allows_owned_upload(vector_factory_module, sqlite_session: Session):
+    tenant_id = str(uuid4())
+    user_id = str(uuid4())
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    vector._dataset = _dataset(tenant_id=tenant_id)
+    vector._embeddings = create_autospec(vector_factory_module.Embeddings, instance=True, spec_set=True)
+    vector._vector_processor = create_autospec(vector_factory_module.BaseVector, instance=True, spec_set=True)
+    vector._session = sqlite_session
+    upload_file = UploadFile(
+        tenant_id=tenant_id,
+        storage_type=StorageType.LOCAL,
+        key="blob-key",
+        name="query.png",
+        size=10,
+        extension="png",
+        mime_type="image/png",
+        created_by_role=CreatorUserRole.END_USER,
+        created_by=user_id,
+        created_at=datetime.now(UTC),
+        used=True,
+    )
+    sqlite_session.add(upload_file)
+    sqlite_session.commit()
     vector._embeddings.embed_multimodal_query.return_value = [0.3, 0.4]
     vector._vector_processor.search_by_vector.return_value = ["hit"]
+    scope = FileAccessScope(
+        tenant_id=tenant_id,
+        user_id=user_id,
+        user_from=UserFrom.END_USER,
+        invoke_from=InvokeFrom.SERVICE_API,
+    )
 
-    result = vector.search_by_file(upload_file.id, top_k=2)
+    with (
+        bind_file_access_scope(scope),
+        patch.object(vector_factory_module.storage, "load_once", autospec=True, return_value=b"file-bytes"),
+    ):
+        result = vector.search_by_file(upload_file.id, top_k=2)
 
     assert result == ["hit"]
     payload = vector._embeddings.embed_multimodal_query.call_args.args[0]
     assert payload["content_type"] == vector_factory_module.DocType.IMAGE
     assert payload["file_id"] == upload_file.id
+
+
+def test_search_by_file_allows_same_tenant_upload_for_account_scope(vector_factory_module, sqlite_session: Session):
+    tenant_id = str(uuid4())
+    vector = vector_factory_module.Vector.__new__(vector_factory_module.Vector)
+    vector._dataset = _dataset(tenant_id=tenant_id)
+    vector._embeddings = create_autospec(vector_factory_module.Embeddings, instance=True, spec_set=True)
+    vector._vector_processor = create_autospec(vector_factory_module.BaseVector, instance=True, spec_set=True)
+    vector._session = sqlite_session
+    upload_file = UploadFile(
+        tenant_id=tenant_id,
+        storage_type=StorageType.LOCAL,
+        key="workspace-blob-key",
+        name="workspace-query.png",
+        size=10,
+        extension="png",
+        mime_type="image/png",
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by=str(uuid4()),
+        created_at=datetime.now(UTC),
+        used=True,
+    )
+    sqlite_session.add(upload_file)
+    sqlite_session.commit()
+    vector._embeddings.embed_multimodal_query.return_value = [0.3, 0.4]
+    vector._vector_processor.search_by_vector.return_value = ["hit"]
+    scope = FileAccessScope(
+        tenant_id=tenant_id,
+        user_id=str(uuid4()),
+        user_from=UserFrom.ACCOUNT,
+        invoke_from=InvokeFrom.EXPLORE,
+    )
+
+    with (
+        bind_file_access_scope(scope),
+        patch.object(
+            vector_factory_module.storage, "load_once", autospec=True, return_value=b"file-bytes"
+        ) as load_once,
+    ):
+        result = vector.search_by_file(upload_file.id, top_k=2)
+
+    assert result == ["hit"]
+    load_once.assert_called_once_with(upload_file.key)
+    vector._embeddings.embed_multimodal_query.assert_called_once()
+    vector._vector_processor.search_by_vector.assert_called_once_with([0.3, 0.4], top_k=2)
 
 
 def test_delete_clears_redis_cache_when_collection_exists(vector_factory_module, monkeypatch: pytest.MonkeyPatch):

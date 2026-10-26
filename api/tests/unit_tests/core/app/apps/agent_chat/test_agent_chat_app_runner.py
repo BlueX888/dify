@@ -1,4 +1,5 @@
 from collections.abc import Generator, Iterator, Mapping
+from unittest.mock import create_autospec
 
 import pytest
 from sqlalchemy import event, select
@@ -18,6 +19,7 @@ from core.moderation.base import ModerationError
 from core.moderation.input_moderation import InputModeration
 from core.plugin.entities.plugin_daemon import PluginLLMNumTokensResponse
 from core.plugin.impl.model import PluginModelClient
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.model_runtime.entities.llm_entities import LLMMode, LLMResultChunk, LLMResultChunkDelta, LLMUsage
 from graphon.model_runtime.entities.message_entities import AssistantPromptMessage
 from graphon.model_runtime.entities.model_entities import ModelFeature, ModelPropertyKey
@@ -38,7 +40,10 @@ def _assert_direct_output(agent_queue_manager: MessageBasedAppQueueManager, text
 @pytest.fixture
 def runner(agent_records: tuple[Conversation, Message]) -> AgentChatAppRunner:
     assert agent_records[0].id == "conv"
-    return AgentChatAppRunner(execution_driver=WorkflowRunAgg.run)
+    return AgentChatAppRunner(
+        execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+    )
 
 
 def _records(session: Session) -> tuple[Conversation, Message]:

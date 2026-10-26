@@ -4,9 +4,9 @@ import time
 from collections.abc import Callable
 from enum import StrEnum, auto
 from functools import wraps
-from typing import Protocol, cast, overload
+from typing import Concatenate, NamedTuple, Protocol, cast, overload
 
-from flask import current_app, request
+from flask import current_app, g, request
 from flask_login import user_logged_in
 from flask_restx import Resource
 from flask_restx.utils import merge
@@ -24,11 +24,13 @@ from controllers.service_api.schema import (
     USER_QUERY_PARAM,
     USER_REQUIRED_ATTR,
 )
+from core.logging.context import get_request_id, get_trace_id
 from enums import CloudPlan, DeploymentEdition
 from extensions.ext_application_services import application_services
 from extensions.ext_database import db
 from extensions.ext_redis import redis_client
-from libs.login import current_user
+from libs.login import current_account_with_tenant, current_user
+from machinery.context import RequestContext
 from models import Account, Tenant, TenantAccountJoin, TenantStatus
 from models.dataset import Dataset, RateLimitLog
 from models.model import ApiToken
@@ -60,6 +62,15 @@ class WhereisUserArg(StrEnum):
 class FetchUserArg(BaseModel):
     fetch_from: WhereisUserArg
     required: bool = False
+
+
+class _DatasetAdmission(NamedTuple):
+    bearer_token: str
+    dataset_id: str | None
+    tenant_id: str
+
+
+_DATASET_ADMISSION_CONTEXT_KEY = "_service_api_dataset_admission"
 
 
 APP_TOKEN_FORBIDDEN_RESPONSE = {
@@ -284,19 +295,65 @@ def cloud_edition_billing_knowledge_limit_check[**P, R](
     return interceptor
 
 
+def _normalize_dataset_id(value: object | None) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _dataset_id_from_request_call(args: tuple[object, ...], kwargs: dict[str, object]) -> str | None:
+    dataset_id = kwargs.get("dataset_id")
+    if dataset_id is None and request.view_args:
+        dataset_id = request.view_args.get("dataset_id")
+    if dataset_id is None and args:
+        potential_id = str(args[0])
+        if len(potential_id) == 36 and potential_id.count("-") == 4:
+            dataset_id = potential_id
+    return _normalize_dataset_id(dataset_id)
+
+
+def _resolve_dataset_service_tenant(*, bearer_token: str, dataset_id: str | None) -> str:
+    if is_resource_access_token(bearer_token):
+        with resource_access_token_errors():
+            return application_services().resource_access_tokens.resolve_tenant_for_dataset_service_api(
+                token=bearer_token,
+                dataset_id=dataset_id,
+            )
+
+    api_token = validate_and_get_api_token("dataset")
+    tenant_id = api_token.tenant_id
+    if tenant_id is None:
+        raise Unauthorized("Tenant id is required for this token.")
+    bound_dataset_ids = dataset_api_key_bindings.get_active_token_dataset_ids(
+        cast(Session, db.session),
+        api_token_id=api_token.id,
+        token=api_token.token,
+        tenant_id=tenant_id,
+    )
+    if bound_dataset_ids is None:
+        ApiTokenCache.delete(api_token.token, api_token.type)
+        raise Unauthorized("Access token is invalid")
+    if bound_dataset_ids and (dataset_id is None or dataset_id not in bound_dataset_ids):
+        raise Forbidden("The API key is not authorized to access this knowledge base.")
+    return tenant_id
+
+
+def _rate_limit_tenant(args: tuple[object, ...], kwargs: dict[str, object]) -> str:
+    cached = g.__dict__.pop(_DATASET_ADMISSION_CONTEXT_KEY, None)
+    bearer_token = extract_service_api_bearer_token()
+    dataset_id = _dataset_id_from_request_call(args, kwargs)
+    if isinstance(cached, _DatasetAdmission):
+        if cached.bearer_token == bearer_token and cached.dataset_id == dataset_id:
+            return cached.tenant_id
+    return _resolve_dataset_service_tenant(bearer_token=bearer_token, dataset_id=dataset_id)
+
+
 def cloud_edition_billing_rate_limit_check[**P, R](
     resource: str,
-    api_token_type: str,
 ) -> Callable[[Callable[P, R]], Callable[P, R]]:
     def interceptor(view: Callable[P, R]):
         @wraps(view)
         def decorated(*args: P.args, **kwargs: P.kwargs):
-            api_token = validate_and_get_api_token(api_token_type)
-
             if resource == "knowledge":
-                tenant_id = api_token.tenant_id
-                if tenant_id is None:
-                    raise Unauthorized("Tenant id is required for this token.")
+                tenant_id = _rate_limit_tenant(cast(tuple[object, ...], args), cast(dict[str, object], kwargs))
                 knowledge_rate_limit = FeatureService.get_knowledge_rate_limit(tenant_id)
                 if knowledge_rate_limit.enabled:
                     current_time = int(time.time() * 1000)
@@ -337,40 +394,10 @@ def validate_dataset_token[R](view: Callable[..., R]) -> Callable[..., R]:
 
     @wraps(view)
     def decorated(*args: object, **kwargs: object) -> R:
-        # Flask may pass URL path parameters positionally, so inspect both kwargs and args.
-        dataset_id = kwargs.get("dataset_id")
-
-        if not dataset_id and args:
-            potential_id = args[0]
-            try:
-                str_id = str(potential_id)
-                if len(str_id) == 36 and str_id.count("-") == 4:
-                    dataset_id = str_id
-            except Exception:
-                logger.exception("Failed to parse dataset_id from positional args")
-
-        auth_token = peek_service_api_bearer_token()
-        if auth_token and is_resource_access_token(auth_token):
-            with resource_access_token_errors():
-                tenant_id = application_services().resource_access_tokens.resolve_tenant_for_dataset_service_api(
-                    token=auth_token,
-                    dataset_id=str(dataset_id) if dataset_id else None,
-                )
-        else:
-            api_token = validate_and_get_api_token("dataset")
-            tenant_id = api_token.tenant_id
-
-            # Per-knowledge-base scoping is expressed by DatasetApiTokenBinding rows:
-            #   no rows  -> the key can reach every dataset in its tenant (default / back-compat)
-            #   N rows   -> the key is limited to exactly those datasets
-            # A bound key may only call endpoints carrying one of its dataset ids; endpoints
-            # without a dataset id (e.g. list/create datasets) are rejected. The set is queried
-            # per request (not cached) so scope changes take effect immediately.
-            # db.session is Flask-SQLAlchemy's scoped_session proxy; cast so the plain-Session
-            # typed helper accepts it (runtime proxies every Session method through unchanged).
-            bound_dataset_ids = dataset_api_key_bindings.get_bound_dataset_ids(cast(Session, db.session), api_token.id)
-            if bound_dataset_ids and (not dataset_id or str(dataset_id) not in bound_dataset_ids):
-                raise Forbidden("The API key is not authorized to access this knowledge base.")
+        g.__dict__.pop(_DATASET_ADMISSION_CONTEXT_KEY, None)
+        dataset_id = _dataset_id_from_request_call(args, kwargs)
+        bearer_token = extract_service_api_bearer_token()
+        tenant_id = _resolve_dataset_service_tenant(bearer_token=bearer_token, dataset_id=dataset_id)
 
         if dataset_id:
             dataset_id = str(dataset_id)
@@ -408,6 +435,12 @@ def validate_dataset_token[R](view: Callable[..., R]) -> Callable[..., R]:
         else:
             raise Unauthorized("Tenant does not exist.")
 
+        g.__dict__[_DATASET_ADMISSION_CONTEXT_KEY] = _DatasetAdmission(
+            bearer_token=bearer_token,
+            dataset_id=dataset_id,
+            tenant_id=tenant_id,
+        )
+
         if expects_bound_instance:
             if not args:
                 raise TypeError("validate_dataset_token expected a bound resource instance.")
@@ -416,6 +449,27 @@ def validate_dataset_token[R](view: Callable[..., R]) -> Callable[..., R]:
         return view(tenant_id, *args, **kwargs)
 
     return decorated
+
+
+def dataset_retrieval_admission[T, **P, R](
+    view: Callable[Concatenate[T, RequestContext, P], R],
+) -> Callable[Concatenate[T, P], R]:
+    """Validate dataset token scope, apply knowledge limits, and capture the admitted owner."""
+
+    @wraps(view)
+    def inject_request_context(self: T, tenant_id: str, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        identity = current_account_with_tenant()
+        context = RequestContext(
+            account_id=identity.account.id,
+            active_workspace_id=tenant_id,
+            request_id=get_request_id(),
+            trace_id=get_trace_id() or request.headers.get("X-Trace-Id"),
+            remote_ip=request.remote_addr,
+        )
+        return view(self, context, *args, **kwargs)
+
+    limited = cloud_edition_billing_rate_limit_check("knowledge")(inject_request_context)
+    return validate_dataset_token(limited)
 
 
 def validate_and_get_api_token(scope: str | None = None):

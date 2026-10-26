@@ -47,6 +47,9 @@ class IndexProcessorProtocol(Protocol):
         summary_index_setting: dict[str, Any] | None = None,
         *,
         session: Session,
+        enforce_projected_capacity: bool | None = None,
+        indexing_request_id: str | None = None,
+        claim_id: str | None = None,
     ) -> IndexingResultDict: ...
 
     def get_preview_output(

@@ -1,15 +1,22 @@
-from unittest.mock import Mock
+from unittest.mock import Mock, create_autospec
 
 import pytest
 from flask import Flask
+from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from models import Dataset
+from constants.resource_access_token import ResourceAccessTokenResourceType
+from models import ApiToken, Dataset, DatasetApiTokenBinding, Tenant
 from models.agent import Agent, AgentHomeSnapshot, AgentScope, AgentSource, AgentStatus, AgentWorkingResourceStatus
+from models.dataset import DatasetPermission
+from models.enums import ApiTokenType
+from models.model import ResourceCleanupOutbox
 from repositories.app.console_repository import ConsoleAppRepository
 from repositories.knowledge.dataset_repository import SQLAlchemyDatasetRepository
 from repositories.workspace.resource_cleanup_repository import WorkspaceResourceCleanupRepository
+from services.resource_access_token_service import ResourceAccessTokenCleanupService
 from services.workspace import resource_cleanup_service as module
+from tasks.clean_dataset_task import run_dataset_cleanup
 
 
 def _service(session_factory: sessionmaker[Session]) -> module.WorkspaceResourceCleanupService:
@@ -77,25 +84,130 @@ def test_agent_sweep_covers_all_scopes_and_retains_other_tenants(
 def test_dataset_deletion_schedules_even_without_index_configuration(
     sqlite_session: Session, sqlite_session_factory: sessionmaker[Session], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    target_tenant = Tenant(name="Target")
+    target_tenant.id = "target"
+    other_tenant = Tenant(name="Other")
+    other_tenant.id = "other"
+    target_permission = DatasetPermission(tenant_id="target", dataset_id="dataset", account_id="reader")
+    other_permission = DatasetPermission(tenant_id="other", dataset_id="other-dataset", account_id="reader")
     sqlite_session.add_all(
         [
+            target_tenant,
+            other_tenant,
             Dataset(id="dataset", tenant_id="target", name="Empty", created_by="owner"),
             Dataset(id="other-dataset", tenant_id="other", name="Other", created_by="owner"),
+            target_permission,
+            other_permission,
         ]
     )
     sqlite_session.commit()
-    cleanup = Mock()
-    monkeypatch.setattr(module, "clean_dataset_task", cleanup)
-    monkeypatch.setattr(module.dataset_api_key_bindings, "delete_keys_scoped_only_to", Mock())
-    monkeypatch.setattr(module, "build_resource_access_token_cleanup_service", Mock())
+    target_permission_id = target_permission.id
+    other_permission_id = other_permission.id
+    enqueued: list[str] = []
+    cleanup = create_autospec(ResourceAccessTokenCleanupService, instance=True, spec_set=True)
+    monkeypatch.setattr(module, "enqueue_resource_cleanup_intent", enqueued.append)
+
+    def build_cleanup(*, session: Session) -> ResourceAccessTokenCleanupService:
+        assert session.bind is sqlite_session.bind
+        return cleanup
+
+    monkeypatch.setattr(module, "build_resource_access_token_cleanup_service", build_cleanup)
     _service(sqlite_session_factory)._delete_dataset("target", "other-dataset")
-    cleanup.delay.assert_not_called()
+    assert enqueued == []
     _service(sqlite_session_factory)._delete_dataset("target", "dataset")
-    cleanup.delay.assert_called_once()
-    assert cleanup.delay.call_args.args[:2] == ("dataset", "target")
+    assert len(enqueued) == 1
+    intent = sqlite_session.get(ResourceCleanupOutbox, enqueued[0])
+    assert intent is not None
+    assert (intent.tenant_id, intent.dataset_id, intent.resource_id) == ("target", "dataset", "dataset")
+    cleanup.delete_resource_relations.assert_called_once_with(
+        tenant_id="target",
+        resource_type=ResourceAccessTokenResourceType.KNOWLEDGE,
+        resource_id="dataset",
+    )
     sqlite_session.expire_all()
     assert sqlite_session.get(Dataset, "dataset") is None
     assert sqlite_session.get(Dataset, "other-dataset") is not None
+    assert sqlite_session.get(DatasetPermission, target_permission_id) is None
+    assert sqlite_session.get(DatasetPermission, other_permission_id) is not None
+
+    # The durable cleanup remains idempotent after the command removed ACLs.
+    monkeypatch.setattr("tasks.clean_dataset_task._prepare_dataset_cleanup", lambda **_kwargs: None)
+    run_dataset_cleanup(
+        tenant_id=intent.tenant_id,
+        dataset_id=intent.dataset_id,
+        indexing_technique=intent.indexing_technique,
+        index_struct=intent.index_struct,
+        collection_binding_id=intent.collection_binding_id,
+        doc_form=intent.doc_form or "text_model",
+        pipeline_id=intent.pipeline_id,
+    )
+    sqlite_session.expire_all()
+    assert sqlite_session.get(DatasetPermission, target_permission_id) is None
+    assert sqlite_session.get(DatasetPermission, other_permission_id) is not None
+
+
+def test_dataset_cleanup_commits_key_deletion_before_cache_invalidation(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = Tenant(name="Target")
+    tenant.id = "target"
+    dataset = Dataset(id="dataset", tenant_id=tenant.id, name="Empty", created_by="owner")
+    key = ApiToken(id="key", tenant_id=tenant.id, type=ApiTokenType.DATASET, token="dataset-secret")
+    sqlite_session.add_all([tenant, dataset, key])
+    sqlite_session.flush()
+    sqlite_session.add(DatasetApiTokenBinding(api_token_id=key.id, dataset_id=dataset.id))
+    sqlite_session.commit()
+    enqueued: list[str] = []
+    invalidated: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(module, "enqueue_resource_cleanup_intent", enqueued.append)
+
+    def invalidate(token: str, scope: str | None = None) -> bool:
+        with sqlite_session_factory() as committed_session:
+            assert committed_session.get(Dataset, dataset.id) is None
+            assert committed_session.get(ApiToken, key.id) is None
+            assert committed_session.scalar(select(ResourceCleanupOutbox.id)) is not None
+        invalidated.append((token, scope or ""))
+        return True
+
+    monkeypatch.setattr(module.ApiTokenCache, "delete", invalidate)
+
+    _service(sqlite_session_factory)._delete_dataset(tenant.id, dataset.id)
+
+    assert len(enqueued) == 1
+    assert invalidated == [(key.token, key.type)]
+
+
+def test_dataset_cleanup_failure_rolls_back_dataset_and_intent(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant = Tenant(name="Target")
+    tenant.id = "target"
+    dataset = Dataset(id="dataset", tenant_id=tenant.id, name="Empty", created_by="owner")
+    sqlite_session.add_all([tenant, dataset])
+    sqlite_session.commit()
+    cleanup = create_autospec(ResourceAccessTokenCleanupService, instance=True, spec_set=True)
+    cleanup.delete_resource_relations.side_effect = RuntimeError("relation cleanup failed")
+    enqueued: list[str] = []
+    monkeypatch.setattr(module, "enqueue_resource_cleanup_intent", enqueued.append)
+
+    def build_cleanup(*, session: Session) -> ResourceAccessTokenCleanupService:
+        assert session.bind is sqlite_session.bind
+        return cleanup
+
+    monkeypatch.setattr(module, "build_resource_access_token_cleanup_service", build_cleanup)
+
+    with pytest.raises(RuntimeError, match="relation cleanup failed"):
+        _service(sqlite_session_factory)._delete_dataset(tenant.id, dataset.id)
+
+    sqlite_session.expire_all()
+    assert sqlite_session.get(Dataset, dataset.id) is not None
+    assert sqlite_session.scalar(select(ResourceCleanupOutbox)) is None
+    assert enqueued == []
 
 
 def test_agent_collection_failure_propagates_and_retirement_can_be_retried(

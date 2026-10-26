@@ -179,7 +179,7 @@ def test_extract_images_from_docx(monkeypatch: pytest.MonkeyPatch, inject_sessio
     assert transaction_events == ([] if inject_session else ["commit"])
 
 
-def test_extract_images_does_not_stage_partial_files_on_storage_failure(
+def test_extract_images_exposes_partial_artifacts_on_storage_failure(
     monkeypatch: pytest.MonkeyPatch, sqlite_session: Session
 ):
     doc = Document()
@@ -187,14 +187,20 @@ def test_extract_images_does_not_stage_partial_files_on_storage_failure(
     doc.part.rels.add_relationship(RT.IMAGE, _image_part("image2.png", b"second"), "rId2")
 
     save_calls = 0
+    failed_key: str | None = None
+    attempted_keys: list[str] = []
+    deleted_keys: list[str] = []
 
     def save(key: str, data: bytes) -> None:
-        nonlocal save_calls
+        nonlocal failed_key, save_calls
         save_calls += 1
+        attempted_keys.append(key)
         if save_calls == 2:
+            failed_key = key
             raise RuntimeError("storage failure")
 
     monkeypatch.setattr(we.storage, "save", save)
+    monkeypatch.setattr(we.storage, "delete", deleted_keys.append)
     apply_config_overrides(monkeypatch, FILES_URL="http://files.local", STORAGE_TYPE="local")
 
     extractor = object.__new__(WordExtractor)
@@ -206,6 +212,9 @@ def test_extract_images_does_not_stage_partial_files_on_storage_failure(
         extractor._extract_images_from_docx(doc)
 
     assert sqlite_session.scalars(select(UploadFile)).all() == []
+    assert deleted_keys == []
+    assert failed_key == attempted_keys[-1]
+    assert [artifact.key for artifact in extractor.created_upload_artifacts] == attempted_keys
 
 
 def test_extract_images_from_docx_uses_internal_files_url(monkeypatch: pytest.MonkeyPatch):
@@ -325,6 +334,24 @@ def test_extract_legacy_hyperlinks(monkeypatch: pytest.MonkeyPatch, unbound_sess
     finally:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+def test_text_only_extraction_skips_word_images(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    document = Document()
+    document.add_paragraph("preview text")
+    file_path = tmp_path / "preview.docx"
+    document.save(file_path)
+    extractor = WordExtractor(str(file_path), "tenant", "user", persist_images=False)
+
+    def fail_if_called(_document: object) -> dict[object, str]:
+        pytest.fail("text-only extraction must not persist Word images")
+
+    monkeypatch.setattr(extractor, "_extract_images_from_docx", fail_if_called)
+
+    extracted = extractor.extract()
+
+    assert "preview text" in extracted[0].page_content
+    assert extractor.created_upload_file_ids == ()
 
 
 def test_init_rejects_invalid_url_status(monkeypatch: pytest.MonkeyPatch):
@@ -481,6 +508,7 @@ def test_parse_docx_reads_real_paragraph_table_order(monkeypatch: pytest.MonkeyP
         tmp_path = tmp.name
 
     extractor = object.__new__(WordExtractor)
+    extractor._persist_images = True
     monkeypatch.setattr(extractor, "_extract_images_from_docx", lambda doc: {})
 
     try:
@@ -496,6 +524,7 @@ def test_parse_docx_covers_drawing_shapes_hyperlink_error_and_table_branch(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ):
     extractor = object.__new__(WordExtractor)
+    extractor._persist_images = True
 
     ext_image_id = "ext-image"
     int_embed_id = "int-embed"

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Generator, Sequence
 from contextlib import contextmanager
+from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, Mock, call
@@ -19,32 +20,98 @@ import yaml
 from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import tasks.dataset_indexing_outbox_task as dataset_indexing_task_module
+import tasks.deal_dataset_vector_index_task as dataset_vector_task_module
 from core.workflow.llm_environment_variable import LLMEnvironmentVariable
 from core.workflow.nodes.knowledge_index import KNOWLEDGE_INDEX_NODE_TYPE
 from graphon.enums import BuiltinNodeTypes
 from models import Account
 from models.dataset import (
     Dataset,
+    DocumentSegment,
     Pipeline,
     PipelineCustomizedTemplate,
 )
-from models.enums import DataSourceType
+from models.enums import DataSourceType, IndexingStatus, SegmentStatus
+from models.model import DatasetIndexingOutbox
 from models.workflow import Workflow, WorkflowKind, WorkflowType
+from repositories.knowledge.dataset_indexing_outbox_repository import SQLAlchemyDatasetIndexingOutboxRepository
 from services.dsl_version import check_version_compatibility
 from services.entities.knowledge_entities.rag_pipeline_entities import IconInfo, RagPipelineDatasetCreateEntity
+from services.knowledge import dataset_service as dataset_service_module
+from services.knowledge.entities.datasets import DatasetIndexingRepresentation
 from services.rag_pipeline import rag_pipeline_dsl_service as module
 from services.rag_pipeline.rag_pipeline_dsl_service import (
     ImportMode,
     ImportStatus,
     RagPipelineDslService,
+    RagPipelineImportInfo,
     RagPipelinePendingData,
 )
-from tests.unit_tests.model_factories import make_account, make_dataset, make_tenant, make_workflow
+from tests.unit_tests.model_factories import make_account, make_dataset, make_document, make_tenant, make_workflow
 
 
 @pytest.fixture
 def service(sqlite_session: Session) -> RagPipelineDslService:
     return RagPipelineDslService(session=sqlite_session)
+
+
+@dataclass(frozen=True)
+class _EmbeddingModelBoundary:
+    model_name: str
+    provider: str
+
+
+class _ModelManagerBoundary:
+    def get_model_instance(
+        self,
+        *,
+        tenant_id: str,
+        provider: str,
+        model_type: object,
+        model: str,
+    ) -> _EmbeddingModelBoundary:
+        del model_type
+        assert tenant_id == "tenant-1"
+        return _EmbeddingModelBoundary(model_name=model, provider=provider)
+
+
+class _ResolvedDatasetVectorBoundary:
+    def __init__(self, _dataset: Dataset, *, session: Session) -> None:
+        del session
+
+    def get_routing_target(self) -> tuple[str, str]:
+        return "qdrant", "dsl-import-target"
+
+
+class _DatasetLoadBoundary:
+    def __init__(self) -> None:
+        self.loaded_models: list[str | None] = []
+
+    def load(self, dataset: Dataset, *_args: object, **_kwargs: object) -> None:
+        self.loaded_models.append(dataset.embedding_model)
+
+
+class _DatasetProcessorFactoryBoundary:
+    def __init__(self, processor: _DatasetLoadBoundary) -> None:
+        self._processor = processor
+
+    def init_index_processor(self) -> _DatasetLoadBoundary:
+        return self._processor
+
+
+@pytest.fixture(autouse=True)
+def _stub_embedding_model_boundary(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        dataset_service_module.ModelManager,
+        "for_tenant",
+        staticmethod(lambda *, tenant_id: _ModelManagerBoundary()),
+    )
+    monkeypatch.setattr(
+        dataset_service_module.DatasetService,
+        "check_is_multimodal_model",
+        staticmethod(lambda _tenant_id, _provider, _model: False),
+    )
 
 
 def _account(*, tenant_id: str = "tenant-1", account_id: str = "account-1") -> Account:
@@ -162,6 +229,85 @@ workflow:
           type: {KNOWLEDGE_INDEX_NODE_TYPE}
     edges: []
 """
+
+
+def _seed_materialized_dataset(session: Session, *, pipeline: Pipeline) -> Dataset:
+    dataset = _dataset(session, pipeline)
+    dataset.embedding_model = "embedding-a"
+    dataset.embedding_model_provider = "provider-a"
+    dataset.indexing_applied_representation = DatasetIndexingRepresentation(
+        indexing_technique="high_quality",
+        index_struct=None,
+        collection_binding_id=None,
+        embedding_model="embedding-a",
+        embedding_model_provider="provider-a",
+        keyword_number=None,
+        is_multimodal=False,
+        doc_form="text_model",
+        summary_index_setting=None,
+    ).model_dump_json()
+    document = make_document(
+        document_id="document-1",
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        doc_form="text_model",
+    )
+    document.indexing_status = IndexingStatus.COMPLETED
+    session.add_all(
+        [
+            dataset,
+            document,
+            DocumentSegment(
+                tenant_id=dataset.tenant_id,
+                dataset_id=dataset.id,
+                document_id=document.id,
+                position=1,
+                content="content",
+                word_count=1,
+                tokens=1,
+                created_by="account-1",
+                index_node_id="node-1",
+                index_node_hash="hash-1",
+                status=SegmentStatus.COMPLETED,
+            ),
+        ]
+    )
+    session.commit()
+    return dataset
+
+
+def _import_existing_dataset(
+    service: RagPipelineDslService,
+    *,
+    pipeline: Pipeline,
+    account: Account,
+    confirm: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    deleted_confirmation_keys: list[str] | None = None,
+) -> RagPipelineImportInfo:
+    monkeypatch.setattr(
+        module.KnowledgeConfiguration,
+        "model_validate",
+        lambda _value: _knowledge_configuration(),
+    )
+    if not confirm:
+        return service.import_rag_pipeline(
+            account=account,
+            import_mode=ImportMode.YAML_CONTENT.value,
+            yaml_content=_valid_dsl(),
+            pipeline_id=pipeline.id,
+        )
+    pending = RagPipelinePendingData(
+        tenant_id=account.current_tenant_id or "",
+        account_id=account.id,
+        import_mode=ImportMode.YAML_CONTENT.value,
+        yaml_content=_valid_dsl(),
+        pipeline_id=pipeline.id,
+    )
+    monkeypatch.setattr(module.redis_client, "get", lambda _key: pending.model_dump_json())
+    if deleted_confirmation_keys is not None:
+        monkeypatch.setattr(module.redis_client, "delete", deleted_confirmation_keys.append)
+    return service.confirm_import(import_id="import-1", account=account)
 
 
 @contextmanager
@@ -701,9 +847,170 @@ def test_import_creates_real_pipeline_dataset_binding_and_workflow_without_commi
         assert observer.get(Dataset, dataset.id) is None
 
     sqlite_session.commit()
+    service.finalize_committed_import()
     with sqlite_session_factory() as observer:
         assert observer.get(Pipeline, pipeline.id) is not None
         assert observer.get(Dataset, dataset.id) is not None
+        assert observer.scalar(select(DatasetIndexingOutbox.id)) is None
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+@pytest.mark.parametrize("published", [False, True])
+def test_existing_materialized_import_commits_generation_before_claim_and_load(
+    monkeypatch: pytest.MonkeyPatch,
+    service: RagPipelineDslService,
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    confirm: bool,
+    published: bool,
+) -> None:
+    pipeline = _pipeline(sqlite_session, published=published)
+    dataset = _seed_materialized_dataset(sqlite_session, pipeline=pipeline)
+    _workflow(sqlite_session, pipeline)
+    deleted_confirmation_keys: list[str] = []
+
+    result = _import_existing_dataset(
+        service,
+        pipeline=pipeline,
+        account=_account(),
+        confirm=confirm,
+        monkeypatch=monkeypatch,
+        deleted_confirmation_keys=deleted_confirmation_keys,
+    )
+
+    assert result.status == ImportStatus.COMPLETED
+    (intent_id,) = service.pending_dataset_indexing_intent_ids
+    assert sqlite_session.get_one(Dataset, dataset.id).embedding_model == "text-embedding"
+    assert sqlite_session.get(DatasetIndexingOutbox, intent_id) is not None
+    with sqlite_session_factory() as observer:
+        assert observer.get_one(Dataset, dataset.id).embedding_model == "embedding-a"
+        assert observer.get(DatasetIndexingOutbox, intent_id) is None
+    assert deleted_confirmation_keys == []
+
+    sqlite_session.commit()
+    repository = SQLAlchemyDatasetIndexingOutboxRepository(session_factory=sqlite_session_factory)
+    intent = repository.claim(intent_id)
+    assert intent is not None
+    assert intent.target.embedding_model == "text-embedding"
+    assert intent.target.embedding_model_provider == "openai"
+
+    processor = _DatasetLoadBoundary()
+    monkeypatch.setattr(dataset_vector_task_module, "Vector", _ResolvedDatasetVectorBoundary)
+    monkeypatch.setattr(
+        dataset_vector_task_module,
+        "IndexProcessorFactory",
+        lambda *_args, **_kwargs: _DatasetProcessorFactoryBoundary(processor),
+    )
+    monkeypatch.setattr(dataset_vector_task_module, "_repository", lambda: repository)
+    monkeypatch.setattr(dataset_vector_task_module.session_factory, "create_session", sqlite_session_factory)
+
+    assert dataset_vector_task_module.deal_dataset_vector_index_task.run(
+        intent.dataset_id,
+        intent.action,
+        intent.generation_id,
+        indexing_intent_id=intent.id,
+        indexing_claim_id=intent.claim_id,
+        tenant_id=intent.tenant_id,
+        source_representation=intent.source.model_dump_json(),
+        target_representation=intent.target.model_dump_json(),
+    )
+    assert processor.loaded_models == ["text-embedding"]
+    assert repository.mark_vector_completed(intent)
+    assert repository.complete(intent)
+
+    with sqlite_session_factory() as observer:
+        serialized_applied = observer.get_one(Dataset, dataset.id).indexing_applied_representation
+        assert serialized_applied is not None
+        applied = DatasetIndexingRepresentation.model_validate_json(serialized_applied)
+        assert applied.embedding_model == "text-embedding"
+        assert applied.vector_route is not None
+        assert applied.vector_route.collection_name == "dsl-import-target"
+
+
+@pytest.mark.parametrize("confirm", [False, True])
+def test_existing_import_rollback_and_same_import_retry_preserve_one_durable_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    service: RagPipelineDslService,
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+    confirm: bool,
+) -> None:
+    pipeline = _pipeline(sqlite_session, published=True)
+    dataset = _seed_materialized_dataset(sqlite_session, pipeline=pipeline)
+    _workflow(sqlite_session, pipeline)
+    deleted_confirmation_keys: list[str] = []
+
+    first = _import_existing_dataset(
+        service,
+        pipeline=pipeline,
+        account=_account(),
+        confirm=confirm,
+        monkeypatch=monkeypatch,
+        deleted_confirmation_keys=deleted_confirmation_keys,
+    )
+    assert first.status == ImportStatus.COMPLETED
+    assert len(service.pending_dataset_indexing_intent_ids) == 1
+    sqlite_session.rollback()
+    assert deleted_confirmation_keys == []
+    with sqlite_session_factory() as observer:
+        assert observer.get_one(Dataset, dataset.id).embedding_model == "embedding-a"
+        assert observer.scalar(select(DatasetIndexingOutbox.id)) is None
+
+    retry = _import_existing_dataset(
+        service,
+        pipeline=pipeline,
+        account=_account(),
+        confirm=confirm,
+        monkeypatch=monkeypatch,
+        deleted_confirmation_keys=deleted_confirmation_keys,
+    )
+    assert retry.status == ImportStatus.COMPLETED
+    (intent_id,) = service.pending_dataset_indexing_intent_ids
+    sqlite_session.commit()
+
+    repeated = _import_existing_dataset(
+        service,
+        pipeline=pipeline,
+        account=_account(),
+        confirm=confirm,
+        monkeypatch=monkeypatch,
+        deleted_confirmation_keys=deleted_confirmation_keys,
+    )
+    assert repeated.status == ImportStatus.COMPLETED
+    assert service.pending_dataset_indexing_intent_ids == ()
+    sqlite_session.commit()
+    with sqlite_session_factory() as observer:
+        assert observer.scalars(select(DatasetIndexingOutbox.id)).all() == [intent_id]
+
+
+def test_committed_import_broker_failure_keeps_durable_intent_for_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    service: RagPipelineDslService,
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    pipeline = _pipeline(sqlite_session, published=True)
+    _seed_materialized_dataset(sqlite_session, pipeline=pipeline)
+    _workflow(sqlite_session, pipeline)
+    result = _import_existing_dataset(
+        service,
+        pipeline=pipeline,
+        account=_account(),
+        confirm=False,
+        monkeypatch=monkeypatch,
+    )
+    assert result.status == ImportStatus.COMPLETED
+    (intent_id,) = service.pending_dataset_indexing_intent_ids
+    sqlite_session.commit()
+
+    def reject(_intent_id: str) -> None:
+        raise OSError("broker unavailable")
+
+    monkeypatch.setattr(dataset_indexing_task_module.process_dataset_indexing_intent_task, "delay", reject)
+    service.finalize_committed_import()
+
+    with sqlite_session_factory() as observer:
+        assert observer.get(DatasetIndexingOutbox, intent_id) is not None
 
 
 def test_import_pipeline_id_is_tenant_scoped(service: RagPipelineDslService, sqlite_session: Session) -> None:
@@ -900,6 +1207,7 @@ def test_confirm_import_updates_tenant_pipeline_and_dataset(
         assert observed_pipeline.name == "Pipeline"
 
     sqlite_session.commit()
+    service.finalize_committed_import()
     with sqlite_session_factory() as observer:
         observed_pipeline = observer.get(Pipeline, pipeline.id)
         assert observed_pipeline is not None

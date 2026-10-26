@@ -1,10 +1,26 @@
 from datetime import datetime
 from typing import Any
 
-from pydantic import Field, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from fields.base import ResponseModel
 from libs.helper import to_timestamp
+from services.knowledge.entities.knowledge_entities import RetrievalModel
+
+
+class HitTestingPayload(BaseModel):
+    query: str = Field(description="Search query text.", max_length=250)
+    retrieval_model: RetrievalModel | None = Field(
+        default=None,
+        description=(
+            "Retrieval model configuration. Controls how chunks are searched and ranked when querying this "
+            "knowledge base."
+        ),
+    )
+    attachment_ids: list[str] | None = Field(
+        default=None,
+        description="List of attachment IDs to include in the retrieval context.",
+    )
 
 
 class HitTestingQuery(ResponseModel):
@@ -72,7 +88,7 @@ class HitTestingFile(ResponseModel):
     name: str
     size: int
     extension: str
-    mime_type: str
+    mime_type: str | None = Field(description="MIME type, or null when the upload has no recorded MIME type.")
     source_url: str
 
 

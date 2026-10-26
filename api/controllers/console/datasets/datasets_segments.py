@@ -422,6 +422,7 @@ class DatasetDocumentSegmentBatchImportApi(Resource):
     @console_ns.response(200, "Batch import started", console_ns.models[SegmentBatchImportStatusResponse.__name__])
     @console_ns.response(500, "Batch import failed", console_ns.models[ErrorMessageResponse.__name__])
     @console_account_admission(
+        allowed_roles=_DATASET_EDIT_ROLES,
         rbac_checks=(RBACCheck(RBACPermission.DATASET_EDIT, DatasetId()),),
     )
     @cloud_edition_billing_resource_check("vector_space")

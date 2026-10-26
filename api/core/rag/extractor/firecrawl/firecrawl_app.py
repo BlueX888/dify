@@ -5,7 +5,6 @@ from typing import Any, NotRequired, TypedDict, cast
 import httpx
 
 from core.helper import ssrf_proxy
-from extensions.ext_storage import storage
 
 # Bounded connect/read timeout so a slow or hanging Firecrawl endpoint cannot
 # block extraction indefinitely (mirrors the WaterCrawl extractor client).
@@ -104,14 +103,6 @@ class FirecrawlApp:
                 if total <= 0:
                     raise Exception("Failed to check crawl status. Error: No page found")
                 url_data_list = self._collect_all_crawl_pages(crawl_status_response, headers)
-                if url_data_list:
-                    file_key = "website_files/" + job_id + ".txt"
-                    try:
-                        if storage.exists(file_key):
-                            storage.delete(file_key)
-                        storage.save(file_key, json.dumps(url_data_list).encode("utf-8"))
-                    except Exception as e:
-                        raise Exception(f"Error saving crawl data: {e}") from e
                 return self._format_crawl_status_response("completed", crawl_status_response, url_data_list)
             else:
                 return self._format_crawl_status_response(

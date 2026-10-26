@@ -70,6 +70,7 @@ from core.workflow.llm_environment_variable import (
     LLMEnvironmentVariable,
 )
 from core.workflow.nodes.human_input.entities import FormInputConfig, UserActionConfig
+from extensions.ext_application_services import application_services
 from extensions.ext_database import db
 from extensions.ext_redis import redis_client
 from factories import file_factory, variable_factory
@@ -754,6 +755,7 @@ class AdvancedChatDraftWorkflowRunApi(Resource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=current_user,
@@ -805,6 +807,7 @@ class AdvancedChatDraftRunIterationNodeApi(Resource):
 
         try:
             response = AppGenerateService.generate_single_iteration(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 app_model=app_model,
                 user=current_user,
                 node_id=node_id,
@@ -854,6 +857,7 @@ class WorkflowDraftRunIterationNodeApi(Resource):
 
         try:
             response = AppGenerateService.generate_single_iteration(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 app_model=app_model,
                 user=current_user,
                 node_id=node_id,
@@ -898,6 +902,7 @@ class AdvancedChatDraftRunLoopNodeApi(Resource):
 
         try:
             response = AppGenerateService.generate_single_loop(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 app_model=app_model,
                 user=current_user,
                 node_id=node_id,
@@ -946,6 +951,7 @@ class WorkflowDraftRunLoopNodeApi(Resource):
 
         try:
             response = AppGenerateService.generate_single_loop(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 app_model=app_model,
                 user=current_user,
                 node_id=node_id,
@@ -1202,6 +1208,7 @@ class DraftWorkflowRunApi(Resource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=current_user,
@@ -1284,6 +1291,7 @@ class DraftWorkflowNodeRunApi(Resource):
         workflow_service = WorkflowService()
 
         workflow_node_execution = workflow_service.run_draft_workflow_node(
+            external_retrieval=application_services().knowledge.external_retrieval,
             app_model=app_model,
             draft_workflow=draft_workflow,
             node_id=node_id,
@@ -1777,6 +1785,7 @@ class DraftWorkflowTriggerRunApi(Resource):
                 return jsonable_encoder({"status": "waiting", "retry_in": LISTENING_RETRY_IN})
             return helper.compact_generate_response(
                 AppGenerateService.generate(
+                    external_retrieval=application_services().knowledge.external_retrieval,
                     session=session,
                     app_model=app_model,
                     user=current_user,
@@ -1864,6 +1873,7 @@ class DraftWorkflowTriggerNodeApi(Resource):
         files = _parse_file(draft_workflow, raw_files if isinstance(raw_files, list) else None)
         try:
             node_execution = workflow_service.run_draft_workflow_node(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 app_model=app_model,
                 draft_workflow=draft_workflow,
                 node_id=node_id,
@@ -1933,6 +1943,7 @@ class DraftWorkflowTriggerRunAllApi(Resource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=current_user,

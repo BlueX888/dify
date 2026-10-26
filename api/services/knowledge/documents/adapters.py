@@ -4,7 +4,7 @@ import copy
 import json
 from collections.abc import Generator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 from redis.exceptions import LockNotOwnedError
@@ -15,6 +15,7 @@ from werkzeug.exceptions import NotFound
 from configs import dify_config
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
 from core.model_manager import ModelManager
+from core.rag.extractor.entity.extract_setting import WebsiteJobRef
 from core.rag.index_processor.constant.built_in_field import BuiltInField
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
 from extensions.ext_redis import redis_client
@@ -33,12 +34,23 @@ from repositories.knowledge.dataset_read_repository import (
     get_latest_dataset_process_rule,
 )
 from repositories.knowledge.dataset_repository import _get_dataset
+from repositories.knowledge.document_indexing_outbox_repository import create_document_indexing_intents
 from repositories.knowledge.document_repository import _get_document
+from repositories.knowledge.metadata_repository import (
+    lock_metadata_dataset,
+    lock_metadata_document,
+    lock_metadata_document_bindings,
+)
+from services.data_source.credential_gateway import (
+    ActorDatasourceCredentialResolver,
+    DatasourceCredentialError,
+    DatasourceCredentialNotFoundError,
+)
 from services.enterprise import rbac_service
 from services.errors.base import NoPermissionError
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
 from services.errors.document import DocumentIndexingError
 from services.file_service import FileService
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
 from services.knowledge.dataset_read_service import (
     get_document_metadata_details,
     get_document_source_detail,
@@ -55,9 +67,9 @@ from services.knowledge.documents.application import (
     DocumentState,
     DocumentZip,
 )
-from services.knowledge.entities.document_creation import DocumentCreationDataset, DocumentIndexingJobs
+from services.knowledge.entities.document_creation import DocumentCreationDataset
 from services.knowledge.entities.knowledge_entities import KnowledgeConfig
-from services.knowledge.resource_scope import DatasetRef, DocumentRef
+from services.knowledge.entities.resource_scope import DatasetRef, DocumentRef
 from services.knowledge.summaries.adapters import SummaryIndexAdapter
 from services.rbac import contracts as rbac_contracts
 from services.vector_space_admission_service import get_vector_space_admission_error_fields
@@ -74,7 +86,7 @@ def _translate_errors() -> Generator[None]:
         raise DatasetAccessDeniedError() from error
     except DocumentIndexingError as error:
         raise DocumentIndexingStateError(str(error)) from error
-    except (ProviderTokenNotInitError, InvokeAuthorizationError) as error:
+    except (ProviderTokenNotInitError, InvokeAuthorizationError, DatasourceCredentialError) as error:
         raise DocumentProviderError(str(error), kind="uninitialized") from error
     except QuotaExceededError as error:
         raise DocumentProviderError(str(error), kind="quota") from error
@@ -143,9 +155,23 @@ def _indexing_status(document: Document, counts: tuple[int, int]) -> dict[str, A
     }
 
 
+class WebsiteJobResolver(Protocol):
+    def resolve_job_ref(
+        self, *, tenant_id: str, provider: str, job_id: str, source_handle: str | None = None
+    ) -> WebsiteJobRef: ...
+
+
 class SQLAlchemyDocumentOperations:
-    def __init__(self, *, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        actor_credentials: ActorDatasourceCredentialResolver,
+        website_jobs: WebsiteJobResolver | None = None,
+    ) -> None:
         self._sessions = session_factory
+        self._actor_credentials = actor_credentials
+        self._website_jobs = website_jobs
 
     def find_document(self, *, workspace_id: str, document_id: str) -> DocumentRef | None:
         with self._sessions() as session:
@@ -352,41 +378,86 @@ class SQLAlchemyDocumentOperations:
                 dataset.tenant_id, dataset.indexing_technique, dataset.embedding_model, dataset.embedding_model_provider
             )
 
+    def _resolve_website_job_ref(self, *, workspace_id: str, config: KnowledgeConfig) -> WebsiteJobRef | None:
+        data_source = config.data_source
+        if data_source is None or data_source.info_list.data_source_type != "website_crawl":
+            return None
+        website_info = data_source.info_list.website_info_list
+        if website_info is None:
+            raise ValueError("No website info list found.")
+        if self._website_jobs is None:
+            raise ValueError("Website source resolver is unavailable")
+        return self._website_jobs.resolve_job_ref(
+            tenant_id=workspace_id,
+            provider=website_info.provider,
+            job_id=website_info.job_id,
+            source_handle=website_info.source_handle,
+        )
+
+    def _validate_actor_notion_credentials(self, *, context: RequestContext, config: KnowledgeConfig) -> None:
+        """Authorize every actor-selected Notion credential before source persistence."""
+        data_source = config.data_source
+        if data_source is None or data_source.info_list.data_source_type != "notion_import":
+            return
+        notion_info_list = data_source.info_list.notion_info_list
+        if not notion_info_list:
+            raise ValueError("No notion info list found.")
+        credential_ids = {notion_info.credential_id for notion_info in notion_info_list}
+        if "" in credential_ids:
+            raise DatasourceCredentialNotFoundError()
+        for credential_id in sorted(credential_ids):
+            self._actor_credentials.resolve(
+                workspace_id=context.active_workspace_id,
+                actor_id=context.account_id,
+                credential_id=credential_id,
+                provider="notion_datasource",
+                plugin_id="langgenius/notion_datasource",
+            )
+
     def _persist_creation(
-        self, context: RequestContext, ref: DatasetRef, config: KnowledgeConfig, *, initialize: bool
-    ) -> tuple[dict[str, Any], DocumentIndexingJobs]:
-        """Keep ORM values local and materialize the response before closing the session."""
-        jobs: DocumentIndexingJobs | None = None
-        try:
-            with self._sessions() as session:
-                account = self._actor(session, context)
-                dataset = (
-                    DocumentService.build_dataset_for_documents(ref, config, account, session)
-                    if initialize
-                    else _require_dataset(session, ref)
+        self,
+        context: RequestContext,
+        ref: DatasetRef,
+        config: KnowledgeConfig,
+        *,
+        initialize: bool,
+        website_job_ref: WebsiteJobRef | None,
+    ) -> tuple[dict[str, Any], tuple[str, ...]]:
+        """Materialize the response and commit all document writes as one operation."""
+        with self._sessions() as session:
+            account = self._actor(session, context)
+            dataset = (
+                DocumentService.build_dataset_for_documents(ref, config, account, session)
+                if initialize
+                else _require_dataset(session, ref)
+            )
+            documents, batch, jobs = DocumentService.save_prepared_documents(
+                dataset,
+                config,
+                account,
+                session=session,
+                website_job_ref=website_job_ref,
+            )
+            indexing_intent_ids = create_document_indexing_intents(session, jobs)
+            if initialize:
+                dataset.name = documents[0].name[:18] + "..."
+                dataset.description = "useful for when you want to answer queries about the " + documents[0].name
+                dataset.permission = (
+                    DatasetPermissionEnum.ALL_TEAM if dify_config.RBAC_ENABLED else DatasetPermissionEnum.ONLY_ME
                 )
-                documents, batch, jobs = DocumentService.save_prepared_documents(
-                    dataset, config, account, session=session
-                )
-                if initialize:
-                    dataset.name = documents[0].name[:18] + "..."
-                    dataset.description = "useful for when you want to answer queries about the " + documents[0].name
-                    dataset.permission = (
-                        DatasetPermissionEnum.ALL_TEAM if dify_config.RBAC_ENABLED else DatasetPermissionEnum.ONLY_ME
-                    )
-                    session.flush()
-                result = _created_response(dataset, documents, batch, session)
-                session.commit()
-                return result, jobs
-        except Exception:
-            # The persistence helper commits documents before loading response
-            # details. Preserve their indexing even if that later read fails.
-            if jobs is not None:
-                DocumentService.dispatch_document_indexing(jobs)
-            raise
+                session.flush()
+            result = _created_response(dataset, documents, batch, session)
+            session.commit()
+            return result, indexing_intent_ids
 
     def _run_creation(
-        self, context: RequestContext, ref: DatasetRef, config: KnowledgeConfig, *, initialize: bool
+        self,
+        context: RequestContext,
+        ref: DatasetRef,
+        config: KnowledgeConfig,
+        *,
+        initialize: bool,
+        website_job_ref: WebsiteJobRef | None,
     ) -> dict[str, Any]:
         lock = (
             nullcontext()
@@ -396,10 +467,16 @@ class SQLAlchemyDocumentOperations:
         result = None
         try:
             with lock:
-                result, jobs = self._persist_creation(context, ref, config, initialize=initialize)
+                result, indexing_intent_ids = self._persist_creation(
+                    context,
+                    ref,
+                    config,
+                    initialize=initialize,
+                    website_job_ref=website_job_ref,
+                )
                 # No session or ORM entity crosses the task boundary. Keep the
                 # creation lock until committed documents have been dispatched.
-                DocumentService.dispatch_document_indexing(jobs)
+                DocumentService.dispatch_document_indexing(indexing_intent_ids)
         except LockNotOwnedError:
             if config.original_document_id:
                 raise
@@ -420,7 +497,18 @@ class SQLAlchemyDocumentOperations:
         with _translate_errors():
             snapshot = self._creation_dataset(context, ref, config)
             config = DocumentService.prepare_document_creation(snapshot, config)
-            return self._run_creation(context, ref, config, initialize=False)
+            self._validate_actor_notion_credentials(context=context, config=config)
+            website_job_ref = self._resolve_website_job_ref(
+                workspace_id=context.active_workspace_id,
+                config=config,
+            )
+            return self._run_creation(
+                context,
+                ref,
+                config,
+                initialize=False,
+                website_job_ref=website_job_ref,
+            )
 
     def initialize_dataset(self, context: RequestContext, settings: Mapping[str, Any]) -> dict[str, Any]:
         config = KnowledgeConfig.model_validate(settings)
@@ -455,9 +543,18 @@ class SQLAlchemyDocumentOperations:
                 ),
                 config,
             )
+            self._validate_actor_notion_credentials(context=context, config=config)
+            website_job_ref = self._resolve_website_job_ref(
+                workspace_id=context.active_workspace_id,
+                config=config,
+            )
             dataset_id = str(uuid4())
             result = self._run_creation(
-                context, DatasetRef(context.active_workspace_id, dataset_id), config, initialize=True
+                context,
+                DatasetRef(context.active_workspace_id, dataset_id),
+                config,
+                initialize=True,
+                website_job_ref=website_job_ref,
             )
             if dify_config.RBAC_ENABLED:
                 rbac_service.RBACService.DatasetAccess.replace_whitelist(
@@ -474,13 +571,7 @@ class SQLAlchemyDocumentOperations:
                 )
             return result
 
-    def _check_model(self, ref: DatasetRef) -> None:
-        with self._sessions() as session:
-            dataset = _require_dataset(session, ref)
-        DatasetService.check_dataset_model_setting(dataset)
-
     def delete_document(self, ref: DocumentRef) -> None:
-        self._check_model(ref.dataset)
         with _translate_errors(), self._sessions() as session:
             DocumentService.delete_document(_require_document(session, ref), session)
 
@@ -491,18 +582,53 @@ class SQLAlchemyDocumentOperations:
                 ref, list(document_ids), get_dataset_doc_form(dataset, session=session), session
             )
 
-    def update_document(self, ref: DocumentRef, values: Mapping[str, object]) -> None:
+    def update_metadata(self, ref: DocumentRef, *, doc_type: str, doc_metadata: Mapping[str, object]) -> None:
+        """Replace document-type metadata without overwriting other metadata owners.
+
+        Dataset metadata schema/binding writers and built-in metadata toggles
+        serialize on the dataset lock. The document lock then protects the JSON
+        projection. Only values owned by this endpoint are replaced; custom
+        values with a current binding and enabled built-in values survive.
+        """
+
         with self._sessions.begin() as session:
-            document = _require_document(session, ref)
-            for name, value in values.items():
-                setattr(document, name, value)
+            dataset = lock_metadata_dataset(session, ref.dataset)
+            if dataset is None:
+                raise DatasetNotFoundError()
+            document = lock_metadata_document(session, ref.dataset, ref.document_id)
+            if document is None:
+                raise DocumentNotFoundError("Document not found.")
+
+            current = dict(document.doc_metadata or {})
+            bound = lock_metadata_document_bindings(session, ref.dataset, ref.document_id)
+            custom_values = {field.name: current[field.name] for _binding, field in bound if field.name in current}
+
+            values = dict(doc_metadata)
+            # Built-in metadata is exclusively maintained by the metadata
+            # repository. A stale free-form document-type payload cannot revive
+            # fields after the dataset-wide built-in toggle removes them.
+            for field in BuiltInField:
+                values.pop(field, None)
+            if dataset.built_in_field_enabled:
+                values.update({field: current[field] for field in BuiltInField if field in current})
+
+            # A bound custom field wins a same-name document-type field. Custom
+            # values may only be edited through the ID-based metadata API, which
+            # keeps their JSON projection and binding in one transaction.
+            values.update(custom_values)
+            document.doc_type = doc_type
+            document.doc_metadata = values
 
     def rename_document(self, ref: DocumentRef, name: str) -> dict[str, Any]:
         with self._sessions.begin() as session:
-            dataset = _require_dataset(session, ref.dataset)
-            document = _require_document(session, ref)
-            if dataset.built_in_field_enabled and document.doc_metadata:
-                document.doc_metadata = {**document.doc_metadata, BuiltInField.document_name: name}
+            dataset = lock_metadata_dataset(session, ref.dataset)
+            if dataset is None:
+                raise DatasetNotFoundError()
+            document = lock_metadata_document(session, ref.dataset, ref.document_id)
+            if document is None:
+                raise DocumentNotFoundError("Document not found.")
+            if dataset.built_in_field_enabled:
+                document.doc_metadata = {**(document.doc_metadata or {}), BuiltInField.document_name: name}
             document.name = name
             if document.data_source_info_dict and (file_id := document.data_source_info_dict.get("upload_file_id")):
                 session.execute(
@@ -533,7 +659,6 @@ class SQLAlchemyDocumentOperations:
         document_ids: Sequence[str],
         action: Literal["enable", "disable", "archive", "un_archive"],
     ) -> None:
-        self._check_model(ref)
         with _translate_errors(), self._sessions() as session:
             dataset = _require_dataset(session, ref)
             account = self._actor(session, context)
@@ -578,4 +703,7 @@ class SQLAlchemyDocumentOperations:
                 )
 
     def dispatch_summary(self, ref: DocumentRef) -> None:
-        generate_summary_index_task.delay(ref.dataset.dataset_id, ref.document_id)
+        with self._sessions() as session:
+            dataset = _require_dataset(session, ref.dataset)
+            parent_generation_id = dataset.indexing_request_id
+        generate_summary_index_task.delay(ref.dataset.dataset_id, ref.document_id, None, parent_generation_id)

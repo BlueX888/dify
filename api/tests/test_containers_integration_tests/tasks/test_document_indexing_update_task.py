@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from faker import Faker
@@ -9,28 +9,21 @@ from core.rag.index_processor.constant.index_type import IndexStructureType, Ind
 from models import Account, AccountStatus, Tenant, TenantAccountJoin, TenantAccountRole, TenantStatus
 from models.dataset import Dataset, Document, DocumentSegment
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus, SegmentStatus
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 from tasks.document_indexing_update_task import document_indexing_update_task
 
 
 class TestDocumentIndexingUpdateTask:
     @pytest.fixture
     def mock_external_dependencies(self):
-        """Patch external collaborators used by the update task.
-        - IndexProcessorFactory.init_index_processor().clean(...)
-        - build_document_indexing_service.run([...])
-        """
+        """Patch the cleanup and indexing application boundaries."""
         with (
-            patch("tasks.document_indexing_update_task.IndexProcessorFactory", autospec=True) as mock_factory,
+            patch("tasks.document_indexing_update_task.clean_document_for_reindex", autospec=True) as mock_cleanup,
             patch("tasks.document_indexing_update_task.build_document_indexing_service", autospec=True) as mock_runner,
         ):
-            processor_instance = MagicMock()
-            mock_factory.return_value.init_index_processor.return_value = processor_instance
-
             runner_instance = mock_runner.return_value
             yield {
-                "factory": mock_factory,
-                "processor": processor_instance,
+                "cleanup": mock_cleanup,
                 "runner": mock_runner,
                 "runner_instance": runner_instance,
             }
@@ -116,8 +109,8 @@ class TestDocumentIndexingUpdateTask:
 
         return dataset, document, node_ids
 
-    def test_cleans_segments_and_reindexes(self, db_session_with_containers: Session, mock_external_dependencies):
-        dataset, document, node_ids = self._create_dataset_document_with_segments(db_session_with_containers)
+    def test_delegates_cleanup_and_reindexes(self, db_session_with_containers: Session, mock_external_dependencies):
+        dataset, document, _ = self._create_dataset_document_with_segments(db_session_with_containers)
 
         # Act
         document_indexing_update_task(dataset.id, document.id)
@@ -130,43 +123,38 @@ class TestDocumentIndexingUpdateTask:
         assert updated.indexing_status == IndexingStatus.PARSING
         assert updated.processing_started_at is not None
 
-        # Segments should be deleted
-        remaining = db_session_with_containers.scalar(
-            select(func.count()).select_from(DocumentSegment).where(DocumentSegment.document_id == document.id)
-        )
-        assert remaining == 0
-
-        # Assert index processor clean was called with expected args
-        clean_call = mock_external_dependencies["processor"].clean.call_args
-        assert clean_call is not None
-        args, kwargs = clean_call
-        # args[0] is a Dataset instance (from another session), so validate by id.
-        assert args[0].id == dataset.id
-        # args[1] should contain our node_ids.
-        assert set(args[1]) == set(node_ids)
-        assert kwargs.get("with_keywords") is True
-        assert kwargs.get("delete_child_chunks") is True
+        cleanup_call = mock_external_dependencies["cleanup"].call_args
+        assert cleanup_call is not None
+        assert cleanup_call.args == ()
+        assert cleanup_call.kwargs["tenant_id"] == dataset.tenant_id
+        assert cleanup_call.kwargs["dataset_id"] == dataset.id
+        assert cleanup_call.kwargs["document_ids"] == (document.id,)
+        assert cleanup_call.kwargs["doc_form"] == IndexStructureType.PARAGRAPH_INDEX
+        assert callable(cleanup_call.kwargs["new_session"])
+        assert callable(cleanup_call.kwargs["delete_blob"])
 
         # Reindexing receives the detached reference with its complete ownership chain.
         mock_external_dependencies["runner_instance"].run.assert_called_once_with(
             [DatasetRef(dataset.tenant_id, dataset.id).document(document.id)]
         )
 
-    def test_clean_error_is_logged_and_indexing_continues(
+    def test_clean_error_marks_document_failed_without_indexing(
         self, db_session_with_containers: Session, mock_external_dependencies
     ):
-        dataset, document, node_ids = self._create_dataset_document_with_segments(db_session_with_containers)
+        dataset, document, _ = self._create_dataset_document_with_segments(db_session_with_containers)
 
-        # Force clean to raise; task should continue to indexing
-        mock_external_dependencies["processor"].clean.side_effect = Exception("boom")
+        mock_external_dependencies["cleanup"].side_effect = Exception("boom")
 
         document_indexing_update_task(dataset.id, document.id)
 
         # Ensure we see committed changes from another session
         db_session_with_containers.expire_all()
 
-        # Indexing should still be triggered
-        mock_external_dependencies["runner_instance"].run.assert_called_once()
+        updated = db_session_with_containers.scalar(select(Document).where(Document.id == document.id).limit(1))
+        assert updated is not None
+        assert updated.indexing_status == IndexingStatus.ERROR
+        assert updated.error == "boom"
+        mock_external_dependencies["runner_instance"].run.assert_not_called()
 
         # Segments should remain (since clean failed before DB delete)
         remaining = db_session_with_containers.scalar(
@@ -179,6 +167,6 @@ class TestDocumentIndexingUpdateTask:
         # Act with non-existent document id
         document_indexing_update_task(dataset_id=fake.uuid4(), document_id=fake.uuid4())
 
-        # Neither processor nor runner should be called
-        mock_external_dependencies["processor"].clean.assert_not_called()
+        # Neither cleanup nor indexing should be called.
+        mock_external_dependencies["cleanup"].assert_not_called()
         mock_external_dependencies["runner_instance"].run.assert_not_called()

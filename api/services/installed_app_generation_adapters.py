@@ -8,6 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from core.app.apps.completion.app_generator import CompletionAppGenerator
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models import Account, App
 from services.account_errors import AccountNotFoundError
 from services.app_definition_query_service import AppDefinitionUnavailableError
@@ -55,8 +56,14 @@ class _MoreLikeThisEventStream:
 
 
 class AppGenerateServiceRuntime(InstalledAppGenerationRuntime):
-    def __init__(self, *, session_factory: sessionmaker[Session]) -> None:
+    def __init__(
+        self,
+        *,
+        session_factory: sessionmaker[Session],
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         self._session_factory: sessionmaker[Session] = session_factory
+        self._external_retrieval = external_retrieval
 
     @override
     def generate(
@@ -81,6 +88,7 @@ class AppGenerateServiceRuntime(InstalledAppGenerationRuntime):
                 args=args,
                 invoke_from=InvokeFrom.EXPLORE,
                 streaming=streaming,
+                external_retrieval=self._external_retrieval,
             )
         )
 
@@ -103,6 +111,7 @@ class AppGenerateServiceRuntime(InstalledAppGenerationRuntime):
                 message_id=message_id,
                 invoke_from=InvokeFrom.EXPLORE,
                 streaming=streaming,
+                external_retrieval=self._external_retrieval,
             )
             if isinstance(response, Mapping):
                 return response

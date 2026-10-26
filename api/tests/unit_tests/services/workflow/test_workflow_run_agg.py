@@ -1,6 +1,7 @@
 """Workflow orchestration against real Engine, SQLAlchemy, and filesystem storage."""
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import uuid4
@@ -8,6 +9,7 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
+from sqlalchemy.pool import PoolProxiedConnection
 
 from core.app.apps.workflow.app_config_manager import WorkflowAppConfig
 from core.app.apps.workflow.app_queue_manager import WorkflowAppQueueManager
@@ -34,7 +36,7 @@ from graphon.engine_events import (
     GraphRunStartedEvent,
     GraphRunSucceededEvent,
 )
-from graphon.enums import WorkflowExecutionStatus
+from graphon.enums import WorkflowExecutionStatus, WorkflowType
 from graphon.nodes.start.entities import StartNodeData
 from graphon.runtime import RuntimeState
 from graphon.variable_loader import DUMMY_VARIABLE_LOADER
@@ -49,10 +51,14 @@ from models.workflow import (
     WorkflowPause,
     WorkflowRun,
 )
-from services.workflow.entities import WorkflowScheduleCFSPlanEntity
+from repositories.entities.workflow_execution import WorkflowExecution
+from repositories.entities.workflow_pause import WorkflowTriggerPausePublication
+from repositories.sqlalchemy_api_workflow_run_repository import (
+    DifyAPISQLAlchemyWorkflowRunRepository,
+    WorkflowPauseTriggerOwnershipLostError,
+)
 from services.workflow_run_agg import WorkflowRunAgg
-from tasks.workflow_cfs_scheduler.cfs_scheduler import AsyncWorkflowCFSPlanEntity
-from tasks.workflow_cfs_scheduler.entities import AsyncWorkflowQueue
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 
 
 def make_workflow_runner(
@@ -132,8 +138,41 @@ def make_workflow_runner(
         workflow=workflow,
         system_user_id=user_id,
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=make_external_dataset_retriever(),
     )
     return runner, workflow_repository, node_repository
+
+
+def attach_owned_trigger(
+    sqlite_engine: Engine, runner: WorkflowAppRunner, *, owner_id: str = "owner-1"
+) -> tuple[WorkflowTriggerLog, datetime]:
+    trigger_log = WorkflowTriggerLog(
+        tenant_id=runner.application_generate_entity.app_config.tenant_id,
+        app_id=runner.application_generate_entity.app_config.app_id,
+        workflow_id=runner._workflow.id,
+        workflow_run_id=None,
+        root_node_id=None,
+        trigger_metadata="{}",
+        trigger_type=AppTriggerType.TRIGGER_SCHEDULE,
+        trigger_data="{}",
+        inputs="{}",
+        outputs=None,
+        status=WorkflowTriggerStatus.RUNNING,
+        error=None,
+        queue_name="workflow",
+        celery_task_id=None,
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by=runner.application_generate_entity.user_id,
+        execution_owner_id=owner_id,
+        execution_lease_expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        elapsed_time=5.0,
+    )
+    with Session(sqlite_engine, expire_on_commit=False) as session:
+        session.add(trigger_log)
+        session.commit()
+    start_time = datetime.now(UTC) - timedelta(seconds=10)
+    runner._graph_engine_layers = (TriggerPostLayer(start_time, trigger_log.id, owner_id),)
+    return trigger_log, start_time
 
 
 def test_driver_publishes_persisted_start_index_and_success(sqlite_engine: Engine) -> None:
@@ -210,10 +249,24 @@ def test_pause_database_failure_publishes_failure_instead_of_resume_ready(
     sqlite_engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     def fail_pause(*_args: object, **_kwargs: object) -> None:
+        # This is the hard-loss checkpoint: the snapshot has been prepared and
+        # handed to the publisher, but no resumable state or owner release is
+        # durably visible yet.
+        with Session(sqlite_engine) as checkpoint_session:
+            checkpoint_run = checkpoint_session.get(
+                WorkflowRun, runner.application_generate_entity.workflow_execution_id
+            )
+            checkpoint_trigger = checkpoint_session.get(WorkflowTriggerLog, trigger_log.id)
+            assert checkpoint_run is not None
+            assert checkpoint_run.status == WorkflowExecutionStatus.RUNNING
+            assert checkpoint_trigger is not None
+            assert checkpoint_trigger.status == WorkflowTriggerStatus.RUNNING
+            assert checkpoint_trigger.execution_owner_id == "owner-1"
+            assert checkpoint_session.scalar(select(WorkflowPause)) is None
         raise RuntimeError("pause-write-failed")
 
     monkeypatch.setattr(
-        "repositories.sqlalchemy_api_workflow_run_repository.DifyAPISQLAlchemyWorkflowRunRepository.create_workflow_pause",
+        "repositories.sqlalchemy_api_workflow_run_repository.DifyAPISQLAlchemyWorkflowRunRepository.publish_workflow_pause",
         fail_pause,
     )
     retirements: list[dict[str, object]] = []
@@ -232,34 +285,7 @@ def test_pause_database_failure_publishes_failure_instead_of_resume_ready(
         lambda **kwargs: collections.append(kwargs),
     )
     runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
-    trigger_log = WorkflowTriggerLog(
-        tenant_id=runner.application_generate_entity.app_config.tenant_id,
-        app_id=runner.application_generate_entity.app_config.app_id,
-        workflow_id=runner._workflow.id,
-        workflow_run_id=None,
-        root_node_id=None,
-        trigger_metadata="{}",
-        trigger_type=AppTriggerType.TRIGGER_SCHEDULE,
-        trigger_data="{}",
-        inputs="{}",
-        outputs=None,
-        status=WorkflowTriggerStatus.RUNNING,
-        error=None,
-        queue_name="workflow",
-        celery_task_id=None,
-        created_by_role=CreatorUserRole.ACCOUNT,
-        created_by=runner.application_generate_entity.user_id,
-        elapsed_time=5.0,
-    )
-    with Session(sqlite_engine, expire_on_commit=False) as session:
-        session.add(trigger_log)
-        session.commit()
-    start_time = datetime.now(UTC) - timedelta(seconds=10)
-    plan = AsyncWorkflowCFSPlanEntity(
-        schedule_strategy=WorkflowScheduleCFSPlanEntity.Strategy.Nop,
-        queue=AsyncWorkflowQueue.PROFESSIONAL_QUEUE,
-    )
-    runner._graph_engine_layers = (TriggerPostLayer(plan, start_time, trigger_log.id),)
+    trigger_log, start_time = attach_owned_trigger(sqlite_engine, runner)
     WorkflowRunAgg.run(
         runner,
         PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
@@ -297,6 +323,317 @@ def test_pause_database_failure_publishes_failure_instead_of_resume_ready(
         assert session.scalar(select(WorkflowPause)) is None
 
 
+@pytest.mark.usefixtures("_local_storage")
+def test_pause_publication_atomically_releases_the_owned_trigger(sqlite_engine: Engine) -> None:
+    runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
+    trigger_log, start_time = attach_owned_trigger(sqlite_engine, runner)
+
+    WorkflowRunAgg.run(
+        runner,
+        PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
+        workflow_repository,
+        node_repository,
+    )
+
+    events = [message.event for message in runner._queue_manager.listen()]
+    assert isinstance(events[-1], QueueWorkflowPausedEvent), events
+    with Session(sqlite_engine) as session:
+        persisted_trigger = session.get(WorkflowTriggerLog, trigger_log.id)
+        run = session.get(WorkflowRun, runner.application_generate_entity.workflow_execution_id)
+        assert persisted_trigger is not None
+        assert persisted_trigger.status == WorkflowTriggerStatus.PAUSED
+        assert persisted_trigger.execution_owner_id is None
+        assert persisted_trigger.execution_lease_expires_at is None
+        assert persisted_trigger.terminal_owner_id == "owner-1"
+        assert persisted_trigger.finished_at is not None
+        assert persisted_trigger.elapsed_time == pytest.approx(
+            5.0 + (persisted_trigger.finished_at.replace(tzinfo=UTC) - start_time).total_seconds()
+        )
+        assert run is not None
+        assert run.status == WorkflowExecutionStatus.PAUSED
+        assert session.scalar(select(WorkflowPause).where(WorkflowPause.workflow_run_id == run.id)) is not None
+
+
+@pytest.mark.usefixtures("_local_storage")
+def test_pause_commit_ack_loss_reconciles_the_exact_published_snapshot(
+    sqlite_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
+    trigger_log, _ = attach_owned_trigger(sqlite_engine, runner)
+    original_do_commit = sqlite_engine.dialect.do_commit
+    lost_acknowledgements: list[None] = []
+
+    def commit_then_lose_ack(dbapi_connection: PoolProxiedConnection) -> None:
+        original_do_commit(dbapi_connection)
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SELECT COUNT(*) FROM workflow_pauses")
+            row = cursor.fetchone()
+            assert row is not None
+            pause_count = row[0]
+        finally:
+            cursor.close()
+        if pause_count and not lost_acknowledgements:
+            lost_acknowledgements.append(None)
+            raise ConnectionError("commit-ack-lost")
+
+    monkeypatch.setattr(sqlite_engine.dialect, "do_commit", commit_then_lose_ack)
+    WorkflowRunAgg.run(
+        runner,
+        PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
+        workflow_repository,
+        node_repository,
+    )
+
+    events = [message.event for message in runner._queue_manager.listen()]
+    assert lost_acknowledgements == [None]
+    assert isinstance(events[-1], QueueWorkflowPausedEvent), events
+    with Session(sqlite_engine) as session:
+        persisted_trigger = session.get(WorkflowTriggerLog, trigger_log.id)
+        run = session.get(WorkflowRun, runner.application_generate_entity.workflow_execution_id)
+        assert run is not None
+        pause = session.scalar(select(WorkflowPause).where(WorkflowPause.workflow_run_id == run.id))
+        assert persisted_trigger is not None
+        assert persisted_trigger.status == WorkflowTriggerStatus.PAUSED
+        assert persisted_trigger.terminal_owner_id == "owner-1"
+        assert run.status == WorkflowExecutionStatus.PAUSED
+        assert pause is not None
+        assert storage.load(pause.state_object_key)
+
+
+@pytest.mark.usefixtures("_local_storage")
+def test_pause_commit_ack_loss_does_not_overwrite_a_concurrent_resume(
+    sqlite_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from sqlalchemy.orm import sessionmaker
+
+    runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
+    trigger_log, _ = attach_owned_trigger(sqlite_engine, runner)
+    control_repository = DifyAPISQLAlchemyWorkflowRunRepository(sessionmaker(sqlite_engine))
+    original_do_commit = sqlite_engine.dialect.do_commit
+    resumed_after_commit: list[None] = []
+
+    def commit_resume_then_lose_ack(dbapi_connection: PoolProxiedConnection) -> None:
+        original_do_commit(dbapi_connection)
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SELECT COUNT(*) FROM workflow_pauses")
+            row = cursor.fetchone()
+            assert row is not None
+            pause_count = row[0]
+        finally:
+            cursor.close()
+        if pause_count and not resumed_after_commit:
+            resumed_after_commit.append(None)
+            pause = control_repository.get_workflow_pause(runner.application_generate_entity.workflow_execution_id)
+            assert pause is not None
+            control_repository.resume_workflow_pause(
+                runner.application_generate_entity.workflow_execution_id,
+                pause,
+            )
+            raise ConnectionError("commit-ack-lost-after-resume")
+
+    monkeypatch.setattr(sqlite_engine.dialect, "do_commit", commit_resume_then_lose_ack)
+    WorkflowRunAgg.run(
+        runner,
+        PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
+        workflow_repository,
+        node_repository,
+    )
+
+    events = [message.event for message in runner._queue_manager.listen()]
+    assert resumed_after_commit == [None]
+    assert isinstance(events[-1], QueueWorkflowFailedEvent), events
+    assert not any(isinstance(event, QueueWorkflowPausedEvent) for event in events)
+    trigger_layer = runner._graph_engine_layers[0]
+    assert isinstance(trigger_layer, TriggerPostLayer)
+    assert trigger_layer.pause_publication_outcome_unknown is False
+    with Session(sqlite_engine) as session:
+        persisted_trigger = session.get(WorkflowTriggerLog, trigger_log.id)
+        run = session.get(WorkflowRun, runner.application_generate_entity.workflow_execution_id)
+        assert run is not None
+        pause = session.scalar(select(WorkflowPause).where(WorkflowPause.workflow_run_id == run.id))
+        assert persisted_trigger is not None
+        assert persisted_trigger.status == WorkflowTriggerStatus.PAUSED
+        assert persisted_trigger.terminal_owner_id == "owner-1"
+        assert run.status == WorkflowExecutionStatus.RUNNING
+        assert pause is not None
+        assert pause.resumed_at is not None
+        assert storage.load(pause.state_object_key)
+
+
+@pytest.mark.usefixtures("_local_storage")
+def test_unavailable_postcommit_reconciliation_preserves_published_snapshot(
+    sqlite_engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from repositories.sqlalchemy_api_workflow_run_repository import DifyAPISQLAlchemyWorkflowRunRepository
+
+    runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
+    trigger_log, _ = attach_owned_trigger(sqlite_engine, runner)
+    original_do_commit = sqlite_engine.dialect.do_commit
+    lost_acknowledgements: list[None] = []
+
+    def commit_then_lose_ack(dbapi_connection: PoolProxiedConnection) -> None:
+        original_do_commit(dbapi_connection)
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("SELECT COUNT(*) FROM workflow_pauses")
+            row = cursor.fetchone()
+            assert row is not None
+            pause_count = row[0]
+        finally:
+            cursor.close()
+        if pause_count and not lost_acknowledgements:
+            lost_acknowledgements.append(None)
+            raise ConnectionError("commit-ack-lost")
+
+    def unavailable_reconciliation(*_args: object, **_kwargs: object) -> None:
+        raise TimeoutError("reconciliation-unavailable")
+
+    monkeypatch.setattr(sqlite_engine.dialect, "do_commit", commit_then_lose_ack)
+    monkeypatch.setattr(
+        DifyAPISQLAlchemyWorkflowRunRepository,
+        "_reconcile_pause_publication",
+        unavailable_reconciliation,
+    )
+    WorkflowRunAgg.run(
+        runner,
+        PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
+        workflow_repository,
+        node_repository,
+    )
+
+    events = [message.event for message in runner._queue_manager.listen()]
+    assert lost_acknowledgements == [None]
+    assert isinstance(events[-1], QueueWorkflowFailedEvent), events
+    trigger_layer = runner._graph_engine_layers[0]
+    assert isinstance(trigger_layer, TriggerPostLayer)
+    assert trigger_layer.pause_publication_outcome_unknown is True
+    with Session(sqlite_engine) as session:
+        persisted_trigger = session.get(WorkflowTriggerLog, trigger_log.id)
+        run = session.get(WorkflowRun, runner.application_generate_entity.workflow_execution_id)
+        assert run is not None
+        pause = session.scalar(select(WorkflowPause).where(WorkflowPause.workflow_run_id == run.id))
+        assert persisted_trigger is not None
+        assert persisted_trigger.status == WorkflowTriggerStatus.PAUSED
+        assert persisted_trigger.terminal_owner_id == "owner-1"
+        assert run.status == WorkflowExecutionStatus.PAUSED
+        assert pause is not None
+        assert storage.load(pause.state_object_key)
+
+
+@pytest.mark.usefixtures("_local_storage")
+def test_replacing_resumed_pause_preserves_old_blob_on_rollback_then_cleans_it_after_commit(
+    sqlite_engine: Engine,
+) -> None:
+    from sqlalchemy.orm import sessionmaker
+
+    runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
+    WorkflowRunAgg.run(
+        runner,
+        PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
+        workflow_repository,
+        node_repository,
+    )
+    repository = DifyAPISQLAlchemyWorkflowRunRepository(sessionmaker(sqlite_engine))
+    run_id = runner.application_generate_entity.workflow_execution_id
+    old_pause = repository.get_workflow_pause(run_id)
+    assert old_pause is not None
+    with Session(sqlite_engine) as session:
+        old_pause_model = session.get(WorkflowPause, old_pause.id)
+        assert old_pause_model is not None
+        old_state_obj_key = old_pause_model.state_object_key
+    old_state = storage.load(old_state_obj_key)
+    repository.resume_workflow_pause(run_id, old_pause)
+
+    trigger_log, _ = attach_owned_trigger(sqlite_engine, runner, owner_id="owner-2")
+    paused_execution = WorkflowExecution(
+        id_=run_id,
+        workflow_id=runner._workflow.id,
+        workflow_type=WorkflowType.WORKFLOW,
+        workflow_version="draft",
+        graph={},
+        inputs={},
+        outputs={"answer": "replacement"},
+        status=WorkflowExecutionStatus.PAUSED,
+        total_tokens=3,
+        total_steps=2,
+        exceptions_count=0,
+        started_at=datetime.now(UTC) - timedelta(seconds=2),
+        accumulated_elapsed_time=2.0,
+    )
+    publication = WorkflowTriggerPausePublication(
+        trigger_log_id=trigger_log.id,
+        owner_id="owner-1",
+        workflow_run_id=run_id,
+        outputs='{"answer":"replacement"}',
+        elapsed_time=2.0,
+        total_tokens=3,
+        finished_at=datetime.now(UTC),
+    )
+
+    with pytest.raises(WorkflowPauseTriggerOwnershipLostError):
+        repository.publish_workflow_pause(
+            workflow_execution=paused_execution,
+            state_owner_user_id=runner.application_generate_entity.user_id,
+            state='{"replacement":false}',
+            pause_reasons=(),
+            trigger_updates=(publication,),
+        )
+
+    with Session(sqlite_engine) as session:
+        restored_old_pause = session.get(WorkflowPause, old_pause.id)
+        run = session.get(WorkflowRun, run_id)
+        assert restored_old_pause is not None
+        assert restored_old_pause.state_object_key == old_state_obj_key
+        assert run is not None
+        assert run.status == WorkflowExecutionStatus.RUNNING
+    assert storage.load(old_state_obj_key) == old_state
+
+    committed_pause = repository.publish_workflow_pause(
+        workflow_execution=paused_execution,
+        state_owner_user_id=runner.application_generate_entity.user_id,
+        state='{"replacement":true}',
+        pause_reasons=(),
+        trigger_updates=(replace(publication, owner_id="owner-2"),),
+    )
+    with Session(sqlite_engine) as session:
+        replacement = session.get(WorkflowPause, committed_pause.id)
+        assert replacement is not None
+        assert replacement.state_object_key != old_state_obj_key
+    with pytest.raises(FileNotFoundError):
+        storage.load(old_state_obj_key)
+
+
+@pytest.mark.usefixtures("_local_storage")
+def test_pause_publication_lost_owner_does_not_overwrite_successor_state(sqlite_engine: Engine) -> None:
+    runner, workflow_repository, node_repository = make_workflow_runner(sqlite_engine, human_input=True)
+    trigger_log, _ = attach_owned_trigger(sqlite_engine, runner)
+    with Session(sqlite_engine) as session, session.begin():
+        persisted_trigger = session.get(WorkflowTriggerLog, trigger_log.id)
+        assert persisted_trigger is not None
+        persisted_trigger.execution_owner_id = "owner-2"
+
+    WorkflowRunAgg.run(
+        runner,
+        PauseStateLayerConfig(sqlite_engine, runner.application_generate_entity.user_id),
+        workflow_repository,
+        node_repository,
+    )
+
+    events = [message.event for message in runner._queue_manager.listen()]
+    assert isinstance(events[-1], QueueWorkflowFailedEvent), events
+    with Session(sqlite_engine) as session:
+        persisted_trigger = session.get(WorkflowTriggerLog, trigger_log.id)
+        run = session.get(WorkflowRun, runner.application_generate_entity.workflow_execution_id)
+        assert persisted_trigger is not None
+        assert persisted_trigger.status == WorkflowTriggerStatus.RUNNING
+        assert persisted_trigger.execution_owner_id == "owner-2"
+        assert run is not None
+        assert run.status == WorkflowExecutionStatus.RUNNING
+        assert session.scalar(select(WorkflowPause).where(WorkflowPause.workflow_run_id == run.id)) is None
+
+
 def test_late_form_submission_is_refreshed_before_the_real_queue_closes(sqlite_session: Session) -> None:
     from core.app.apps.workflow_app_runner import WorkflowBasedAppRunner
     from core.app.entities.queue_entities import QueueHumanInputFormFilledEvent
@@ -312,7 +649,11 @@ def test_late_form_submission_is_refreshed_before_the_real_queue_closes(sqlite_s
     first = _save_form(sqlite_session, status=HumanInputFormStatus.SUBMITTED)
     late = _save_form(sqlite_session, status=HumanInputFormStatus.WAITING)
     queue = WorkflowAppQueueManager("form-refresh-task", "user", InvokeFrom.DEBUGGER, AppMode.WORKFLOW)
-    runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+    runner = WorkflowBasedAppRunner(
+        queue_manager=queue,
+        external_retrieval=make_external_dataset_retriever(),
+        app_id="app",
+    )
     entry = _make_paused_workflow(runner, [first, late])
     for event in _resume_events(runner, entry):
         runner.handle_event(entry, event)
@@ -369,6 +710,7 @@ def test_durable_pause_resumes_with_one_form_completion_and_continuing_indexes(s
         graph_runtime_state=RuntimeState.from_snapshot(snapshot.serialized_graph_runtime_state),
         response_stream_filter=snapshot.get_response_stream_filter(),
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=make_external_dataset_retriever(),
     )
     WorkflowRunAgg.run(resumed, config, workflow_repository, node_repository)
     after = [message.event for message in queue.listen()]
@@ -532,6 +874,7 @@ def test_pause_before_first_tool_call_preserves_its_published_definition(sqlite_
         graph_runtime_state=RuntimeState.from_snapshot(snapshot.serialized_graph_runtime_state),
         response_stream_filter=snapshot.get_response_stream_filter(),
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=make_external_dataset_retriever(),
     )
     WorkflowRunAgg.run(resumed, config, workflow_repository, node_repository)
     after = [message.event for message in queue.listen()]
@@ -563,6 +906,7 @@ def test_pause_before_first_tool_call_preserves_its_published_definition(sqlite_
         workflow=original._workflow,
         system_user_id=fresh_entity.user_id,
         execution_driver=WorkflowRunAgg.run,
+        external_retrieval=make_external_dataset_retriever(),
     )
     WorkflowRunAgg.run(fresh, None, workflow_repository, node_repository)
     fresh_events = [message.event for message in fresh_queue.listen()]
@@ -725,6 +1069,7 @@ def test_elapsed_time_accumulates_across_pauses_and_matches_delayed_stream_respo
                 graph_runtime_state=RuntimeState.from_snapshot(snapshot.serialized_graph_runtime_state),
                 response_stream_filter=snapshot.get_response_stream_filter(),
                 execution_driver=WorkflowRunAgg.run,
+                external_retrieval=make_external_dataset_retriever(),
             )
         else:
             response = converter.workflow_finish_to_stream_response(

@@ -35,6 +35,16 @@ class WorkflowExecutionRepository(Protocol):
         """Commit the SQL control record before publishing a lifecycle transition."""
         ...
 
+    def publish_committed_pause(
+        self,
+        execution: WorkflowExecution,
+        *,
+        history_revision: int,
+        history_claim_id: str,
+    ) -> None:
+        """Publish pause history after its SQL control transaction is known committed."""
+        ...
+
 
 class WorkflowNodeExecutionRepository(Protocol):
     def for_workflow_tool(self, app_id: str) -> "WorkflowNodeExecutionRepository":

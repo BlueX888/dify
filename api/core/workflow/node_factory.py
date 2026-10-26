@@ -22,6 +22,7 @@ from core.helper.ssrf_proxy import graphon_ssrf_proxy
 from core.memory.token_buffer_memory import TokenBufferMemory
 from core.model_manager import ModelInstance
 from core.prompt.entities.advanced_prompt_entities import MemoryConfig
+from core.rag.index_processor.index_processor_base import KnowledgeIndexRuntime
 from core.trigger.constants import TRIGGER_NODE_TYPES
 from core.workflow.human_input_adapter import adapt_node_config_for_graph, parse_human_input_delivery_methods
 from core.workflow.llm_environment_variable import (
@@ -54,6 +55,7 @@ from core.workflow.nodes.agent_v2.output_adapter import WorkflowAgentOutputAdapt
 from core.workflow.nodes.agent_v2.runtime_request_builder import WorkflowAgentRuntimeRequestBuilder
 from core.workflow.nodes.human_input.callback import DifyHITLCallback
 from core.workflow.nodes.human_input.entities import HumanInputNodeData as DifyHumanInputNodeData
+from core.workflow.nodes.knowledge_index import KNOWLEDGE_INDEX_NODE_TYPE
 from core.workflow.system_variables import SystemVariableKey, get_system_text, system_variable_selector
 from core.workflow.template_rendering import CodeExecutorJinja2TemplateRenderer
 from core.workflow.workflow_tool_node import DifyWorkflowToolNode
@@ -80,6 +82,7 @@ from models.model import Conversation
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
     from core.tools.workflow_as_tool.tool import WorkflowTool
     from graphon.runtime import InitParams, RuntimeState
 
@@ -102,6 +105,8 @@ class DifyGraphInitContext:
     graph_config: Mapping[str, Any]
     run_context: Mapping[str, Any]
     call_depth: int
+    external_retrieval: "ExternalDatasetRetriever"
+    knowledge_index_runtime: KnowledgeIndexRuntime
     execution_driver: "WorkflowRunDriver | None" = None
 
     def to_graph_init_params(self) -> "InitParams":
@@ -326,6 +331,8 @@ class DifyNodeFactory(NodeFactory):
             runtime_state=runtime_state,
             human_input_run_context=human_input_run_context,
             use_workflow_tool_containers=use_workflow_tool_containers,
+            external_retrieval=graph_init_context.external_retrieval,
+            knowledge_index_runtime=graph_init_context.knowledge_index_runtime,
             execution_driver=graph_init_context.execution_driver,
             workflow_tools=workflow_tools,
         )
@@ -334,6 +341,8 @@ class DifyNodeFactory(NodeFactory):
         self,
         init_params: "InitParams",
         runtime_state: "RuntimeState",
+        external_retrieval: "ExternalDatasetRetriever",
+        knowledge_index_runtime: KnowledgeIndexRuntime,
         human_input_run_context: Mapping[str, Any] | DifyRunContext | None = None,
         use_workflow_tool_containers: bool = True,
         workflow_tools: dict[str, "WorkflowTool"] | None = None,
@@ -341,6 +350,8 @@ class DifyNodeFactory(NodeFactory):
     ) -> None:
         self.init_params = init_params
         self.runtime_state = runtime_state
+        self._external_retrieval = external_retrieval
+        self._knowledge_index_runtime = knowledge_index_runtime
         self._dify_context = self._resolve_dify_context(init_params.run_context)
         self._use_workflow_tool_containers = use_workflow_tool_containers
         self._execution_driver = execution_driver
@@ -392,7 +403,10 @@ class DifyNodeFactory(NodeFactory):
         )
         self.workflow_tools = workflow_tools if workflow_tools is not None else {}
         self._tool_runtime = DifyToolNodeRuntime(
-            self._dify_context, execution_driver=execution_driver, workflow_tools=self.workflow_tools
+            self._dify_context,
+            external_retrieval=external_retrieval,
+            execution_driver=execution_driver,
+            workflow_tools=self.workflow_tools,
         )
         self._http_request_file_manager = file_manager
         self._document_extractor_unstructured_api_config = UnstructuredApiConfig(
@@ -420,6 +434,8 @@ class DifyNodeFactory(NodeFactory):
         return DifyNodeFactory(
             init_params=self.init_params,
             runtime_state=runtime_state,
+            external_retrieval=self._external_retrieval,
+            knowledge_index_runtime=self._knowledge_index_runtime,
             human_input_run_context=self._human_input_run_context,
             use_workflow_tool_containers=self._use_workflow_tool_containers,
             workflow_tools=self.workflow_tools,
@@ -435,6 +451,14 @@ class DifyNodeFactory(NodeFactory):
     @property
     def execution_driver(self) -> "WorkflowRunDriver | None":
         return self._execution_driver
+
+    @property
+    def external_retrieval(self) -> "ExternalDatasetRetriever":
+        return self._external_retrieval
+
+    @property
+    def knowledge_index_runtime(self) -> KnowledgeIndexRuntime:
+        return self._knowledge_index_runtime
 
     @property
     def human_input_run_context(self) -> DifyRunContext:
@@ -510,6 +534,16 @@ class DifyNodeFactory(NodeFactory):
             BuiltinNodeTypes.DOCUMENT_EXTRACTOR: lambda: {
                 "unstructured_api_config": self._document_extractor_unstructured_api_config,
                 "http_client": self._remote_file_http_client,
+            },
+            BuiltinNodeTypes.KNOWLEDGE_RETRIEVAL: lambda: {
+                "external_retrieval": self._external_retrieval,
+                "retrieval_finalizer": self._knowledge_index_runtime.retrieval_finalizer,
+            },
+            KNOWLEDGE_INDEX_NODE_TYPE: lambda: {
+                "attachment_vectors": self._knowledge_index_runtime.attachment_vectors,
+                "child_vector_routes": self._knowledge_index_runtime.child_vector_routes,
+                "indexing_guard_factory": self._knowledge_index_runtime.indexing_guard_factory,
+                "indexing_route_recorder_factory": self._knowledge_index_runtime.indexing_route_recorder_factory,
             },
             BuiltinNodeTypes.QUESTION_CLASSIFIER: lambda: self._build_llm_compatible_node_init_kwargs(
                 node_class=node_class,

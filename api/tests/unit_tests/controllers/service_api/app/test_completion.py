@@ -15,7 +15,7 @@ import sys
 import uuid
 from decimal import Decimal
 from inspect import unwrap
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
 from flask import Flask
@@ -44,7 +44,9 @@ from controllers.service_api.app.error import (
 from controllers.web.error import InvokeRateLimitError as InvokeRateLimitHttpError
 from core.app.apps.agent_app.errors import AgentAppNotPublishedError
 from core.errors.error import QuotaExceededError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from enums import CloudPlan, DeploymentEdition
+from extensions.ext_application_services import ApplicationServices
 from graphon.model_runtime.errors.invoke import InvokeError
 from graphon.model_runtime.errors.invoke import InvokeRateLimitError as ProviderInvokeRateLimitError
 from models.base import TypeBase
@@ -58,6 +60,19 @@ from services.errors.app import IsDraftWorkflowError, WorkflowIdFormatError, Wor
 from services.errors.conversation import ConversationNotExistsError
 from services.errors.llm import InvokeRateLimitError
 from tests.unit_tests.config_override import apply_config_overrides
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    application_services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    application_services.knowledge.external_retrieval = external_retrieval
+    monkeypatch.setattr(
+        sys.modules["controllers.service_api.app.completion"],
+        "application_services",
+        lambda: application_services,
+    )
+    return external_retrieval
 
 
 @pytest.fixture
@@ -401,7 +416,12 @@ class TestCompletionControllerLogic:
     @patch("controllers.service_api.app.completion.service_api_ns")
     @patch("controllers.service_api.app.completion.AppGenerateService")
     def test_completion_api_post_success(
-        self, mock_generate_service, mock_service_api_ns, app: Flask, orm_session: Session
+        self,
+        mock_generate_service,
+        mock_service_api_ns,
+        app: Flask,
+        orm_session: Session,
+        external_retrieval: MagicMock,
     ):
         """Test CompletionApi.post success path."""
         from controllers.service_api.app.completion import CompletionApi
@@ -423,6 +443,7 @@ class TestCompletionControllerLogic:
 
                 assert response == {"text": "compacted"}
                 mock_generate_service.generate.assert_called_once()
+                assert mock_generate_service.generate.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch("controllers.service_api.app.completion.service_api_ns")
     def test_completion_api_post_wrong_app_mode(self, mock_service_api_ns, app: Flask, orm_session: Session):
@@ -437,7 +458,14 @@ class TestCompletionControllerLogic:
 
     @patch("controllers.service_api.app.completion.service_api_ns")
     @patch("controllers.service_api.app.completion.AppGenerateService")
-    def test_chat_api_post_success(self, mock_generate_service, mock_service_api_ns, app: Flask, orm_session: Session):
+    def test_chat_api_post_success(
+        self,
+        mock_generate_service,
+        mock_service_api_ns,
+        app: Flask,
+        orm_session: Session,
+        external_retrieval: MagicMock,
+    ):
         """Test ChatApi.post success path."""
         from controllers.service_api.app.completion import ChatApi
 
@@ -454,6 +482,7 @@ class TestCompletionControllerLogic:
                 api = ChatApi()
                 response = unwrap(api.post)(api, orm_session, app_model, end_user)
                 assert response == {"text": "compacted"}
+                assert mock_generate_service.generate.call_args.kwargs["external_retrieval"] is external_retrieval
 
     @patch("controllers.service_api.app.completion.service_api_ns")
     def test_chat_api_post_wrong_app_mode(self, mock_service_api_ns, app: Flask, orm_session: Session):
@@ -642,6 +671,7 @@ class TestChatApiController:
         deployment_edition: DeploymentEdition,
         plan: CloudPlan,
         workflow_id: str | None,
+        external_retrieval: MagicMock,
     ) -> None:
         completion_module = sys.modules["controllers.service_api.app.completion"]
         apply_config_overrides(monkeypatch, DEPLOYMENT_EDITION=deployment_edition)
@@ -664,6 +694,7 @@ class TestChatApiController:
 
         assert response == {"result": "ok"}
         generate.assert_called_once()
+        assert generate.call_args.kwargs["external_retrieval"] is external_retrieval
         if deployment_edition == DeploymentEdition.CLOUD and workflow_id:
             billing_get_info.assert_called_once_with(app_model.tenant_id, exclude_vector_space=True)
         else:

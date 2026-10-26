@@ -64,6 +64,8 @@ def _persist_trigger_log(database: TriggerDatabase, *, trigger_log_id: str = "lo
         celery_task_id=None,
         created_by_role=CreatorUserRole.ACCOUNT,
         created_by="account-1",
+        execution_owner_id="owner-1",
+        execution_lease_expires_at=datetime(2026, 2, 20, tzinfo=UTC) + timedelta(minutes=5),
     )
     trigger_log.id = trigger_log_id
     database.session.add(trigger_log)
@@ -88,9 +90,9 @@ class TestTriggerPostLayer:
             mock_datetime.now.return_value = datetime(2026, 2, 20, tzinfo=UTC)
 
             layer = TriggerPostLayer(
-                cfs_plan_scheduler_entity=Mock(),
                 start_time=datetime(2026, 2, 20, tzinfo=UTC) - timedelta(seconds=10),
                 trigger_log_id="log-1",
+                execution_owner_id="owner-1",
             )
             layer.initialize(runtime_state, Mock())
 
@@ -122,9 +124,9 @@ class TestTriggerPostLayer:
             mock_datetime.now.return_value = datetime(2026, 2, 20, tzinfo=UTC)
 
             layer = TriggerPostLayer(
-                cfs_plan_scheduler_entity=Mock(),
                 start_time=datetime(2026, 2, 20, tzinfo=UTC) - timedelta(seconds=10),
                 trigger_log_id="log-1",
+                execution_owner_id="owner-1",
             )
             layer.initialize(runtime_state, Mock())
 
@@ -155,9 +157,9 @@ class TestTriggerPostLayer:
         )
 
         layer = TriggerPostLayer(
-            cfs_plan_scheduler_entity=Mock(),
             start_time=datetime(2026, 2, 20, tzinfo=UTC),
             trigger_log_id="missing",
+            execution_owner_id="owner-1",
         )
         layer.initialize(runtime_state, Mock())
 
@@ -177,9 +179,9 @@ class TestTriggerPostLayer:
         )
 
         layer = TriggerPostLayer(
-            cfs_plan_scheduler_entity=Mock(),
             start_time=datetime(2026, 2, 20, tzinfo=UTC),
             trigger_log_id="log-1",
+            execution_owner_id="owner-1",
         )
         layer.initialize(runtime_state, Mock())
 

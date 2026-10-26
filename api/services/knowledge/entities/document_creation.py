@@ -2,7 +2,7 @@
 
 from dataclasses import dataclass
 
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 
 
 @dataclass(frozen=True)
@@ -20,3 +20,7 @@ class DocumentIndexingJobs:
     duplicated: tuple[str, ...] = ()
     removed_notion: tuple[str, ...] = ()
     updated: str | None = None
+    website_sync: str | None = None
+    recovered: str | None = None
+    retried: tuple[str, ...] = ()
+    actor_id: str | None = None

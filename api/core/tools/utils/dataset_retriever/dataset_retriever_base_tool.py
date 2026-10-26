@@ -4,6 +4,7 @@ from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from core.callback_handler.index_tool_callback_handler import DatasetIndexToolCallbackHandler
+from core.rag.embedding.retrieval import RetrievalFinalizer
 
 
 class DatasetRetrieverBaseTool(BaseModel, ABC):
@@ -17,6 +18,7 @@ class DatasetRetrieverBaseTool(BaseModel, ABC):
     hit_callbacks: list[DatasetIndexToolCallbackHandler] = []
     return_resource: bool
     retriever_from: str
+    retrieval_finalizer: RetrievalFinalizer
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     def run(self, session: Session, query: str) -> str:

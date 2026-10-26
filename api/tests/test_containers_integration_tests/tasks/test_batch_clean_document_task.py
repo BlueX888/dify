@@ -11,14 +11,14 @@ from unittest.mock import patch
 
 import pytest
 from faker import Faker
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from core.rag.index_processor.constant.index_type import IndexStructureType
 from extensions.storage.storage_type import StorageType
 from libs.datetime_utils import naive_utc_now
 from models import Account, Tenant, TenantAccountJoin, TenantAccountRole
-from models.dataset import Dataset, Document, DocumentSegment
+from models.dataset import Dataset, Document, DocumentSegment, SegmentAttachmentBinding
 from models.enums import CreatorUserRole, DataSourceType, DocumentCreatedFrom, IndexingStatus, SegmentStatus
 from models.model import UploadFile
 from repositories.knowledge.dataset_read_repository import get_dataset_doc_form
@@ -34,19 +34,14 @@ class TestBatchCleanDocumentTask:
         with (
             patch("tasks.batch_clean_document_task.storage") as mock_storage,
             patch("services.knowledge.indexing.adapters.cleanup.Vector", autospec=True) as mock_vector,
-            patch("tasks.batch_clean_document_task.get_image_upload_file_ids") as mock_get_image_ids,
             patch("tasks.batch_clean_document_task.schedule_billing_vector_space_refresh"),
         ):
             # Setup default mock returns
             mock_storage.delete.return_value = None
 
-            # Mock image file ID extraction
-            mock_get_image_ids.return_value = []
-
             yield {
                 "storage": mock_storage,
                 "vector": mock_vector.return_value,
-                "get_image_ids": mock_get_image_ids,
             }
 
     def _create_test_account(self, db_session_with_containers: Session):
@@ -223,6 +218,12 @@ class TestBatchCleanDocumentTask:
 
         return upload_file
 
+    @staticmethod
+    def _delete_documents_before_cleanup(session: Session, document_ids: list[str]) -> None:
+        """Mirror the committed document deletion that dispatches the production task."""
+        session.execute(delete(Document).where(Document.id.in_(document_ids)))
+        session.commit()
+
     def test_batch_clean_document_task_successful_cleanup(
         self, db_session_with_containers: Session, mock_external_service_dependencies
     ):
@@ -250,6 +251,7 @@ class TestBatchCleanDocumentTask:
         segment_id = segment.id
         index_node_id = segment.index_node_id
         file_id = upload_file.id
+        self._delete_documents_before_cleanup(db_session_with_containers, [document_id])
 
         # Execute the task
         batch_clean_document_task(
@@ -288,7 +290,7 @@ class TestBatchCleanDocumentTask:
         dataset = self._create_test_dataset(db_session_with_containers, account)
         document = self._create_test_document(db_session_with_containers, dataset, account)
         assert account.current_tenant
-        # Create segment with simple content (no image references)
+        # Persist an image and its durable segment ownership record.
         segment = DocumentSegment(
             tenant_id=account.current_tenant.id,
             dataset_id=document.dataset_id,
@@ -303,11 +305,28 @@ class TestBatchCleanDocumentTask:
         )
 
         db_session_with_containers.add(segment)
+        db_session_with_containers.flush()
+        image_file = self._create_test_upload_file(db_session_with_containers, account)
+        image_file.extension = "jpg"
+        image_file.mime_type = "image/jpeg"
+        image_file.name = "attachment.jpg"
+        binding = SegmentAttachmentBinding(
+            tenant_id=account.current_tenant.id,
+            dataset_id=dataset.id,
+            document_id=document.id,
+            segment_id=segment.id,
+            attachment_id=image_file.id,
+        )
+        db_session_with_containers.add(binding)
         db_session_with_containers.commit()
 
         # Store original IDs for verification
         segment_id = segment.id
         document_id = document.id
+        image_file_id = image_file.id
+        image_file_key = image_file.key
+        binding_id = binding.id
+        self._delete_documents_before_cleanup(db_session_with_containers, [document_id])
 
         # Execute the task
         batch_clean_document_task(
@@ -325,9 +344,9 @@ class TestBatchCleanDocumentTask:
             select(DocumentSegment).where(DocumentSegment.id == segment_id).limit(1)
         )
         assert deleted_segment is None
-
-        # Verify that the task completed successfully by checking the log output
-        # The task should have processed the segment and cleaned up the database
+        assert db_session_with_containers.get(SegmentAttachmentBinding, binding_id) is None
+        assert db_session_with_containers.get(UploadFile, image_file_id) is None
+        mock_external_service_dependencies["storage"].delete.assert_called_once_with(image_file_key)
 
     def test_batch_clean_document_task_no_segments(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -351,6 +370,7 @@ class TestBatchCleanDocumentTask:
         # Store original IDs for verification
         document_id = document.id
         file_id = upload_file.id
+        self._delete_documents_before_cleanup(db_session_with_containers, [document_id])
 
         # Execute the task
         batch_clean_document_task(
@@ -399,13 +419,14 @@ class TestBatchCleanDocumentTask:
         db_session_with_containers.delete(dataset)
         db_session_with_containers.commit()
 
-        # Execute the task with non-existent dataset
-        batch_clean_document_task(
-            document_ids=[document_id],
-            dataset_id=dataset_id,
-            doc_form=IndexStructureType.PARAGRAPH_INDEX,
-            file_ids=[],
-        )
+        # The compatibility task cannot recover tenant scope once the dataset row is gone.
+        with pytest.raises(ValueError, match="Dataset not found"):
+            batch_clean_document_task(
+                document_ids=[document_id],
+                dataset_id=dataset_id,
+                doc_form=IndexStructureType.PARAGRAPH_INDEX,
+                file_ids=[],
+            )
 
         # Verify that no index processing occurred
         mock_external_service_dependencies["vector"].delete_by_ids.assert_not_called()
@@ -446,6 +467,7 @@ class TestBatchCleanDocumentTask:
         document_id = document.id
         segment_id = segment.id
         file_id = upload_file.id
+        self._delete_documents_before_cleanup(db_session_with_containers, [document_id])
 
         # Mock storage.delete to raise an exception
         mock_external_service_dependencies["storage"].delete.side_effect = Exception("Storage error")
@@ -510,6 +532,7 @@ class TestBatchCleanDocumentTask:
         document_ids = [doc.id for doc in documents]
         segment_ids = [seg.id for seg in segments]
         file_ids = [file.id for file in upload_files]
+        self._delete_documents_before_cleanup(db_session_with_containers, document_ids)
 
         # Execute the task with multiple documents
         batch_clean_document_task(
@@ -570,43 +593,16 @@ class TestBatchCleanDocumentTask:
             segment = self._create_test_document_segment(db_session_with_containers, document, account)
 
             # Store the ID before the object is deleted
+            document_id = document.id
             segment_id = segment.id
+            self._delete_documents_before_cleanup(db_session_with_containers, [document_id])
 
-            try:
-                # Execute the task
-                batch_clean_document_task(
-                    document_ids=[document.id], dataset_id=dataset.id, doc_form=doc_form, file_ids=[]
-                )
+            batch_clean_document_task(document_ids=[document_id], dataset_id=dataset.id, doc_form=doc_form, file_ids=[])
 
-                # Verify that the task completed successfully for this doc_form
-                # The task should handle different document forms correctly
-
-                # Verify database cleanup
-                db_session_with_containers.commit()
-
-                # Check that segment is deleted
-                deleted_segment = db_session_with_containers.scalar(
-                    select(DocumentSegment).where(DocumentSegment.id == segment_id).limit(1)
-                )
-                assert deleted_segment is None
-
-            except Exception:
-                # If the task fails due to external service issues (e.g., plugin daemon),
-                # we should still verify that the database state is consistent
-                # This is a common scenario in test environments where external services may not be available
-                db_session_with_containers.commit()
-
-                # Check if the segment still exists (task may have failed before deletion)
-                existing_segment = db_session_with_containers.scalar(
-                    select(DocumentSegment).where(DocumentSegment.id == segment_id).limit(1)
-                )
-                if existing_segment is not None:
-                    # If segment still exists, the task failed before deletion
-                    # This is acceptable in test environments with external service issues
-                    pass
-                else:
-                    # If segment was deleted, the task succeeded
-                    pass
+            deleted_segment = db_session_with_containers.scalar(
+                select(DocumentSegment).where(DocumentSegment.id == segment_id).limit(1)
+            )
+            assert deleted_segment is None
 
     def test_batch_clean_document_task_large_batch_performance(
         self, db_session_with_containers: Session, mock_external_service_dependencies
@@ -647,6 +643,7 @@ class TestBatchCleanDocumentTask:
         document_ids = [doc.id for doc in documents]
         segment_ids = [seg.id for seg in segments]
         file_ids = [file.id for file in upload_files]
+        self._delete_documents_before_cleanup(db_session_with_containers, document_ids)
 
         # Measure execution time
         start_time = time.perf_counter()
@@ -746,6 +743,7 @@ class TestBatchCleanDocumentTask:
         document_id = document.id
         segment_ids = [seg.id for seg in segments]
         file_id = upload_file.id
+        self._delete_documents_before_cleanup(db_session_with_containers, [document_id])
 
         # Execute the task
         batch_clean_document_task(

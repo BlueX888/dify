@@ -8,7 +8,14 @@ from sqlalchemy.orm import Session
 
 import core.rag.extractor.extract_processor as processor_module
 from core.rag.extractor.entity.datasource_type import DatasourceType
-from core.rag.extractor.entity.extract_setting import ExtractSetting, NotionInfo, WebsiteInfo
+from core.rag.extractor.entity.extract_setting import (
+    CreatedUploadArtifact,
+    ExtractionResult,
+    ExtractSetting,
+    NotionInfo,
+    WebsiteInfo,
+    WebsiteJobRef,
+)
 from core.rag.extractor.extract_processor import ExtractProcessor
 from core.rag.models.document import Document
 from models.model import UploadFile
@@ -32,22 +39,28 @@ def _upload_file(*, key: str, file_id: str = "upload-file-1") -> UploadFile:
 
 class _ExtractorFactory:
     def __init__(self) -> None:
-        self.calls = []
+        self.calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
 
     def make(self, name: str) -> type[object]:
         calls = self.calls
 
         class DummyExtractor:
-            def __init__[**P](self, *args: P.args, **kwargs: P.kwargs):
+            last_edited_time: str | None = None
+
+            def __init__[**P](self, *args: P.args, **kwargs: P.kwargs) -> None:
                 calls.append((name, args, kwargs))
 
-            def extract(self):
+            def extract(self) -> list[Document]:
                 return [Document(page_content=f"extracted-by-{name}")]
+
+            @property
+            def created_upload_artifacts(self) -> tuple[CreatedUploadArtifact, ...]:
+                return ()
 
         return DummyExtractor
 
 
-def _patch_all_extractors(monkeypatch) -> _ExtractorFactory:
+def _patch_all_extractors(monkeypatch: pytest.MonkeyPatch) -> _ExtractorFactory:
     factory = _ExtractorFactory()
 
     for cls_name in [
@@ -81,10 +94,9 @@ class TestExtractProcessorLoaders:
         monkeypatch.setattr(
             ExtractProcessor,
             "extract",
-            lambda extract_setting, is_automatic=False, file_path=None: [
-                Document(page_content="doc-1"),
-                Document(page_content="doc-2"),
-            ],
+            lambda extract_setting, is_automatic=False, file_path=None, **_kwargs: ExtractionResult(
+                documents=[Document(page_content="doc-1"), Document(page_content="doc-2")]
+            ),
         )
 
         upload_file = _upload_file(key="file.txt")
@@ -131,10 +143,10 @@ class TestExtractProcessorLoaders:
 
         captured = {}
 
-        def fake_extract(extract_setting, is_automatic=False, file_path=None):
+        def fake_extract(extract_setting, is_automatic=False, file_path=None, **_kwargs):
             key = "file_path_docs" if "file_path_docs" not in captured else "file_path_text"
             captured[key] = file_path
-            return [Document(page_content="u1"), Document(page_content="u2")]
+            return ExtractionResult(documents=[Document(page_content="u1"), Document(page_content="u2")])
 
         monkeypatch.setattr(ExtractProcessor, "extract", fake_extract)
 
@@ -204,6 +216,7 @@ class TestExtractProcessorFileRouting:
         etl_type: str,
         is_automatic: bool = False,
         session: object | None = None,
+        persist_images: bool = True,
     ):
         factory = _patch_all_extractors(monkeypatch)
         apply_config_overrides(monkeypatch, ETL_TYPE=etl_type)
@@ -219,10 +232,15 @@ class TestExtractProcessorFileRouting:
             upload_file=_upload_file(key=f"uploaded{extension}"),
         )
 
-        docs = ExtractProcessor.extract(setting, is_automatic=is_automatic, session=session)
+        result = ExtractProcessor.extract(
+            setting,
+            is_automatic=is_automatic,
+            session=session,
+            persist_images=persist_images,
+        )
 
-        assert len(docs) == 1
-        assert docs[0].page_content.startswith("extracted-by-")
+        assert len(result.documents) == 1
+        assert result.documents[0].page_content.startswith("extracted-by-")
         return factory.calls[-1][0], factory.calls[-1][1], factory.calls[-1][2]
 
     @pytest.mark.parametrize(
@@ -282,7 +300,36 @@ class TestExtractProcessorFileRouting:
 
         assert extractor_name == "ExcelExtractor"
         assert args[1:] == ("tenant-1", "user-1", "upload-file-1")
-        assert kwargs == {}
+        assert kwargs == {"persist_images": True}
+
+    def test_extract_returns_ids_created_by_extractor(self, monkeypatch: pytest.MonkeyPatch):
+        class OwnedUploadExtractor:
+            @property
+            def created_upload_artifacts(self) -> tuple[CreatedUploadArtifact, ...]:
+                return (CreatedUploadArtifact(id="created-upload-1", key="created-key"),)
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+            def extract(self) -> list[Document]:
+                return [Document(page_content="content")]
+
+        apply_config_overrides(monkeypatch, ETL_TYPE="SelfHosted")
+        monkeypatch.setattr(processor_module, "TextExtractor", OwnedUploadExtractor)
+        monkeypatch.setattr(
+            processor_module.storage,
+            "download",
+            lambda _key, local_path: Path(local_path).write_text("content", encoding="utf-8"),
+        )
+        setting = ExtractSetting(
+            datasource_type=DatasourceType.FILE,
+            upload_file=_upload_file(key="uploaded.txt"),
+        )
+
+        result = ExtractProcessor.extract(setting)
+
+        assert [document.page_content for document in result.documents] == ["content"]
+        assert result.created_upload_file_ids == ("created-upload-1",)
 
     @pytest.mark.parametrize("extension", [".pdf", ".docx"])
     def test_extract_passes_session_to_database_backed_file_extractors(
@@ -294,6 +341,17 @@ class TestExtractProcessorFileRouting:
 
         assert kwargs["session"] is unbound_session
 
+    @pytest.mark.parametrize("extension", [".xlsx", ".pdf", ".docx"])
+    def test_extract_forwards_text_only_mode_to_image_extractors(self, monkeypatch: pytest.MonkeyPatch, extension: str):
+        _, _, kwargs = self._run_extract_for_extension(
+            monkeypatch,
+            extension,
+            etl_type="SelfHosted",
+            persist_images=False,
+        )
+
+        assert kwargs["persist_images"] is False
+
     def test_extract_requires_upload_file_when_file_path_not_provided(self):
         setting = ExtractSetting(datasource_type=DatasourceType.FILE, upload_file=None)
 
@@ -302,7 +360,7 @@ class TestExtractProcessorFileRouting:
 
 
 class TestExtractProcessorDatasourceRouting:
-    def test_extract_routes_notion_datasource(self, monkeypatch: pytest.MonkeyPatch):
+    def test_extract_routes_notion_datasource(self, monkeypatch: pytest.MonkeyPatch) -> None:
         factory = _patch_all_extractors(monkeypatch)
 
         notion_info = NotionInfo(
@@ -316,9 +374,10 @@ class TestExtractProcessorDatasourceRouting:
         )
         setting = ExtractSetting(datasource_type=DatasourceType.NOTION, notion_info=notion_info)
 
-        docs = ExtractProcessor.extract(setting)
+        result = ExtractProcessor.extract(setting)
 
-        assert docs[0].page_content == "extracted-by-NotionExtractor"
+        assert result.documents[0].page_content == "extracted-by-NotionExtractor"
+        assert result.source_version is None
         assert factory.calls[-1][0] == "NotionExtractor"
         assert factory.calls[-1][2]["notion_access_token"] == "secret"
 
@@ -336,25 +395,31 @@ class TestExtractProcessorDatasourceRouting:
         factory = _patch_all_extractors(monkeypatch)
 
         website_info = WebsiteInfo(
-            provider=provider,
+            job_ref=WebsiteJobRef(
+                tenant_id="tenant",
+                provider=provider,
+                provider_instance_id="0" * 64,
+                job_id="job",
+            ),
             url="https://example.com",
-            job_id="job",
-            tenant_id="tenant",
             mode="crawl",
             only_main_content=True,
         )
         setting = ExtractSetting(datasource_type=DatasourceType.WEBSITE, website_info=website_info)
 
-        docs = ExtractProcessor.extract(setting)
-        assert docs[0].page_content == f"extracted-by-{expected}"
+        result = ExtractProcessor.extract(setting)
+        assert result.documents[0].page_content == f"extracted-by-{expected}"
         assert factory.calls[-1][0] == expected
 
     def test_extract_unsupported_website_provider(self):
         bad_provider = WebsiteInfo(
-            provider="unknown",
+            job_ref=WebsiteJobRef(
+                tenant_id="tenant",
+                provider="unknown",
+                provider_instance_id="0" * 64,
+                job_id="job",
+            ),
             url="https://example.com",
-            job_id="job",
-            tenant_id="tenant",
             mode="crawl",
             only_main_content=True,
         )

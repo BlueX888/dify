@@ -8,7 +8,9 @@ import {
   zArchivedDocumentImmutableError,
   zAudioTooLargeError,
   zCompletionRequestError,
+  zDatasetAccessDeniedError,
   zDatasetNameDuplicateError,
+  zDatasetNotInitializedError,
   zEndUserNotFoundError,
   zFileAccessDeniedError,
   zFileExtensionBlockedError,
@@ -1515,12 +1517,12 @@ export const updateByFile = {
 /**
  * Update Document by Text
  *
- * Update an existing document's text content, name, or processing configuration. Re-triggers indexing if content changes — use the returned `batch` ID with [Get Document Indexing Status](/api-reference/documents/get-document-indexing-status) to track progress.
+ * Update an existing document's text content, name, or processing configuration. Changing only the name updates document metadata without reindexing. Providing text, including an empty string, or a processing rule re-triggers indexing; use the returned `batch` ID with [Get Document Indexing Status](/api-reference/documents/get-document-indexing-status) to track progress.
  */
 export const post24 = oc
   .route({
     description:
-      "Update an existing document's text content, name, or processing configuration. Re-triggers indexing if content changes — use the returned `batch` ID with [Get Document Indexing Status](/api-reference/documents/get-document-indexing-status) to track progress.",
+      "Update an existing document's text content, name, or processing configuration. Changing only the name updates document metadata without reindexing. Providing text, including an empty string, or a processing rule re-triggers indexing; use the returned `batch` ID with [Get Document Indexing Status](/api-reference/documents/get-document-indexing-status) to track progress.",
     inputStructure: 'detailed',
     method: 'POST',
     operationId: 'postDatasetsByDatasetIdDocumentsByDocumentIdUpdateByText',
@@ -1540,7 +1542,7 @@ export const post24 = oc
 /**
  * Update document by text through the deprecated underscore alias
  *
- * Deprecated legacy alias for updating an existing document by providing text content. Use /datasets/{dataset_id}/documents/{document_id}/update-by-text instead.
+ * Deprecated legacy alias for updating an existing document's name, text content, or processing rule. Name-only updates do not reindex the document. Use /datasets/{dataset_id}/documents/{document_id}/update-by-text instead.
  *
  * @deprecated
  */
@@ -1548,7 +1550,7 @@ export const post25 = oc
   .route({
     deprecated: true,
     description:
-      'Deprecated legacy alias for updating an existing document by providing text content. Use /datasets/{dataset_id}/documents/{document_id}/update-by-text instead.',
+      "Deprecated legacy alias for updating an existing document's name, text content, or processing rule. Name-only updates do not reindex the document. Use /datasets/{dataset_id}/documents/{document_id}/update-by-text instead.",
     inputStructure: 'detailed',
     method: 'POST',
     operationId: 'postDatasetsByDatasetIdDocumentsByDocumentIdUpdateByText',
@@ -1716,6 +1718,8 @@ export const post26 = oc
   .output(zPostDatasetsByDatasetIdHitTestingResponse)
   .errors({
     completion_request_error: { status: 400, data: zCompletionRequestError },
+    dataset_access_denied: { status: 403, data: zDatasetAccessDeniedError },
+    dataset_not_initialized: { status: 400, data: zDatasetNotInitializedError },
     model_currently_not_support: { status: 400, data: zModelCurrentlyNotSupportError },
     provider_not_initialize: { status: 400, data: zProviderNotInitializeError },
     provider_quota_exceeded: { status: 400, data: zProviderQuotaExceededError },
@@ -1998,6 +2002,8 @@ export const post31 = oc
   .output(zPostDatasetsByDatasetIdRetrieveResponse)
   .errors({
     completion_request_error: { status: 400, data: zCompletionRequestError },
+    dataset_access_denied: { status: 403, data: zDatasetAccessDeniedError },
+    dataset_not_initialized: { status: 400, data: zDatasetNotInitializedError },
     model_currently_not_support: { status: 400, data: zModelCurrentlyNotSupportError },
     provider_not_initialize: { status: 400, data: zProviderNotInitializeError },
     provider_quota_exceeded: { status: 400, data: zProviderQuotaExceededError },

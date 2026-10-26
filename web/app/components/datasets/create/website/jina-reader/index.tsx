@@ -26,7 +26,7 @@ type Props = Readonly<{
   onPreview: (payload: CrawlResultItem) => void
   checkedCrawlResult: CrawlResultItem[]
   onCheckedCrawlResultChange: (payload: CrawlResultItem[]) => void
-  onJobIdChange: (jobId: string) => void
+  onJobIdChange: (jobId: string, sourceHandle?: string) => void
   crawlOptions: CrawlOptions
   onCrawlOptionsChange: (payload: CrawlOptions) => void
 }>
@@ -95,9 +95,9 @@ const JinaReader: FC<Props> = ({
   const [crawlErrorMessage, setCrawlErrorMessage] = useState('')
   const showError = isCrawlFinished && crawlErrorMessage
   const waitForCrawlFinished = useCallback(
-    async (jobId: string) => {
+    async (jobId: string, sourceHandle: string) => {
       try {
-        const res = (await checkJinaReaderTaskStatus(jobId)) as any
+        const res = (await checkJinaReaderTaskStatus(jobId, sourceHandle)) as any
         if (res.status === 'completed') {
           return {
             isError: false,
@@ -123,7 +123,7 @@ const JinaReader: FC<Props> = ({
         })
         onCheckedCrawlResultChange(res.data || []) // default select the crawl result
         await sleep(2500)
-        return await waitForCrawlFinished(jobId)
+        return await waitForCrawlFinished(jobId, sourceHandle)
       } catch (e: any) {
         return {
           isError: true,
@@ -154,6 +154,7 @@ const JinaReader: FC<Props> = ({
           options: crawlOptions,
         })) as any
         if (res.data) {
+          onJobIdChange('')
           const { title, content, description, url } = res.data
           const data = {
             current: 1,
@@ -173,8 +174,9 @@ const JinaReader: FC<Props> = ({
           setCrawlErrorMessage('')
         } else if (res.job_id) {
           const jobId = res.job_id
-          onJobIdChange(jobId)
-          const { isError, data, errorMessage } = await waitForCrawlFinished(jobId)
+          const sourceHandle = res.source_handle
+          onJobIdChange(jobId, sourceHandle)
+          const { isError, data, errorMessage } = await waitForCrawlFinished(jobId, sourceHandle)
           if (isError) {
             setCrawlErrorMessage(
               errorMessage || t(($) => $[`${I18N_PREFIX}.unknownError`], { ns: 'datasetCreation' }),

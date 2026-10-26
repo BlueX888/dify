@@ -1,6 +1,7 @@
 import json
 from dataclasses import dataclass
 from typing import cast
+from unittest.mock import create_autospec
 
 import pytest
 from pydantic import BaseModel
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from core.app.layers.pause_state_persist_layer import PauseStateLayerConfig
 from core.plugin.backwards_invocation.app import PluginAppBackwardsInvocation
 from core.plugin.backwards_invocation.base import BaseBackwardsInvocation
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models import Account, Tenant, TenantAccountJoin
 from models.enums import EndUserType
 from models.model import App, AppMode, AppModelConfig, EndUser
@@ -124,6 +126,7 @@ class TestPluginAppBackwardsInvocation:
         self.session_factory = sqlite_session_factory
         self.sqlite_engine = sqlite_engine
         self.end_users = _EndUserProvisioner()
+        self.external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
         mocker.patch("core.plugin.backwards_invocation.app.create_session", side_effect=sqlite_session_factory)
 
     def test_fetch_app_info_workflow_path(self, mocker: MockerFixture):
@@ -189,10 +192,12 @@ class TestPluginAppBackwardsInvocation:
             files=[],
             session=self.session,
             end_users=self.end_users,
+            external_retrieval=self.external_retrieval,
         )
 
         assert result == {"routed": True}
         assert route.call_count == 1
+        assert route.call_args.kwargs["external_retrieval"] is self.external_retrieval
 
     def test_invoke_app_uses_end_user_when_user_id_missing(self, mocker: MockerFixture):
         app = _app(mode=AppMode.WORKFLOW)
@@ -215,12 +220,14 @@ class TestPluginAppBackwardsInvocation:
             files=[],
             session=self.session,
             end_users=self.end_users,
+            external_retrieval=self.external_retrieval,
         )
 
         assert result == {"ok": True}
         assert self.end_users.calls == [(app.tenant_id, app.id, None)]
         assert route.call_args.args[1] is workflow
         assert route.call_args.args[2] is end_user
+        assert route.call_args.kwargs["external_retrieval"] is self.external_retrieval
 
     def test_invoke_app_missing_query_for_chat_raises(self, mocker: MockerFixture):
         mocker.patch.object(PluginAppBackwardsInvocation, "_get_app", return_value=_app(mode=AppMode.CHAT))
@@ -239,6 +246,7 @@ class TestPluginAppBackwardsInvocation:
                 files=[],
                 session=self.session,
                 end_users=self.end_users,
+                external_retrieval=self.external_retrieval,
             )
 
     def test_invoke_app_unexpected_mode_raises(self, mocker: MockerFixture):
@@ -262,18 +270,26 @@ class TestPluginAppBackwardsInvocation:
                 files=[],
                 session=self.session,
                 end_users=self.end_users,
+                external_retrieval=self.external_retrieval,
             )
 
     @pytest.mark.parametrize(
-        ("mode", "generator_path"),
+        ("mode", "generator_path", "expected_constructor_kwargs"),
         [
-            (AppMode.AGENT_CHAT, "core.plugin.backwards_invocation.app.AgentChatAppGenerator.generate"),
-            (AppMode.CHAT, "core.plugin.backwards_invocation.app.ChatAppGenerator.generate"),
+            (
+                AppMode.AGENT_CHAT,
+                "core.plugin.backwards_invocation.app.AgentChatAppGenerator",
+                {"execution_driver": WorkflowRunAgg.run},
+            ),
+            (AppMode.CHAT, "core.plugin.backwards_invocation.app.ChatAppGenerator", {}),
         ],
     )
-    def test_invoke_chat_app_agent_and_chat(self, mocker: MockerFixture, mode, generator_path):
+    def test_invoke_chat_app_agent_and_chat(
+        self, mocker: MockerFixture, mode, generator_path, expected_constructor_kwargs
+    ):
         app = _app(mode=mode)
-        spy = mocker.patch(generator_path, return_value={"result": "ok"})
+        generator = mocker.patch(generator_path)
+        generator.return_value.generate.return_value = {"result": "ok"}
 
         result = PluginAppBackwardsInvocation.invoke_chat_app(
             execution_driver=WorkflowRunAgg.run,
@@ -285,10 +301,15 @@ class TestPluginAppBackwardsInvocation:
             inputs={"k": "v"},
             files=[],
             session=self.session,
+            external_retrieval=self.external_retrieval,
         )
 
         assert result == {"result": "ok"}
-        assert spy.call_count == 1
+        generator.assert_called_once_with(
+            **expected_constructor_kwargs,
+            external_retrieval=self.external_retrieval,
+        )
+        generator.return_value.generate.assert_called_once()
 
     def test_invoke_chat_app_advanced_chat_injects_pause_state_config(self, mocker: MockerFixture):
         workflow = _workflow()
@@ -301,10 +322,8 @@ class TestPluginAppBackwardsInvocation:
             "core.plugin.backwards_invocation.app.db",
             _DatabaseWithEngine(self.sqlite_engine),
         )
-        generator_spy = mocker.patch(
-            "core.plugin.backwards_invocation.app.AdvancedChatAppGenerator.generate",
-            return_value={"result": "ok"},
-        )
+        generator = mocker.patch("core.plugin.backwards_invocation.app.AdvancedChatAppGenerator")
+        generator.return_value.generate.return_value = {"result": "ok"}
         session = self.session
 
         result = PluginAppBackwardsInvocation.invoke_chat_app(
@@ -317,10 +336,15 @@ class TestPluginAppBackwardsInvocation:
             inputs={"k": "v"},
             files=[],
             session=session,
+            external_retrieval=self.external_retrieval,
         )
 
         assert result == {"result": "ok"}
-        call_kwargs = generator_spy.call_args.kwargs
+        generator.assert_called_once_with(
+            execution_driver=WorkflowRunAgg.run,
+            external_retrieval=self.external_retrieval,
+        )
+        call_kwargs = generator.return_value.generate.call_args.kwargs
         assert call_kwargs["session"] is session
         pause_state_config = call_kwargs.get("pause_state_config")
         assert isinstance(pause_state_config, PauseStateLayerConfig)
@@ -340,6 +364,7 @@ class TestPluginAppBackwardsInvocation:
                 inputs={},
                 files=[],
                 session=self.session,
+                external_retrieval=self.external_retrieval,
             )
 
     def test_invoke_chat_app_unexpected_mode_raises(self):
@@ -355,6 +380,7 @@ class TestPluginAppBackwardsInvocation:
                 inputs={},
                 files=[],
                 session=self.session,
+                external_retrieval=self.external_retrieval,
             )
 
     def test_invoke_workflow_app_injects_pause_state_config(self, mocker: MockerFixture):
@@ -367,10 +393,8 @@ class TestPluginAppBackwardsInvocation:
             "core.plugin.backwards_invocation.app.db",
             _DatabaseWithEngine(self.sqlite_engine),
         )
-        generator_spy = mocker.patch(
-            "core.plugin.backwards_invocation.app.WorkflowAppGenerator.generate",
-            return_value={"result": "ok"},
-        )
+        generator = mocker.patch("core.plugin.backwards_invocation.app.WorkflowAppGenerator")
+        generator.return_value.generate.return_value = {"result": "ok"}
 
         result = PluginAppBackwardsInvocation.invoke_workflow_app(
             execution_driver=WorkflowRunAgg.run,
@@ -380,10 +404,15 @@ class TestPluginAppBackwardsInvocation:
             stream=False,
             inputs={"k": "v"},
             files=[],
+            external_retrieval=self.external_retrieval,
         )
 
         assert result == {"result": "ok"}
-        call_kwargs = generator_spy.call_args.kwargs
+        generator.assert_called_once_with(
+            execution_driver=WorkflowRunAgg.run,
+            external_retrieval=self.external_retrieval,
+        )
+        call_kwargs = generator.return_value.generate.call_args.kwargs
         pause_state_config = call_kwargs.get("pause_state_config")
         assert isinstance(pause_state_config, PauseStateLayerConfig)
         assert pause_state_config.state_owner_user_id == "owner-id"
@@ -406,18 +435,27 @@ class TestPluginAppBackwardsInvocation:
                 files=[],
                 session=self.session,
                 end_users=self.end_users,
+                external_retrieval=self.external_retrieval,
             )
 
     def test_invoke_completion_app(self, mocker: MockerFixture):
-        spy = mocker.patch(
-            "core.plugin.backwards_invocation.app.CompletionAppGenerator.generate", return_value={"ok": 1}
-        )
+        generator = mocker.patch("core.plugin.backwards_invocation.app.CompletionAppGenerator")
+        generator.return_value.generate.return_value = {"ok": 1}
         app = _app(mode=AppMode.COMPLETION)
 
-        result = PluginAppBackwardsInvocation.invoke_completion_app(app, _end_user(), False, {"x": 1}, [], self.session)
+        result = PluginAppBackwardsInvocation.invoke_completion_app(
+            app,
+            _end_user(),
+            False,
+            {"x": 1},
+            [],
+            self.session,
+            external_retrieval=self.external_retrieval,
+        )
 
         assert result == {"ok": 1}
-        assert spy.call_count == 1
+        generator.assert_called_once_with(external_retrieval=self.external_retrieval)
+        generator.return_value.generate.assert_called_once()
 
     def test_get_user_returns_end_user(self):
         app = _app()
@@ -557,11 +595,13 @@ class TestPluginAppBackwardsInvocation:
             files=[],
             session=self.session,
             end_users=self.end_users,
+            external_retrieval=self.external_retrieval,
         )
 
         assert result == {"ok": True}
         assert self.end_users.calls == [(app.tenant_id, app.id, "wecom-sender-1")]
         assert route.call_args.args[2] is end_user
+        assert route.call_args.kwargs["external_retrieval"] is self.external_retrieval
 
     def test_get_app_returns_app(self):
         app_obj = _app(app_id="app", tenant_id="tenant")

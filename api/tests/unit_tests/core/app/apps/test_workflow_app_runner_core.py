@@ -5,6 +5,7 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import override
+from unittest.mock import create_autospec
 
 import pytest
 from pydantic import ValidationError
@@ -31,6 +32,7 @@ from core.app.entities.queue_entities import (
     QueueWorkflowStartedEvent,
     QueueWorkflowSucceededEvent,
 )
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.nodes.agent.events import NodeRunAgentLogEvent
 from core.workflow.nodes.human_input.pause_reason import HumanInputRequired
 from core.workflow.system_variables import default_system_variables
@@ -86,7 +88,19 @@ def _workflow_entry(runner: WorkflowBasedAppRunner, state: RuntimeState | None =
         invoke_from=InvokeFrom.DEBUGGER,
         call_depth=0,
     )
-    return WorkflowEntry(graph_config=graph.graph_config, graph=graph, call_depth=0, graph_runtime_state=state)
+    return WorkflowEntry(
+        graph_config=graph.graph_config,
+        graph=graph,
+        call_depth=0,
+        graph_runtime_state=state,
+    )
+
+
+def _make_runner(**kwargs) -> WorkflowBasedAppRunner:
+    return WorkflowBasedAppRunner(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        **kwargs,
+    )
 
 
 def _nested_container_graph(ownership: str) -> dict:
@@ -178,7 +192,7 @@ class TestWorkflowBasedAppRunner:
         queue = WorkflowAppQueueManager(
             task_id="metadata-contract", user_id="account", invoke_from=InvokeFrom.DEBUGGER, app_mode="workflow"
         )
-        runner = WorkflowBasedAppRunner(queue_manager=queue, app_id="app")
+        runner = _make_runner(queue_manager=queue, app_id="app")
         entry = _workflow_entry(runner)
         event = event_class(
             id="container-execution",
@@ -216,14 +230,14 @@ class TestWorkflowBasedAppRunner:
         assert event.model_dump() == original_event
 
     def test_resolve_user_from(self):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
 
         assert runner._resolve_user_from(InvokeFrom.EXPLORE) == UserFrom.ACCOUNT
         assert runner._resolve_user_from(InvokeFrom.DEBUGGER) == UserFrom.ACCOUNT
         assert runner._resolve_user_from(InvokeFrom.WEB_APP) == UserFrom.END_USER
 
     def test_init_graph_validates_graph_structure(self):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
 
         runtime_state = RuntimeState(
             workflow_id="test-workflow",
@@ -259,7 +273,7 @@ class TestWorkflowBasedAppRunner:
             )
 
     def test_init_graph_includes_trace_session_id_in_run_context(self, monkeypatch: pytest.MonkeyPatch):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
         runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -296,7 +310,7 @@ class TestWorkflowBasedAppRunner:
 
     @pytest.mark.parametrize("ownership", ["canonical", "parent", "legacy"])
     def test_init_graph_preserves_container_execution_scopes(self, ownership: str) -> None:
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
         runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -338,7 +352,7 @@ class TestWorkflowBasedAppRunner:
         assert graph_config == original_config
 
     def test_prepare_single_node_execution_requires_run(self):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
 
         workflow = _workflow()
 
@@ -348,7 +362,7 @@ class TestWorkflowBasedAppRunner:
     @pytest.mark.parametrize("ownership", ["canonical", "parent", "legacy"])
     @pytest.mark.parametrize("node_id", ["outer", "inner", "deep"])
     def test_single_container_debugging_preserves_descendants(self, ownership: str, node_id: str):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
         graph_runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -382,7 +396,7 @@ class TestWorkflowBasedAppRunner:
     def test_get_graph_and_variable_pool_for_single_node_run_does_not_mutate_inputs(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
         graph_runtime_state = RuntimeState(
             workflow_id="workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -447,7 +461,7 @@ class TestWorkflowBasedAppRunner:
     def test_get_graph_and_variable_pool_for_single_node_run_includes_trace_session_id(
         self, monkeypatch: pytest.MonkeyPatch
     ):
-        runner = WorkflowBasedAppRunner(queue_manager=SimpleNamespace(), app_id="app")
+        runner = _make_runner(queue_manager=SimpleNamespace(), app_id="app")
         graph_runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -514,7 +528,7 @@ class TestWorkflowBasedAppRunner:
                 else []
             )
         )
-        runner = WorkflowBasedAppRunner(
+        runner = _make_runner(
             queue_manager=SimpleNamespace(),
             variable_loader=variable_loader,
             app_id="app",
@@ -589,7 +603,7 @@ class TestWorkflowBasedAppRunner:
             def publish(self, event, publish_from):
                 published.append((event, publish_from))
 
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         graph_runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -640,7 +654,7 @@ class TestWorkflowBasedAppRunner:
                 del publish_from
                 published.append(event)
 
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         workflow_entry = _workflow_entry(runner)
 
         runner.handle_event(workflow_entry, GraphRunAbortedEvent(reason="User requested stop", outputs={}))
@@ -656,7 +670,7 @@ class TestWorkflowBasedAppRunner:
             def publish(self, event, publish_from):
                 published.append(event)
 
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         graph_runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),
@@ -774,7 +788,7 @@ class TestWorkflowBasedAppRunner:
                     persisted_starts[event.node_id] = dict(node_repo.saved[-1].metadata)
 
         state.variable_pool.add(["start", "items"], ["item"])
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         graph = runner._init_graph(
             graph_config=graph_config,
             graph_runtime_state=state,
@@ -782,7 +796,12 @@ class TestWorkflowBasedAppRunner:
             invoke_from=InvokeFrom.DEBUGGER,
             call_depth=0,
         )
-        entry = WorkflowEntry(graph_config=graph.graph_config, graph=graph, call_depth=0, graph_runtime_state=state)
+        entry = WorkflowEntry(
+            graph_config=graph.graph_config,
+            graph=graph,
+            call_depth=0,
+            graph_runtime_state=state,
+        )
         engine = entry.graph_engine
         index = WorkflowRunIndex(())
         layer.set_node_run_indices(index.indices)
@@ -821,7 +840,7 @@ class TestWorkflowBasedAppRunner:
             def publish(self, event, publish_from):
                 published.append(event)
 
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         workflow_entry = _workflow_entry(runner)
 
         runner.handle_event(
@@ -853,7 +872,7 @@ class TestWorkflowBasedAppRunner:
             def publish(self, event, publish_from):
                 published.append(event)
 
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         workflow_entry = _workflow_entry(runner)
 
         runner.handle_event(
@@ -932,7 +951,7 @@ class TestWorkflowBasedAppRunner:
             def publish(self, event, publish_from):
                 published.append(event)
 
-        runner = WorkflowBasedAppRunner(queue_manager=_QueueManager(), app_id="app")
+        runner = _make_runner(queue_manager=_QueueManager(), app_id="app")
         graph_runtime_state = RuntimeState(
             workflow_id="test-workflow",
             variable_pool=VariablePool.from_bootstrap(system_variables=default_system_variables()),

@@ -1,4 +1,6 @@
+from collections.abc import Callable, Sequence
 from contextlib import nullcontext
+from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -8,7 +10,9 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from core.entities.knowledge_entities import PreviewDetail
 from core.rag.entities import ParentMode, Rule, Segmentation
+from core.rag.extractor.entity.extract_setting import ExtractionResult
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
+from core.rag.index_processor.index_processor_base import AttachmentRef, IndexingMutationGuard
 from core.rag.index_processor.processor.parent_child_index_processor import ParentChildIndexProcessor
 from core.rag.models.document import AttachmentDocument, ChildDocument, Document
 from models.account import Account
@@ -18,18 +22,148 @@ from models.enums import DataSourceType
 from tests.unit_tests.config_override import config_overrides_context
 
 
+class _PublishAllAttachmentVectorStore:
+    def __init__(self) -> None:
+        self.routes: list[tuple[str | None, str, str, str]] = []
+
+    def publish_bound(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        attachment_refs: Sequence[AttachmentRef],
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None,
+        publish: Callable[
+            [frozenset[AttachmentRef], Callable[[Sequence[str]], None], Callable[[Sequence[str]], None]], None
+        ],
+        mutation_guard: IndexingMutationGuard | None = None,
+    ) -> frozenset[AttachmentRef]:
+        del session, tenant_id, dataset_id, routing_index_struct, mutation_guard
+        self.routes.append((collection_binding_id, indexing_technique, vector_type, collection_name))
+        bound_refs = frozenset(attachment_refs)
+        publish(bound_refs, self.before_write, self.after_write)
+        return bound_refs
+
+    @staticmethod
+    def before_write(_attachment_ids: Sequence[str]) -> None:
+        pass
+
+    @staticmethod
+    def after_write(_attachment_ids: Sequence[str]) -> None:
+        pass
+
+    def delete_unreferenced(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None,
+        document_ids: Sequence[str] | None = None,
+        segment_ids: Sequence[str] | None = None,
+        candidate_attachment_ids: Sequence[str] | None = None,
+        mutation_guard: IndexingMutationGuard | None = None,
+        validate: Callable[[Session], None] | None = None,
+    ) -> tuple[str, ...]:
+        _ = (
+            session,
+            tenant_id,
+            dataset_id,
+            collection_binding_id,
+            indexing_technique,
+            vector_type,
+            collection_name,
+            routing_index_struct,
+            document_ids,
+            segment_ids,
+            candidate_attachment_ids,
+            mutation_guard,
+            validate,
+        )
+        raise AssertionError("attachment deletion is outside these processor tests")
+
+
+@dataclass(frozen=True)
+class _ChildVectorRouteCall:
+    session: Session
+    tenant_id: str
+    dataset_id: str
+    collection_binding_id: str | None
+    indexing_technique: str
+    doc_form: str
+    node_ids: tuple[str, ...]
+    vector_type: str
+    collection_name: str
+
+
+class _RecordingChildVectorRouteStore:
+    def __init__(self) -> None:
+        self.calls: list[_ChildVectorRouteCall] = []
+        self.on_persist: Callable[[], None] | None = None
+
+    def persist(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        doc_form: str,
+        node_ids: Sequence[str],
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None,
+    ) -> None:
+        _ = routing_index_struct
+        self.calls.append(
+            _ChildVectorRouteCall(
+                session=session,
+                tenant_id=tenant_id,
+                dataset_id=dataset_id,
+                collection_binding_id=collection_binding_id,
+                indexing_technique=indexing_technique,
+                doc_form=doc_form,
+                node_ids=tuple(node_ids),
+                vector_type=vector_type,
+                collection_name=collection_name,
+            )
+        )
+        if self.on_persist is not None:
+            self.on_persist()
+
+
 class TestParentChildIndexProcessor:
     session: Session
     session_factory: sessionmaker[Session]
 
     @pytest.fixture(autouse=True)
-    def _inject_sqlite_sessions(self, sqlite_session: Session, sqlite_session_factory: sessionmaker[Session]) -> None:
+    def _inject_sqlite_sessions(
+        self,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ) -> None:
         self.session = sqlite_session
         self.session_factory = sqlite_session_factory
 
+        self.attachment_vectors = _PublishAllAttachmentVectorStore()
+        self.child_vector_routes = _RecordingChildVectorRouteStore()
+
     @pytest.fixture
     def processor(self) -> ParentChildIndexProcessor:
-        return ParentChildIndexProcessor()
+        return ParentChildIndexProcessor(
+            attachment_vectors=self.attachment_vectors,
+            child_vector_routes=self.child_vector_routes,
+        )
 
     @pytest.fixture
     def dataset(self) -> Dataset:
@@ -80,7 +214,7 @@ class TestParentChildIndexProcessor:
     def test_extract_forwards_automatic_flag(self, processor: ParentChildIndexProcessor) -> None:
         extract_setting = Mock()
         session = self.session
-        expected = [Document(page_content="chunk", metadata={})]
+        expected = ExtractionResult(documents=[Document(page_content="chunk", metadata={})])
 
         with patch(
             "core.rag.index_processor.processor.parent_child_index_processor.ExtractProcessor.extract"
@@ -89,7 +223,12 @@ class TestParentChildIndexProcessor:
             documents = processor.extract(extract_setting, process_rule_mode="hierarchical", session=session)
 
         assert documents == expected
-        mock_extract.assert_called_once_with(extract_setting=extract_setting, is_automatic=True, session=session)
+        mock_extract.assert_called_once_with(
+            extract_setting=extract_setting,
+            is_automatic=True,
+            session=session,
+            on_upload_artifact_created=None,
+        )
 
     def test_transform_validates_process_rule(self, processor: ParentChildIndexProcessor) -> None:
         session = self.session
@@ -229,15 +368,18 @@ class TestParentChildIndexProcessor:
             page_content="parent",
             metadata={},
             children=[
-                ChildDocument(page_content="child-1", metadata={}),
-                ChildDocument(page_content="child-2", metadata={}),
+                ChildDocument(page_content="child-1", metadata={"doc_id": "child-node-1"}),
+                ChildDocument(page_content="child-2", metadata={"doc_id": "child-node-2"}),
             ],
         )
-        multimodal_docs = [AttachmentDocument(page_content="image", metadata={})]
+        multimodal_docs = [
+            AttachmentDocument(page_content="image", metadata={"document_id": "document-1", "doc_id": "attachment-1"})
+        ]
         session = self.session
 
         with patch("core.rag.index_processor.processor.parent_child_index_processor.Vector") as mock_vector_cls:
             vector = mock_vector_cls.return_value
+            vector.get_routing_target.return_value = ("qdrant", "collection-a")
             processor.load(dataset, [parent_doc], multimodal_documents=multimodal_docs, session=session)
 
         mock_vector_cls.assert_called_once_with(dataset, session=session)
@@ -245,7 +387,65 @@ class TestParentChildIndexProcessor:
         formatted_docs = vector.create.call_args[0][0]
         assert len(formatted_docs) == 2
         assert all(isinstance(doc, Document) for doc in formatted_docs)
-        vector.create_multimodal.assert_called_once_with(multimodal_docs)
+        vector.create_multimodal.assert_called_once_with(
+            multimodal_docs,
+            before_write=self.attachment_vectors.before_write,
+            after_write=self.attachment_vectors.after_write,
+        )
+        assert self.attachment_vectors.routes == [
+            (dataset.collection_binding_id, str(dataset.indexing_technique), "qdrant", "collection-a")
+        ]
+        assert self.child_vector_routes.calls == [
+            _ChildVectorRouteCall(
+                session=session,
+                tenant_id=dataset.tenant_id,
+                dataset_id=dataset.id,
+                collection_binding_id=dataset.collection_binding_id,
+                indexing_technique=str(dataset.indexing_technique),
+                doc_form="hierarchical_model",
+                node_ids=("child-node-1", "child-node-2"),
+                vector_type="qdrant",
+                collection_name="collection-a",
+            )
+        ]
+
+    def test_load_batches_child_vectors_for_many_parents(
+        self, processor: ParentChildIndexProcessor, dataset: Dataset
+    ) -> None:
+        parent_docs = [
+            Document(
+                page_content=f"parent-{position}",
+                metadata={},
+                children=[
+                    ChildDocument(page_content=f"child-{position}", metadata={"doc_id": f"child-node-{position}"})
+                ],
+            )
+            for position in range(1000)
+        ]
+
+        with patch("core.rag.index_processor.processor.parent_child_index_processor.Vector") as mock_vector_cls:
+            vector = mock_vector_cls.return_value
+            vector.get_routing_target.return_value = ("qdrant", "collection-a")
+            processor.load(dataset, parent_docs, session=self.session)
+
+        vector.create.assert_called_once()
+        assert len(vector.create.call_args.args[0]) == 1000
+
+    def test_load_does_not_switch_route_when_vector_publication_fails(
+        self, processor: ParentChildIndexProcessor, dataset: Dataset
+    ) -> None:
+        parent_doc = Document(
+            page_content="parent",
+            metadata={},
+            children=[ChildDocument(page_content="child", metadata={"doc_id": "child-node-1"})],
+        )
+
+        with patch("core.rag.index_processor.processor.parent_child_index_processor.Vector") as mock_vector_cls:
+            mock_vector_cls.return_value.create.side_effect = RuntimeError("vector publication failed")
+            with pytest.raises(RuntimeError, match="vector publication failed"):
+                processor.load(dataset, [parent_doc], session=self.session)
+
+        assert self.child_vector_routes.calls == []
 
     def test_clean_with_precomputed_child_ids(self, processor: ParentChildIndexProcessor, dataset: Dataset) -> None:
         session = self.session
@@ -427,10 +627,12 @@ class TestParentChildIndexProcessor:
         ):
             mock_token_counter.side_effect = lambda **_kwargs: phase_events.append("count") or [11]
             mock_store_cls.return_value.add_documents.side_effect = lambda **_kwargs: phase_events.append("store")
+            self.child_vector_routes.on_persist = lambda: phase_events.append("route")
+            mock_vector_cls.return_value.get_routing_target.return_value = ("qdrant", "collection-a")
             mock_vector_cls.return_value.create.side_effect = lambda _documents: phase_events.append("vector")
             processor.index(dataset, dataset_document, {"parent_child_chunks": []}, session)
 
-        assert phase_events == ["count", "store", "commit", "vector"]
+        assert phase_events == ["count", "store", "commit", "vector", "route"]
         dataset_rule = session.get(DatasetProcessRule, dataset_document.dataset_process_rule_id)
         assert dataset_rule is not None
         documents = mock_token_counter.call_args.kwargs["documents"]
@@ -445,6 +647,17 @@ class TestParentChildIndexProcessor:
         mock_vector_cls.assert_called_once_with(dataset, session=session)
         assert mock_vector_cls.return_value.create.call_count == 1
         mock_vector_cls.return_value.create_multimodal.assert_called_once()
+        assert (
+            mock_vector_cls.return_value.create_multimodal.call_args.kwargs["before_write"]
+            == self.attachment_vectors.before_write
+        )
+        assert (
+            mock_vector_cls.return_value.create_multimodal.call_args.kwargs["after_write"]
+            == self.attachment_vectors.after_write
+        )
+        assert self.attachment_vectors.routes == [
+            (dataset.collection_binding_id, str(dataset.indexing_technique), "qdrant", "collection-a")
+        ]
 
     def test_index_uses_content_files_when_files_missing(
         self, processor: ParentChildIndexProcessor, dataset: Dataset, dataset_document: DatasetDocument
@@ -468,15 +681,23 @@ class TestParentChildIndexProcessor:
                 return_value="hash",
             ),
             patch.object(
-                processor, "_get_content_files", return_value=[AttachmentDocument(page_content="image", metadata={})]
+                processor,
+                "_get_content_files",
+                return_value=[
+                    AttachmentDocument(
+                        page_content="image",
+                        metadata={"document_id": dataset_document.id, "doc_id": "attachment-1"},
+                    )
+                ],
             ) as mock_files,
             patch("core.rag.index_processor.processor.parent_child_index_processor.DatasetDocumentStore"),
             patch(
                 "core.rag.index_processor.processor.parent_child_index_processor.calculate_segment_token_counts",
                 return_value=[11],
             ),
-            patch("core.rag.index_processor.processor.parent_child_index_processor.Vector"),
+            patch("core.rag.index_processor.processor.parent_child_index_processor.Vector") as mock_vector_cls,
         ):
+            mock_vector_cls.return_value.get_routing_target.return_value = ("qdrant", "collection-a")
             processor.index(dataset, dataset_document, {"parent_child_chunks": []}, session)
 
         mock_files.assert_called_once()

@@ -18,6 +18,8 @@ from core.db.session_factory import create_session
 from core.memory.token_buffer_memory import TokenBufferMemory
 from core.model_manager import ModelInstance
 from core.moderation.base import ModerationError
+from core.rag.embedding.retrieval import RetrievalFinalizer
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from graphon.file import File
 from graphon.model_runtime.entities.message_entities import ImagePromptMessageContent
@@ -30,6 +32,12 @@ class ChatAppRunner(AppRunner):
     """
     Chat Application Runner
     """
+
+    def __init__(
+        self, *, external_retrieval: ExternalDatasetRetriever, retrieval_finalizer: RetrievalFinalizer
+    ) -> None:
+        self._external_retrieval = external_retrieval
+        self._retrieval_finalizer = retrieval_finalizer
 
     def run(
         self,
@@ -170,7 +178,11 @@ class ChatAppRunner(AppRunner):
                 application_generate_entity.invoke_from,
             )
 
-            dataset_retrieval = DatasetRetrieval(application_generate_entity)
+            dataset_retrieval = DatasetRetrieval(
+                application_generate_entity,
+                external_retrieval=self._external_retrieval,
+                retrieval_finalizer=self._retrieval_finalizer,
+            )
             context, retrieved_files = dataset_retrieval.retrieve(
                 session=session,
                 app_id=app_record.id,

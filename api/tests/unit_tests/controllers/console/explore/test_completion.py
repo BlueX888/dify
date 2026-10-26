@@ -1,5 +1,6 @@
 import json
 from collections.abc import Generator
+from unittest.mock import create_autospec
 from uuid import uuid4
 
 import pytest
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 import controllers.console.explore.completion as completion_module
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.model_runtime.errors.invoke import InvokeError
 from models import AppMode, Conversation, Tenant
 from repositories.installed_app_repository import SQLAlchemyInstalledAppRepository
@@ -359,7 +361,14 @@ def test_chat_conversation_preflight_returns_404_before_starting_generation_and_
         installed_apps=_InstalledAppServices(
             generation=InstalledAppGenerationService(
                 usage=SQLAlchemyInstalledAppRepository(session_factory=sqlite_session_factory),
-                runtime=AppGenerateServiceRuntime(session_factory=sqlite_session_factory),
+                runtime=AppGenerateServiceRuntime(
+                    session_factory=sqlite_session_factory,
+                    external_retrieval=create_autospec(
+                        ExternalDatasetRetriever,
+                        instance=True,
+                        spec_set=True,
+                    ),
+                ),
             )
         )
     )

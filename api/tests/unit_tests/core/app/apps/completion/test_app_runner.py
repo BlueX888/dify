@@ -1,6 +1,7 @@
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from decimal import Decimal
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from flask import Flask
@@ -31,6 +32,8 @@ from core.plugin.impl.model import PluginModelClient
 from core.plugin.impl.model_runtime import PluginModelRuntime
 from core.plugin.impl.model_runtime_factory import create_model_type_instance, create_plugin_model_runtime
 from core.provider_manager import ProviderManager
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from extensions.ext_database import db
 from extensions.ext_redis import RedisClientWrapper
 from graphon.file import FileUploadConfig
@@ -45,7 +48,6 @@ from graphon.model_runtime.entities.model_entities import ModelType
 from models.dataset import Dataset
 from models.enums import ConversationFromSource
 from models.model import App, AppMode, Conversation, IconType, Message
-from services.knowledge.external.service import ExternalDatasetService
 from tests.unit_tests.core.model_fixtures import make_model_config
 
 APP_ID = "00000000-0000-0000-0000-000000000001"
@@ -164,8 +166,16 @@ def retrieval_app(sqlite_engine: Engine) -> Iterator[Flask]:
 
 
 @pytest.fixture
-def runner() -> CompletionAppRunner:
-    return CompletionAppRunner()
+def external_retrieval() -> MagicMock:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+
+
+@pytest.fixture
+def runner(external_retrieval: MagicMock) -> CompletionAppRunner:
+    return CompletionAppRunner(
+        external_retrieval=external_retrieval,
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
 
 
 def _build_app_config(
@@ -314,7 +324,7 @@ class TestCompletionAppRunner:
     def test_run_dataset_and_external_tools_flow(
         self,
         runner: CompletionAppRunner,
-        monkeypatch: pytest.MonkeyPatch,
+        external_retrieval: MagicMock,
         sqlite_session: Session,
         queue_manager: MessageBasedAppQueueManager,
         model_runtime: tuple[ProviderModelBundle, list[RecordedCall], list[str]],
@@ -360,11 +370,11 @@ class TestCompletionAppRunner:
 
         retrieval_calls: list[dict[str, object]] = []
 
-        def retrieve_external(**kwargs: object) -> list[dict[str, object]]:
-            retrieval_calls.append(kwargs)
+        def retrieve_external(*, dataset_id: str, query: str, **kwargs: object) -> list[dict[str, object]]:
+            retrieval_calls.append({**kwargs, "dataset_id": dataset_id, "query": query})
             return [{"content": "ctx", "metadata": {}, "score": 1.0, "title": "Document"}]
 
-        monkeypatch.setattr(ExternalDatasetService, "fetch_external_knowledge_retrieval", retrieve_external)
+        external_retrieval.retrieve.side_effect = retrieve_external
 
         runner.run(app_generate_entity, queue_manager, message, sqlite_session)
 

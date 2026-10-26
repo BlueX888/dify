@@ -371,6 +371,7 @@ class WorkflowRunApi(Resource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,
@@ -513,6 +514,7 @@ class WorkflowRunByIdApi(Resource):
 
         try:
             response = AppGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=end_user,

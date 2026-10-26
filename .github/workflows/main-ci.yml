@@ -48,6 +48,7 @@ jobs:
       web-changed: ${{ steps.changes.outputs.web }}
       vdb-changed: ${{ steps.changes.outputs.vdb }}
       migration-changed: ${{ steps.changes.outputs.migration }}
+      mysql-document-snapshot-changed: ${{ steps.changes.outputs.mysql-document-snapshot }}
       sandbox-runtime-changed: ${{ steps.changes.outputs.sandbox-runtime }}
       dify-agent-changed: ${{ steps.changes.outputs.dify-agent }}
       python-style-changed: ${{ steps.changes.outputs.python-style }}
@@ -129,7 +130,7 @@ jobs:
               - 'api/tests/integration_tests/vdb/**'
               - 'api/conftest.py'
               - 'api/tests/pytest_dify.py'
-              - 'api/providers/vdb/*/tests/**'
+              - 'api/providers/vdb/**'
               - '.github/workflows/vdb-tests.yml'
               - 'docker/.env.example'
               - 'docker/envs/middleware.env.example'
@@ -166,6 +167,172 @@ jobs:
               - 'docker/generate_docker_compose'
               - 'docker/ssrf_proxy/**'
               - 'docker/volumes/sandbox/conf/**'
+            mysql-document-snapshot:
+              - 'api/controllers/console/datasets/datasets.py'
+              - 'api/controllers/console/datasets/datasets_document.py'
+              - 'api/controllers/console/datasets/hit_testing.py'
+              - 'api/controllers/console/datasets/rag_pipeline/**'
+              - 'api/controllers/service_api/dataset/dataset.py'
+              - 'api/controllers/service_api/dataset/document.py'
+              - 'api/controllers/service_api/dataset/hit_testing.py'
+              - 'api/controllers/service_api/dataset/segment.py'
+              - 'api/models/dataset.py'
+              - 'api/models/human_input.py'
+              - 'api/models/model.py'
+              - 'api/models/trigger.py'
+              - 'api/models/workflow.py'
+              - 'api/services/knowledge/dataset_service.py'
+              - 'api/services/knowledge/dataset_access.py'
+              - 'api/services/dataset_storage_cleanup_service.py'
+              - 'api/services/knowledge/document_sync.py'
+              - 'api/services/knowledge/documents/adapters.py'
+              - 'api/services/knowledge/documents/application.py'
+              - 'api/services/knowledge/datasets/adapters.py'
+              - 'api/services/knowledge/datasets/application.py'
+              - 'api/services/knowledge/entities/knowledge_entities.py'
+              - 'api/services/knowledge/entities/datasets.py'
+              - 'api/services/knowledge/entities/hit_testing.py'
+              - 'api/services/knowledge/entities/segments.py'
+              - 'api/services/knowledge/entities/summaries.py'
+              - 'api/services/knowledge/entities/vector_route.py'
+              - 'api/services/knowledge/indexing/adapters/cleanup.py'
+              - 'api/services/knowledge/indexing/adapters/execution.py'
+              - 'api/services/knowledge/indexing/adapters/sources.py'
+              - 'api/services/knowledge/indexing/execution.py'
+              - 'api/services/knowledge/indexing/vector_route.py'
+              - 'api/services/knowledge/indexing/website_sync_hint.py'
+              - 'api/services/knowledge/hit_testing/**'
+              - 'api/services/knowledge/segments/adapters.py'
+              - 'api/services/knowledge/segments/indexing.py'
+              - 'api/services/knowledge/segments/application.py'
+              - 'api/services/knowledge/summaries/adapters.py'
+              - 'api/services/knowledge/summaries/application.py'
+              - 'api/services/knowledge/keyword_file_cleanup.py'
+              - 'api/services/knowledge/upload_file_cleanup.py'
+              - 'api/services/vector_space_admission_service.py'
+              - 'api/services/knowledge/retrieval/attachments.py'
+              - 'api/services/knowledge/retrieval/finalization.py'
+              - 'api/services/data_source/website_crawl_cache.py'
+              - 'api/services/data_source/website_service.py'
+              - 'api/services/data_source/watercrawl_provider.py'
+              - 'api/services/data_source/notion_import_application_service.py'
+              - 'api/services/data_source/credential_gateway.py'
+              - 'api/services/data_source/provider_service.py'
+              - 'api/services/workspace/resource_cleanup_service.py'
+              - 'api/core/app/file_access/**'
+              - 'api/core/agent/fc_agent_runner.py'
+              - 'api/core/rag/datasource/retrieval_service.py'
+              - 'api/core/rag/datasource/keyword/jieba/jieba.py'
+              - 'api/core/rag/datasource/vdb/vector_factory.py'
+              - 'api/core/rag/extractor/firecrawl/**'
+              - 'api/core/rag/extractor/jina_reader_extractor.py'
+              - 'api/core/rag/extractor/notion_extractor.py'
+              - 'api/core/rag/extractor/watercrawl/**'
+              - 'api/core/rag/index_processor/index_processor.py'
+              - 'api/core/rag/index_processor/index_processor_base.py'
+              - 'api/core/rag/index_processor/processor/paragraph_index_processor.py'
+              - 'api/core/rag/index_processor/processor/parent_child_index_processor.py'
+              - 'api/core/rag/index_processor/processor/qa_index_processor.py'
+              - 'api/core/rag/pipeline/queue.py'
+              - 'api/core/rag/summary_index/summary_index.py'
+              - 'api/core/app/apps/pipeline/pipeline_generator.py'
+              - 'api/core/app/apps/pipeline/pipeline_runner.py'
+              - 'api/core/app/entities/app_invoke_entities.py'
+              - 'api/core/app/entities/rag_pipeline_invoke_entities.py'
+              - 'api/core/app/apps/advanced_chat/generate_task_pipeline.py'
+              - 'api/core/app/apps/message_based_app_generator.py'
+              - 'api/core/app/layers/trigger_post_layer.py'
+              - 'api/core/callback_handler/index_tool_callback_handler.py'
+              - 'api/core/repositories/celery_workflow_execution_repository.py'
+              - 'api/core/repositories/factory.py'
+              - 'api/core/repositories/sqlalchemy_workflow_execution_repository.py'
+              - 'api/core/tools/utils/dataset_retriever/dataset_multi_retriever_tool.py'
+              - 'api/core/tools/utils/dataset_retriever/dataset_retriever_tool.py'
+              - 'api/core/workflow/file_reference.py'
+              - 'api/core/workflow/system_variables.py'
+              - 'api/core/workflow/nodes/knowledge_index/**'
+              - 'api/libs/sqlalchemy_utils.py'
+              - 'api/repositories/data_source/website_crawl_job_repository.py'
+              - 'api/repositories/data_source/website_source_repository.py'
+              - 'api/repositories/knowledge/keyword_table_repository.py'
+              - 'api/repositories/knowledge/keyword_file_cleanup_repository.py'
+              - 'api/repositories/knowledge/metadata_repository.py'
+              - 'api/repositories/knowledge/attachment_vector_repository.py'
+              - 'api/repositories/knowledge/dataset_read_repository.py'
+              - 'api/repositories/knowledge/dataset_repository.py'
+              - 'api/repositories/knowledge/dataset_indexing_outbox_repository.py'
+              - 'api/repositories/knowledge/document_repository.py'
+              - 'api/repositories/knowledge/document_indexing_outbox_repository.py'
+              - 'api/repositories/knowledge/child_vector_cleanup_repository.py'
+              - 'api/repositories/knowledge/child_vector_route_repository.py'
+              - 'api/repositories/knowledge/pipeline_indexing_repository.py'
+              - 'api/repositories/knowledge/resource_cleanup_repository.py'
+              - 'api/repositories/knowledge/summary_vector_cleanup_repository.py'
+              - 'api/repositories/knowledge/vector_cleanup_handoff_repository.py'
+              - 'api/repositories/knowledge/upload_file_repository.py'
+              - 'api/repositories/knowledge/segment_repository.py'
+              - 'api/repositories/knowledge/segment_cleanup_repository.py'
+              - 'api/repositories/knowledge/segment_read_adapter.py'
+              - 'api/repositories/upload_file_repository.py'
+              - 'api/repositories/human_input_file_upload_repository.py'
+              - 'api/repositories/api_workflow_run_repository.py'
+              - 'api/repositories/entities/workflow_pause.py'
+              - 'api/repositories/sqlalchemy_api_workflow_run_repository.py'
+              - 'api/repositories/sqlalchemy_workflow_trigger_log_repository.py'
+              - 'api/repositories/workflow_trigger_log_repository.py'
+              - 'api/repositories/workflow_run_history.py'
+              - 'api/extensions/logstore/repositories/logstore_api_workflow_run_repository.py'
+              - 'api/extensions/logstore/repositories/logstore_workflow_execution_repository.py'
+              - 'api/extensions/application_services/knowledge.py'
+              - 'api/extensions/application_services/knowledge_index.py'
+              - 'api/services/async_workflow_service.py'
+              - 'api/services/billing_service.py'
+              - 'api/services/human_input_file_upload_service.py'
+              - 'api/services/quota_service.py'
+              - 'api/services/workflow_trigger_quota_service.py'
+              - 'api/services/workflow_run_agg.py'
+              - 'api/extensions/ext_celery.py'
+              - 'api/core/rag/docstore/dataset_docstore.py'
+              - 'api/tasks/child_vector_cleanup_task.py'
+              - 'api/tasks/attachment_vector_cleanup_task.py'
+              - 'api/tasks/add_document_to_index_task.py'
+              - 'api/tasks/app_generate/workflow_execute_task.py'
+              - 'api/tasks/async_workflow_tasks.py'
+              - 'api/tasks/clean_dataset_task.py'
+              - 'api/tasks/dataset_indexing_outbox_task.py'
+              - 'api/tasks/deal_dataset_vector_index_task.py'
+              - 'api/tasks/delete_conversation_task.py'
+              - 'api/tasks/delete_segment_from_index_task.py'
+              - 'api/tasks/document_indexing_outbox_task.py'
+              - 'api/tasks/document_indexing_sync_task.py'
+              - 'api/tasks/document_indexing_task.py'
+              - 'api/tasks/document_indexing_update_task.py'
+              - 'api/tasks/duplicate_document_indexing_task.py'
+              - 'api/tasks/generate_summary_index_task.py'
+              - 'api/tasks/human_input_timeout_tasks.py'
+              - 'api/tasks/keyword_file_cleanup_task.py'
+              - 'api/tasks/clean_notion_document_task.py'
+              - 'api/tasks/recover_document_indexing_task.py'
+              - 'api/tasks/regenerate_summary_index_task.py'
+              - 'api/tasks/remove_document_from_index_task.py'
+              - 'api/tasks/resource_cleanup_task.py'
+              - 'api/tasks/retry_document_indexing_task.py'
+              - 'api/tasks/rag_pipeline/priority_rag_pipeline_run_task.py'
+              - 'api/tasks/rag_pipeline/rag_pipeline_run_task.py'
+              - 'api/tasks/segment_state_outbox_task.py'
+              - 'api/tasks/summary_vector_cleanup_task.py'
+              - 'api/tasks/sync_website_document_indexing_task.py'
+              - 'api/tasks/upload_file_cleanup_task.py'
+              - 'api/tasks/workflow_run_history_sync_task.py'
+              - 'api/tasks/workflow_execution_tasks.py'
+              - 'api/services/rag_pipeline/pipeline_generate_service.py'
+              - 'api/services/rag_pipeline/rag_pipeline.py'
+              - 'api/services/rag_pipeline/rag_pipeline_dsl_service.py'
+              - 'api/services/rag_pipeline/rag_pipeline_transform_service.py'
+              - 'api/tests/mysql_integration_tests/**'
+              - 'api/tests/database_integration_tests/**'
+              - '.github/workflows/main-ci.yml'
+              - '.github/workflows/db-migration-test.yml'
             python-style:
               - 'api/**'
               - 'scripts/ast_grep_guard.py'
@@ -525,8 +692,15 @@ jobs:
     needs:
       - pre_job
       - check-changes
-    if: needs.pre_job.outputs.should_skip != 'true' && needs.check-changes.outputs.migration-changed == 'true'
+    if: >-
+      needs.pre_job.outputs.should_skip != 'true' &&
+      (needs.check-changes.outputs.migration-changed == 'true' ||
+      needs.check-changes.outputs.mysql-document-snapshot-changed == 'true')
     uses: ./.github/workflows/db-migration-test.yml
+    with:
+      run_postgres_migration: >-
+        ${{ needs.check-changes.outputs.migration-changed == 'true' ||
+        needs.check-changes.outputs.mysql-document-snapshot-changed == 'true' }}
 
   db-migration-test:
     name: DB Migration Test
@@ -540,7 +714,8 @@ jobs:
       - name: Finalize DB Migration Test status
         env:
           SHOULD_SKIP_WORKFLOW: ${{ needs.pre_job.outputs.should_skip }}
-          TESTS_CHANGED: ${{ needs.check-changes.outputs.migration-changed }}
+          MIGRATION_CHANGED: ${{ needs.check-changes.outputs.migration-changed }}
+          MYSQL_DOCUMENT_SNAPSHOT_CHANGED: ${{ needs.check-changes.outputs.mysql-document-snapshot-changed }}
           RUN_RESULT: ${{ needs.db-migration-test-run.result }}
           PRE_JOB_RESULT: ${{ needs.pre_job.result }}
           CHANGES_RESULT: ${{ needs.check-changes.result }}
@@ -555,7 +730,7 @@ jobs:
             exit 1
           fi
 
-          if [[ "$TESTS_CHANGED" == 'true' ]]; then
+          if [[ "$MIGRATION_CHANGED" == 'true' || "$MYSQL_DOCUMENT_SNAPSHOT_CHANGED" == 'true' ]]; then
             if [[ "$RUN_RESULT" == 'success' ]]; then
               echo "DB migration tests ran successfully."
               exit 0
@@ -565,12 +740,12 @@ jobs:
             exit 1
           fi
 
-          if [[ "$TESTS_CHANGED" == 'false' && "$RUN_RESULT" == 'skipped' ]]; then
-            echo "DB migration tests were skipped because no migration-related files changed."
+          if [[ "$MIGRATION_CHANGED" == 'false' && "$MYSQL_DOCUMENT_SNAPSHOT_CHANGED" == 'false' && "$RUN_RESULT" == 'skipped' ]]; then
+            echo "DB migration tests were skipped because no migration or MySQL document snapshot files changed."
             exit 0
           fi
 
-          echo "Unexpected test state: changed=$TESTS_CHANGED, result=$RUN_RESULT" >&2
+          echo "Unexpected test state: migration_changed=$MIGRATION_CHANGED, mysql_document_snapshot_changed=$MYSQL_DOCUMENT_SNAPSHOT_CHANGED, result=$RUN_RESULT" >&2
           exit 1
 
   sandbox-runtime-tests-run:

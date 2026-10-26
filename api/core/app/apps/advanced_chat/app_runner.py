@@ -1,7 +1,7 @@
 import logging
 import time
-from collections.abc import Mapping
-from typing import Any, cast, override
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any, cast, override
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -42,6 +42,7 @@ from extensions.ext_redis import redis_client
 from extensions.workflow_warm_shutdown import WORKFLOW_WARM_SHUTDOWN_ABORT_REASON, celery_warm_shutdown_started
 from graphon.engine.command import RedisChannel
 from graphon.engine.filter import ResponseStreamFilter
+from graphon.engine.layer import Layer
 from graphon.enums import WorkflowType
 from graphon.runtime import RuntimeState, VariablePool
 from graphon.variable_loader import VariableLoader
@@ -49,6 +50,9 @@ from graphon.variables.variables import Variable
 from models import Workflow
 from models.model import App, Conversation, Message, MessageAnnotation
 from models.workflow import ConversationVariable
+
+if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +67,7 @@ class AdvancedChatAppRunner(WorkflowBasedAppRunner):
         *,
         application_generate_entity: AdvancedChatAppGenerateEntity,
         queue_manager: AppQueueManager,
+        external_retrieval: "ExternalDatasetRetriever",
         conversation: Conversation,
         message: Message,
         dialogue_count: int,
@@ -72,13 +77,16 @@ class AdvancedChatAppRunner(WorkflowBasedAppRunner):
         app: App,
         execution_driver: WorkflowRunDriver | None = None,
         graph_runtime_state: RuntimeState | None = None,
+        graph_engine_layers: Sequence[Layer] = (),
         response_stream_filter: ResponseStreamFilter | None = None,
     ):
         super().__init__(
             queue_manager=queue_manager,
+            external_retrieval=external_retrieval,
             execution_driver=execution_driver,
             variable_loader=variable_loader,
             app_id=application_generate_entity.app_config.app_id,
+            graph_engine_layers=graph_engine_layers,
         )
         self.application_generate_entity = application_generate_entity
         self.conversation = conversation

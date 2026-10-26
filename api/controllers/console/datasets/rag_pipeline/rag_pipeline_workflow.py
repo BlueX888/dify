@@ -566,7 +566,11 @@ class RagPipelineDraftNodeRunApi(Resource):
 
         rag_pipeline_service = RagPipelineService(db.session())
         workflow_node_execution = rag_pipeline_service.run_draft_workflow_node(
-            pipeline=pipeline, node_id=node_id, user_inputs=inputs, account=current_user
+            pipeline=pipeline,
+            node_id=node_id,
+            user_inputs=inputs,
+            account=current_user,
+            external_retrieval=application_services().knowledge.external_retrieval,
         )
 
         if workflow_node_execution is None:
@@ -648,6 +652,7 @@ class PublishedRagPipelineApi(Resource):
         pipeline.is_published = True
         pipeline.workflow_id = workflow.id
         db.session.commit()
+        DatasetService.dispatch_dataset_indexing(rag_pipeline_service.pending_dataset_indexing_intent_ids)
         workflow_created_at = TimestampField().format(workflow.created_at)
 
         return {
@@ -1156,6 +1161,7 @@ class RagPipelineDatasourceVariableApi(Resource):
             pipeline=pipeline,
             args=args,
             current_user=current_user,
+            external_retrieval=application_services().knowledge.external_retrieval,
         )
         return WorkflowRunNodeExecutionResponse.model_validate(
             node_execution_response_source(workflow_node_execution, session=db.session()), from_attributes=True

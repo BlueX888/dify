@@ -1,5 +1,6 @@
 """Metadata use cases with explicit ownership and persistence contracts."""
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -7,8 +8,9 @@ from typing import Protocol, TypedDict
 
 from core.rag.index_processor.constant.built_in_field import BuiltInField
 from machinery.context import RequestContext
+from services.errors.metadata import InvalidMetadataValueError
 from services.knowledge.dataset_access import DatasetAccess
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 
 
 class MetadataInput(Protocol):
@@ -37,6 +39,31 @@ class MetadataOperation(Protocol):
 class MetadataOperationsInput(Protocol):
     @property
     def operation_data(self) -> Sequence[MetadataOperation]: ...
+
+
+def validate_metadata_value(*, field_name: str, field_type: str, value: object) -> None:
+    """Validate one persisted value without coercing it to another JSON scalar type.
+
+    ``None`` clears a value for every field type. String fields retain arbitrary
+    strings, while number and time fields use finite JSON numbers. Booleans are
+    deliberately excluded from numeric fields even though ``bool`` subclasses
+    ``int`` in Python.
+    """
+    if value is None:
+        return
+
+    match field_type:
+        case "string":
+            valid = isinstance(value, str)
+        case "number" | "time":
+            valid = not isinstance(value, bool) and isinstance(value, (int, float))
+            if valid and isinstance(value, float):
+                valid = math.isfinite(value)
+        case _:
+            valid = False
+
+    if not valid:
+        raise InvalidMetadataValueError(f"Metadata field '{field_name}' requires a {field_type} value or null.")
 
 
 @dataclass(frozen=True)

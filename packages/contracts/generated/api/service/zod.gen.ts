@@ -1053,6 +1053,18 @@ export const zCompletionRequestError = zErrorResponse.and(
 )
 
 /**
+ * DatasetAccessDeniedError
+ *
+ * Dataset access denied.
+ */
+export const zDatasetAccessDeniedError = zErrorResponse.and(
+  z.object({
+    code: z.literal('dataset_access_denied'),
+    status: z.literal(403),
+  }),
+)
+
+/**
  * DatasetNameDuplicateError
  *
  * The dataset name already exists. Please modify your dataset name.
@@ -1061,6 +1073,18 @@ export const zDatasetNameDuplicateError = zErrorResponse.and(
   z.object({
     code: z.literal('dataset_name_duplicate'),
     status: z.literal(409),
+  }),
+)
+
+/**
+ * DatasetNotInitializedError
+ *
+ * The dataset is still being initialized or indexing. Please wait a moment.
+ */
+export const zDatasetNotInitializedError = zErrorResponse.and(
+  z.object({
+    code: z.literal('dataset_not_initialized'),
+    status: z.literal(400),
   }),
 )
 
@@ -1254,7 +1278,7 @@ export const zHitTestingDocument = z.object({
 export const zHitTestingFile = z.object({
   extension: z.string(),
   id: z.string(),
-  mime_type: z.string(),
+  mime_type: z.string().nullable(),
   name: z.string(),
   size: z.int(),
   source_url: z.string(),
@@ -3228,13 +3252,6 @@ export const zDocumentTextUpdate = z.intersection(
  */
 export const zHitTestingPayload = z.object({
   attachment_ids: z.array(z.string()).nullish(),
-  external_retrieval_model: z
-    .object({
-      score_threshold: z.number().optional(),
-      score_threshold_enabled: z.boolean().optional(),
-      top_k: z.int().optional(),
-    })
-    .nullish(),
   query: z.string().max(250),
   retrieval_model: zRetrievalModel.nullish(),
 })

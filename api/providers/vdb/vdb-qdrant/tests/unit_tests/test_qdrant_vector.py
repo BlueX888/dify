@@ -4,19 +4,26 @@ import os
 import sys
 import types
 from collections import UserDict
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol, cast, override
 from unittest.mock import MagicMock, patch
 
 import pytest
+from qdrant_client.http.models import HasIdCondition, Record
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
 from core.rag.datasource.vdb.vector_factory import Vector
+from core.rag.index_processor.constant.index_type import IndexStructureType
+from core.rag.index_processor.index_processor import IndexProcessorFactory
 from core.rag.models.document import Document
 from models.dataset import Dataset, DatasetCollectionBinding
 from models.enums import CollectionBindingType
+from services.knowledge.entities.datasets import DatasetIndexingRepresentation
+from services.knowledge.entities.vector_route import VectorRoute
+from tasks.deal_dataset_vector_index_task import _dataset_for_representation
 
 
 class ScrollMock(Protocol):
@@ -24,6 +31,13 @@ class ScrollMock(Protocol):
     call_count: int
 
     def assert_not_called(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class _ScoredPoint:
+    payload: dict[str, object]
+    score: float
+    vector: list[float]
 
 
 def _build_fake_qdrant_modules():
@@ -120,6 +134,7 @@ def _build_fake_qdrant_modules():
     qdrant_http_models.MatchValue = MatchValue
     qdrant_http_models.MatchAny = MatchAny
     qdrant_http_models.MatchText = MatchText
+    qdrant_http_models.HasIdCondition = HasIdCondition
     qdrant_http_exceptions.UnexpectedResponse = UnexpectedResponseError
 
     qdrant_http.models = qdrant_http_models
@@ -254,7 +269,9 @@ def test_delete_and_exists_paths(qdrant_module):
     vector._client.get_collections.return_value = SimpleNamespace(collections=[SimpleNamespace(name="other")])
     assert vector.text_exists("id-1") is False
     vector._client.get_collections.return_value = SimpleNamespace(collections=[SimpleNamespace(name="collection_1")])
-    vector._client.retrieve.return_value = [{"id": "id-1"}]
+    vector._client.retrieve.return_value = [
+        Record(id="123e4567-e89b-12d3-a456-426614174000", payload={"group_id": "group-1"})
+    ]
     assert vector.text_exists("id-1") is True
 
 
@@ -302,6 +319,46 @@ def test_search_and_helper_methods(qdrant_module):
         "metadata",
     )
     assert doc.page_content == "doc"
+
+
+def test_qdrant_legacy_attachment_requires_the_unfiltered_compatibility_pool(qdrant_module) -> None:
+    vector = qdrant_module.QdrantVector("collection_1", "group-1", _config(qdrant_module))
+    legacy_point = _ScoredPoint(
+        payload={
+            "page_content": "shared attachment",
+            "metadata": {
+                "document_id": "deleted-owner-a",
+                "doc_id": "shared-file-f",
+                "doc_type": "image",
+            },
+        },
+        score=0.9,
+        vector=[0.1],
+    )
+
+    def apply_qdrant_filter(*, query_filter, **_kwargs):
+        legacy_metadata = cast(dict[str, object], legacy_point.payload["metadata"])
+        document_filter = next(
+            (condition.match.any for condition in query_filter.must if condition.key == "metadata.document_id"),
+            None,
+        )
+        if document_filter is not None and legacy_metadata["document_id"] not in document_filter:
+            return []
+        return [legacy_point]
+
+    vector._client.search.side_effect = apply_qdrant_filter
+
+    assert (
+        vector.search_by_vector(
+            [0.1],
+            top_k=2,
+            score_threshold=0.0,
+            document_ids_filter=["document-b", "shared-file-f"],
+        )
+        == []
+    )
+    fallback = vector.search_by_vector([0.1], top_k=2, score_threshold=0.0)
+    assert [document.metadata["doc_id"] for document in fallback] == ["shared-file-f"]
 
 
 def test_qdrant_full_text_search_does_not_starve_later_keywords(qdrant_module: types.ModuleType) -> None:
@@ -460,3 +517,87 @@ def test_vector_reads_uncommitted_annotation_binding(
             assert session.scalar(stmt) is None
     finally:
         engine.dispose()
+
+
+@pytest.mark.parametrize("sqlite3_session", [(DatasetCollectionBinding,)], indirect=True)
+def test_dataset_cleanup_route_bypasses_qdrant_binding_precedence(
+    qdrant_module,
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite3_session: Session,
+) -> None:
+    class AppConfig:
+        root_path = "/root"
+
+    class App:
+        config = AppConfig()
+
+    created_vectors = []
+    actual_vector_class = qdrant_module.QdrantVector
+
+    class RecordingQdrantVector(actual_vector_class):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            created_vectors.append(self)
+
+    monkeypatch.setattr(qdrant_module, "QdrantVector", RecordingQdrantVector)
+    monkeypatch.setattr(Vector, "get_vector_factory", staticmethod(lambda _: qdrant_module.QdrantVectorFactory))
+    monkeypatch.setattr(qdrant_module, "current_app", App())
+    monkeypatch.setattr(qdrant_module.dify_config, "QDRANT_URL", "http://localhost:6333")
+    monkeypatch.setattr(qdrant_module.dify_config, "QDRANT_API_KEY", "api-key")
+    monkeypatch.setattr(qdrant_module.dify_config, "QDRANT_CLIENT_TIMEOUT", 20)
+    monkeypatch.setattr(qdrant_module.dify_config, "QDRANT_GRPC_PORT", 6334)
+    monkeypatch.setattr(qdrant_module.dify_config, "QDRANT_GRPC_ENABLED", False)
+    monkeypatch.setattr(qdrant_module.dify_config, "QDRANT_REPLICATION_FACTOR", 1)
+
+    binding = DatasetCollectionBinding(
+        provider_name="provider",
+        model_name="model",
+        type=CollectionBindingType.DATASET,
+        collection_name="collection-c",
+    )
+    sqlite3_session.add(binding)
+    sqlite3_session.commit()
+    route_a = VectorRoute.capture(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        vector_type="qdrant",
+        collection_name="collection-a",
+        collection_binding_id="binding-a",
+        indexing_technique="high_quality",
+        doc_form=IndexStructureType.PARAGRAPH_INDEX,
+    )
+    live_dataset = Dataset(
+        id="dataset-1",
+        tenant_id="tenant-1",
+        name="dataset",
+        created_by="account-1",
+        indexing_technique="high_quality",
+        index_struct=route_a.index_struct,
+        collection_binding_id=binding.id,
+    )
+    source = DatasetIndexingRepresentation(
+        indexing_technique="high_quality",
+        index_struct=route_a.index_struct,
+        collection_binding_id=binding.id,
+        embedding_model="embedding",
+        embedding_model_provider="provider",
+        keyword_number=10,
+        is_multimodal=False,
+        doc_form=IndexStructureType.PARAGRAPH_INDEX,
+        summary_index_setting=None,
+        vector_route=route_a,
+        cleanup_routes=(route_a,),
+    )
+
+    live_vector = Vector(live_dataset, session=sqlite3_session, vector_type="qdrant")
+    assert live_vector.get_routing_target() == ("qdrant", "collection-c")
+
+    cleanup_dataset = _dataset_for_representation(live_dataset, source, route=route_a)
+    assert cleanup_dataset.collection_binding_id is None
+    processor = IndexProcessorFactory(IndexStructureType.PARAGRAPH_INDEX).init_index_processor()
+    processor.clean(cleanup_dataset, None, with_keywords=False, session=sqlite3_session)
+
+    assert len(created_vectors) == 2
+    assert created_vectors[1].get_type() == "qdrant"
+    assert created_vectors[1].collection_name == "collection-a"
+    assert created_vectors[1]._client.delete.call_args.kwargs["collection_name"] == "collection-a"

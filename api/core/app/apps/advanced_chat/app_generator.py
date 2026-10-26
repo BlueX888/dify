@@ -4,7 +4,7 @@ import contextvars
 import logging
 import threading
 import uuid
-from collections.abc import Generator, Mapping
+from collections.abc import Generator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Literal, overload
 
 from flask import Flask, current_app
@@ -19,6 +19,7 @@ from constants import UUID_NIL
 if TYPE_CHECKING:
     from controllers.console.app.workflow import LoopNodeRunPayload
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.app.app_config.features.file_upload.manager import FileUploadConfigManager
 from core.app.apps.advanced_chat.app_config_manager import AdvancedChatAppConfigManager
 from core.app.apps.advanced_chat.app_runner import AdvancedChatAppRunner
@@ -50,6 +51,7 @@ from core.repositories.factory import WorkflowExecutionRepository, WorkflowNodeE
 from extensions.ext_database import db
 from factories import file_factory
 from graphon.engine.filter import ResponseStreamFilter
+from graphon.engine.layer import Layer
 from graphon.model_runtime.errors.invoke import InvokeAuthorizationError
 from graphon.runtime import RuntimeState
 from graphon.variable_loader import DUMMY_VARIABLE_LOADER, VariableLoader
@@ -73,8 +75,14 @@ def _extract_trace_session_id_from_debug_args(args: Mapping[str, Any] | Any) -> 
 
 
 class AdvancedChatAppGenerator(MessageBasedAppGenerator):
-    def __init__(self, *, execution_driver: WorkflowRunDriver) -> None:
+    def __init__(
+        self,
+        *,
+        execution_driver: WorkflowRunDriver,
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         self._execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
 
     _dialogue_count: int
 
@@ -285,6 +293,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
         workflow_execution_repository: WorkflowExecutionRepository,
         workflow_node_execution_repository: WorkflowNodeExecutionRepository,
         graph_runtime_state: RuntimeState,
+        graph_engine_layers: Sequence[Layer] = (),
         pause_state_config: PauseStateLayerConfig | None = None,
         response_stream_filter: ResponseStreamFilter | None = None,
     ):
@@ -316,6 +325,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
             stream=application_generate_entity.stream,
             pause_state_config=pause_state_config,
             graph_runtime_state=graph_runtime_state,
+            graph_engine_layers=graph_engine_layers,
             response_stream_filter=response_stream_filter,
             session=session,
         )
@@ -524,6 +534,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
         variable_loader: VariableLoader = DUMMY_VARIABLE_LOADER,
         pause_state_config: PauseStateLayerConfig | None = None,
         graph_runtime_state: RuntimeState | None = None,
+        graph_engine_layers: Sequence[Layer] = (),
         response_stream_filter: ResponseStreamFilter | None = None,
     ) -> Mapping[str, Any] | Generator[str | Mapping[str, Any]]:
         """
@@ -593,6 +604,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
                     "workflow_node_execution_repository": workflow_node_execution_repository,
                     "pause_state_config": pause_state_config,
                     "graph_runtime_state": graph_runtime_state,
+                    "graph_engine_layers": graph_engine_layers,
                     "response_stream_filter": response_stream_filter,
                 },
             )
@@ -647,6 +659,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
         workflow_execution_repository: WorkflowExecutionRepository,
         workflow_node_execution_repository: WorkflowNodeExecutionRepository,
         graph_runtime_state: RuntimeState | None = None,
+        graph_engine_layers: Sequence[Layer] = (),
         response_stream_filter: ResponseStreamFilter | None = None,
         pause_state_config: PauseStateLayerConfig | None = None,
     ):
@@ -703,6 +716,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
             runner = AdvancedChatAppRunner(
                 application_generate_entity=application_generate_entity,
                 execution_driver=self._execution_driver,
+                external_retrieval=self._external_retrieval,
                 queue_manager=queue_manager,
                 conversation=conversation,
                 message=message,
@@ -712,6 +726,7 @@ class AdvancedChatAppGenerator(MessageBasedAppGenerator):
                 system_user_id=system_user_id,
                 app=app,
                 graph_runtime_state=graph_runtime_state,
+                graph_engine_layers=graph_engine_layers,
                 response_stream_filter=response_stream_filter,
             )
 

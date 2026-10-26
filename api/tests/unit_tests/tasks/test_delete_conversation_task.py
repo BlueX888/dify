@@ -1,10 +1,11 @@
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import pytest
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.workflow.human_input_adapter import DeliveryMethodType
@@ -36,9 +37,12 @@ from models.enums import (
     MessageChainType,
 )
 from models.human_input import HumanInputDelivery, HumanInputFormRecipient, RecipientType
+from models.model import UploadFile, UploadFileCleanupOutbox
 from models.tools import ToolConversationVariables, ToolFile
+from repositories.upload_file_repository import SQLAlchemyUploadFileCleanupRepository
+from services.knowledge.upload_file_cleanup import drain_pending_upload_file_cleanups
 from tasks.delete_conversation_task import _cleanup_conversation_related_data, sweep_deleted_conversations
-from tests.unit_tests.model_factories import make_conversation, make_message
+from tests.unit_tests.model_factories import make_conversation, make_message, make_upload_file
 
 TENANT_ID = "11111111-1111-1111-1111-111111111111"
 APP_ID = "22222222-2222-2222-2222-222222222222"
@@ -47,6 +51,7 @@ CONVERSATION_ID = "44444444-4444-4444-4444-444444444444"
 OTHER_CONVERSATION_ID = "55555555-5555-5555-5555-555555555555"
 MESSAGE_ID = "66666666-6666-6666-6666-666666666666"
 AGENT_ID = "77777777-7777-7777-7777-777777777777"
+UPLOAD_FILE_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
 
 def _conversation(conversation_id: str, *, deleted: bool) -> Conversation:
@@ -92,13 +97,17 @@ def _tool_file(*, name: str, conversation_id: str | None = CONVERSATION_ID) -> T
     )
 
 
-def test_cleanup_removes_owned_resources(sqlite_session: Session) -> None:
+def test_cleanup_removes_owned_resources(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
     conversation = _conversation(CONVERSATION_ID, deleted=True)
     other_conversation = _conversation(OTHER_CONVERSATION_ID, deleted=False)
     message = _message()
     owned_file = _tool_file(name="owned.txt")
     other_file = _tool_file(name="other.txt", conversation_id=OTHER_CONVERSATION_ID)
-    sqlite_session.add_all([conversation, other_conversation, message, owned_file, other_file])
+    uploaded_file = make_upload_file(file_id=UPLOAD_FILE_ID, tenant_id=TENANT_ID, key="uploads/hitl-owned")
+    sqlite_session.add_all([conversation, other_conversation, message, owned_file, other_file, uploaded_file])
     sqlite_session.flush()
 
     message_chain = MessageChain(message_id=MESSAGE_ID, type=MessageChainType.SYSTEM, input=None, output=None)
@@ -210,7 +219,7 @@ def test_cleanup_removes_owned_resources(sqlite_session: Session) -> None:
             tenant_id=TENANT_ID,
             app_id=APP_ID,
             form_id=form.id,
-            upload_file_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            upload_file_id=uploaded_file.id,
             upload_token_id=upload_token.id,
         ),
     ]
@@ -220,11 +229,33 @@ def test_cleanup_removes_owned_resources(sqlite_session: Session) -> None:
     owned_file_id = owned_file.id
     owned_file_key = owned_file.file_key
     other_file_id = other_file.id
+    uploaded_file_id = uploaded_file.id
+    uploaded_file_key = uploaded_file.key
 
     with patch("tasks.delete_conversation_task.storage") as storage_mock:
         assert _cleanup_conversation_related_data(CONVERSATION_ID) is True
 
     storage_mock.delete.assert_called_once_with(owned_file_key)
+    with sqlite_session_factory() as session:
+        assert session.get(UploadFile, uploaded_file_id) is not None
+        assert (
+            session.scalar(
+                select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == uploaded_file_id)
+            )
+            is not None
+        )
+
+    deleted_upload_keys: list[str] = []
+    assert (
+        drain_pending_upload_file_cleanups(
+            files=SQLAlchemyUploadFileCleanupRepository(session_factory=sqlite_session_factory),
+            delete_blob=deleted_upload_keys.append,
+            logger=logging.getLogger(__name__),
+            limit=100,
+        )
+        == ()
+    )
+    assert deleted_upload_keys == [uploaded_file_key]
     sqlite_session.expire_all()
     assert sqlite_session.get(Conversation, CONVERSATION_ID) is None
     assert sqlite_session.get(Message, MESSAGE_ID) is None
@@ -235,6 +266,98 @@ def test_cleanup_removes_owned_resources(sqlite_session: Session) -> None:
     assert sqlite_session.get(ToolFile, owned_file_id) is None
     assert sqlite_session.get(ToolFile, other_file_id) is not None
     assert sqlite_session.get(Conversation, OTHER_CONVERSATION_ID) is not None
+    assert sqlite_session.get(UploadFile, uploaded_file_id) is None
+    assert sqlite_session.scalar(select(UploadFileCleanupOutbox)) is None
+
+
+def test_cleanup_handoff_preserves_upload_referenced_by_another_owner(
+    sqlite_session: Session,
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    conversation = _conversation(CONVERSATION_ID, deleted=True)
+    uploaded_file = make_upload_file(file_id=UPLOAD_FILE_ID, tenant_id=TENANT_ID, key="uploads/hitl-shared")
+    form = HumanInputForm(
+        tenant_id=TENANT_ID,
+        app_id=APP_ID,
+        workflow_run_id=None,
+        conversation_id=CONVERSATION_ID,
+        form_kind=HumanInputFormKind.RUNTIME,
+        node_id="ask-human",
+        form_definition="{}",
+        rendered_content="form",
+        status=HumanInputFormStatus.WAITING,
+        expiration_time=datetime.now(UTC) + timedelta(hours=1),
+    )
+    sqlite_session.add_all([conversation, uploaded_file, form])
+    sqlite_session.flush()
+    delivery = HumanInputDelivery(
+        form_id=form.id,
+        delivery_method_type=DeliveryMethodType.WEBAPP,
+        delivery_config_id=None,
+        channel_payload="{}",
+    )
+    sqlite_session.add(delivery)
+    sqlite_session.flush()
+    recipient = HumanInputFormRecipient(
+        form_id=form.id,
+        delivery_id=delivery.id,
+        recipient_type=RecipientType.CONSOLE,
+        recipient_payload="{}",
+    )
+    sqlite_session.add(recipient)
+    sqlite_session.flush()
+    upload_token = HumanInputFormUploadToken(
+        tenant_id=TENANT_ID,
+        app_id=APP_ID,
+        form_id=form.id,
+        recipient_id=recipient.id,
+        token="upload-token",
+    )
+    sqlite_session.add(upload_token)
+    sqlite_session.flush()
+    sqlite_session.add_all(
+        [
+            HumanInputFormUploadFile(
+                tenant_id=TENANT_ID,
+                app_id=APP_ID,
+                form_id=form.id,
+                upload_file_id=uploaded_file.id,
+                upload_token_id=upload_token.id,
+            ),
+            MessageFile(
+                message_id="bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+                type=FileType.DOCUMENT,
+                transfer_method=FileTransferMethod.LOCAL_FILE,
+                created_by_role=CreatorUserRole.ACCOUNT,
+                created_by=ACCOUNT_ID,
+                upload_file_id=uploaded_file.id,
+            ),
+        ]
+    )
+    sqlite_session.commit()
+
+    assert _cleanup_conversation_related_data(CONVERSATION_ID) is True
+
+    deleted_upload_keys: list[str] = []
+    assert (
+        drain_pending_upload_file_cleanups(
+            files=SQLAlchemyUploadFileCleanupRepository(session_factory=sqlite_session_factory),
+            delete_blob=deleted_upload_keys.append,
+            logger=logging.getLogger(__name__),
+            limit=100,
+        )
+        == ()
+    )
+    assert deleted_upload_keys == []
+    with sqlite_session_factory() as session:
+        assert session.get(UploadFile, uploaded_file.id) is not None
+        assert (
+            session.scalar(
+                select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == uploaded_file.id)
+            )
+            is not None
+        )
+        assert session.scalar(select(HumanInputFormUploadFile)) is None
 
 
 def test_cleanup_storage_failure_retains_marker_and_file_key(sqlite_session: Session) -> None:

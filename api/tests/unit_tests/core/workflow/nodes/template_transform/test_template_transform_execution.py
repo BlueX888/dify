@@ -6,6 +6,7 @@ from typing import cast
 
 from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.system_variables import build_system_variables
 from graphon.enums import WorkflowNodeExecutionStatus
 from graphon.graph import Graph
@@ -13,6 +14,7 @@ from graphon.nodes.template_transform.entities import TemplateTransformNodeData
 from graphon.nodes.template_transform.template_transform_node import TemplateTransformNode
 from graphon.runtime import RuntimeState, VariablePool
 from graphon.template_rendering import Jinja2TemplateRenderer, TemplateRenderError
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.workflow_test_utils import build_test_graph_init_params
 
 
@@ -87,6 +89,8 @@ def test_execute_template_transform() -> None:
     node_factory = DifyNodeFactory(
         init_params=init_params,
         runtime_state=graph_runtime_state,
+        external_retrieval=make_external_dataset_retriever(),
+        knowledge_index_runtime=build_knowledge_index_runtime(),
     )
 
     graph = Graph.init(graph_config=graph_config, node_factory=node_factory, root_node_id="start")

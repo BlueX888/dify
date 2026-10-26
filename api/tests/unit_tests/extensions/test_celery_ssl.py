@@ -2,6 +2,7 @@
 
 import ssl
 from collections.abc import Iterator
+from datetime import timedelta
 from importlib import import_module
 from unittest.mock import MagicMock, patch
 
@@ -261,6 +262,19 @@ class TestCelerySSLConfiguration:
         assert celery_app.conf["result_backend_transport_options"]["global_keyprefix"] == "enterprise-a:"
         assert "tasks.collect_agent_resources_task" in celery_app.conf["imports"]
         assert "tasks.delete_conversation_task" in celery_app.conf["imports"]
+        assert "tasks.document_indexing_outbox_task" in celery_app.conf["imports"]
+        assert "tasks.resource_cleanup_task" in celery_app.conf["imports"]
+        assert {
+            "tasks.enable_segment_to_index_task",
+            "tasks.enable_segments_to_index_task",
+            "tasks.disable_segment_from_index_task",
+            "tasks.disable_segments_from_index_task",
+            "tasks.delete_segment_from_index_task",
+        }.issubset(celery_app.conf["imports"])
+        assert "tasks.summary_vector_cleanup_task" in celery_app.conf["imports"]
+        assert "tasks.child_vector_cleanup_task" in celery_app.conf["imports"]
+        assert "tasks.attachment_vector_cleanup_task" in celery_app.conf["imports"]
+        assert "tasks.upload_file_cleanup_task" in celery_app.conf["imports"]
         assert "tasks.workflow_run_archive_deletion_tasks" in celery_app.conf["imports"]
         import_module("tasks.workflow_run_archive_deletion_tasks")
         task_name = "tasks.workflow_run_archive_deletion_tasks.delete_workflow_run_archive_task"
@@ -273,3 +287,38 @@ class TestCelerySSLConfiguration:
         assert celery_app.conf["beat_schedule"]["conversation_cleanup_sweeper"]["task"] == (
             "tasks.delete_conversation_task.sweep_deleted_conversations"
         )
+        assert celery_app.conf["beat_schedule"]["upload-file-cleanup-outbox"] == {
+            "task": "tasks.upload_file_cleanup_task.drain_upload_file_cleanup_outbox_task",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "dataset"},
+        }
+        assert celery_app.conf["beat_schedule"]["resource-cleanup-outbox"] == {
+            "task": "tasks.resource_cleanup_task.drain_resource_cleanup_outbox_task",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "dataset"},
+        }
+        assert celery_app.conf["beat_schedule"]["summary-vector-cleanup-outbox"] == {
+            "task": "tasks.summary_vector_cleanup_task.drain_summary_vector_cleanup_outbox_task",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "dataset"},
+        }
+        assert celery_app.conf["beat_schedule"]["child-vector-cleanup-outbox"] == {
+            "task": "tasks.child_vector_cleanup_task.drain_child_vector_cleanup_outbox_task",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "dataset"},
+        }
+        assert celery_app.conf["beat_schedule"]["attachment-vector-cleanup-outbox"] == {
+            "task": "tasks.attachment_vector_cleanup_task.drain_attachment_vector_cleanup_outbox_task",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "dataset"},
+        }
+        assert celery_app.conf["beat_schedule"]["document-indexing-outbox"] == {
+            "task": "tasks.document_indexing_outbox_task.drain_document_indexing_outbox_task",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "dataset"},
+        }
+        assert celery_app.conf["beat_schedule"]["async-workflow-dispatch-reconciliation"] == {
+            "task": "tasks.async_workflow_tasks.reconcile_async_workflow_dispatches",
+            "schedule": timedelta(minutes=1),
+            "options": {"queue": "workflow"},
+        }

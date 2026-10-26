@@ -1,29 +1,62 @@
 """SQLite-backed tests for dataset availability, rate limiting, and retrieval orchestration."""
 
+import json
 from dataclasses import dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from typing import Literal
+from unittest.mock import MagicMock, create_autospec
 
+import httpx
 import pytest
-from sqlalchemy import select
+from flask import Flask
+from sqlalchemy import Engine, event, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom
+from core.app.app_config.entities import DatasetEntity, DatasetRetrieveConfigEntity
+from core.app.app_config.entities import MetadataFilteringCondition as AppMetadataFilteringCondition
+from core.app.entities.app_invoke_entities import InvokeFrom, ModelConfigWithCredentialsEntity, UserFrom
 from core.app.file_access import FileAccessScope, bind_file_access_scope, get_current_file_access_scope
+from core.entities.provider_configuration import ProviderModelBundle
+from core.model_manager import ModelInstance
+from core.rag.embedding.retrieval import RetrievalSegments
+from core.rag.entities import MetadataFilteringCondition
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
 from core.rag.models.document import Document
 from core.rag.retrieval import dataset_retrieval as retrieval_module
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.nodes.knowledge_retrieval import exc
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
-from models.dataset import Dataset, DocumentSegment, RateLimitLog
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
+from graphon.model_runtime.entities.llm_entities import LLMUsage
+from graphon.model_runtime.entities.model_entities import AIModelEntity
+from graphon.model_runtime.model_providers.base.large_language_model import LargeLanguageModel
+from models.dataset import Dataset, DocumentSegment, ExternalKnowledgeApis, ExternalKnowledgeBindings, RateLimitLog
 from models.dataset import Document as DatasetDocument
-from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
+from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus, SegmentStatus
+from repositories.knowledge.external_repository import SQLAlchemyExternalKnowledgeRepository
+from services.errors.knowledge_retrieval import ExternalKnowledgeRetrievalError
+from services.knowledge.entities.external import ExternalKnowledgeApiSetting
+from services.knowledge.external.adapters import ExternalDatasetRetrievalAdapter, ExternalKnowledgeGateway
 
 
 @dataclass(frozen=True)
 class RetrievalDatabase:
     session_maker: sessionmaker[Session]
+
+
+def _dataset_retrieval() -> DatasetRetrieval:
+    return DatasetRetrieval(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
+
+
+def _external_retrieval(session_factory: sessionmaker[Session]) -> ExternalDatasetRetrievalAdapter:
+    return ExternalDatasetRetrievalAdapter(
+        repository=SQLAlchemyExternalKnowledgeRepository(session_factory=session_factory),
+        gateway=ExternalKnowledgeGateway(),
+    )
 
 
 @pytest.fixture
@@ -110,6 +143,7 @@ def _persist_segment(
         index_node_id="node-1",
         index_node_hash="hash-1",
         hit_count=5,
+        status=SegmentStatus.COMPLETED,
     )
     with database.session_maker.begin() as session:
         session.add(segment)
@@ -132,7 +166,7 @@ def _request(
     *,
     dataset_ids: list[str],
     retrieval_mode: str = "multiple",
-    metadata_filtering_mode: str = "disabled",
+    metadata_filtering_mode: Literal["disabled", "manual", "automatic"] = "disabled",
 ) -> KnowledgeRetrievalRequest:
     return KnowledgeRetrievalRequest(
         tenant_id="tenant-1",
@@ -197,7 +231,7 @@ class TestCheckKnowledgeRateLimit:
     ) -> None:
         redis = _patch_rate_limit(monkeypatch, enabled=False)
 
-        DatasetRetrieval()._check_knowledge_rate_limit("tenant-1")
+        _dataset_retrieval()._check_knowledge_rate_limit("tenant-1")
 
         redis.zadd.assert_not_called()
         with retrieval_database.session_maker() as session:
@@ -210,7 +244,7 @@ class TestCheckKnowledgeRateLimit:
     ) -> None:
         redis = _patch_rate_limit(monkeypatch, enabled=True, request_count=50)
 
-        DatasetRetrieval()._check_knowledge_rate_limit("tenant-1")
+        _dataset_retrieval()._check_knowledge_rate_limit("tenant-1")
 
         current_time = 1234567890000
         redis.zadd.assert_called_once_with("rate_limit_tenant-1", {current_time: current_time})
@@ -226,7 +260,7 @@ class TestCheckKnowledgeRateLimit:
         _patch_rate_limit(monkeypatch, enabled=True, request_count=150)
 
         with pytest.raises(exc.RateLimitExceededError, match="knowledge base request rate limit"):
-            DatasetRetrieval()._check_knowledge_rate_limit("tenant-1")
+            _dataset_retrieval()._check_knowledge_rate_limit("tenant-1")
 
         with retrieval_database.session_maker() as session:
             logs = session.scalars(select(RateLimitLog)).all()
@@ -272,7 +306,7 @@ class TestGetAvailableDatasets:
             tenant_id="tenant-2",
         )
 
-        datasets = DatasetRetrieval()._get_available_datasets(
+        datasets = _dataset_retrieval()._get_available_datasets(
             "tenant-1",
             ["available", "disabled", "archived", "waiting", "external", "other-tenant"],
         )
@@ -285,7 +319,7 @@ class TestGetAvailableDatasets:
     ) -> None:
         _persist_dataset(retrieval_database, dataset_id="empty")
 
-        assert DatasetRetrieval()._get_available_datasets("tenant-1", ["empty"]) == []
+        assert _dataset_retrieval()._get_available_datasets("tenant-1", ["empty"]) == []
 
 
 class TestDatasetRetrievalKnowledgeRetrieval:
@@ -315,10 +349,10 @@ class TestDatasetRetrievalKnowledgeRetrieval:
     ) -> None:
         dataset, document = _persist_available_dataset(retrieval_database)
         segment = _persist_segment(retrieval_database, dataset_id=dataset.id, document_id=document.id)
-        retrieval = DatasetRetrieval()
+        retrieval = _dataset_retrieval()
         monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", MagicMock())
         monkeypatch.setattr(retrieval, "multiple_retrieve", MagicMock(return_value=[_rag_document("Python", "node-1")]))
-        record = SimpleNamespace(segment=segment, score=0.9, child_chunks=[], summary=None, files=None)
+        record = RetrievalSegments(segment=segment, score=0.9, child_chunks=[], summary=None, files=None)
         monkeypatch.setattr(
             retrieval_module.RetrievalService,
             "format_retrieval_documents",
@@ -347,7 +381,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
         retrieval_database: RetrievalDatabase,
     ) -> None:
         _persist_available_dataset(retrieval_database)
-        retrieval = DatasetRetrieval()
+        retrieval = _dataset_retrieval()
         monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", MagicMock())
         metadata_filter = MagicMock(return_value=(None, None))
         monkeypatch.setattr(retrieval, "get_metadata_filter_condition", metadata_filter)
@@ -365,7 +399,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
         retrieval_database: RetrievalDatabase,
     ) -> None:
         _persist_dataset(retrieval_database, dataset_id="external", provider="external")
-        retrieval = DatasetRetrieval()
+        retrieval = _dataset_retrieval()
         monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", MagicMock())
         external_document = _rag_document(
             "External knowledge",
@@ -394,7 +428,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
         retrieval_database: RetrievalDatabase,
     ) -> None:
         _persist_available_dataset(retrieval_database)
-        retrieval = DatasetRetrieval()
+        retrieval = _dataset_retrieval()
         monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", MagicMock())
         monkeypatch.setattr(retrieval, "multiple_retrieve", MagicMock(return_value=[]))
 
@@ -408,7 +442,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
         monkeypatch: pytest.MonkeyPatch,
         retrieval_database: RetrievalDatabase,
     ) -> None:
-        retrieval = DatasetRetrieval()
+        retrieval = _dataset_retrieval()
         monkeypatch.setattr(
             retrieval,
             "_check_knowledge_rate_limit",
@@ -425,7 +459,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
         retrieval_database: RetrievalDatabase,
     ) -> None:
         _persist_dataset(retrieval_database, dataset_id="empty")
-        retrieval = DatasetRetrieval()
+        retrieval = _dataset_retrieval()
         monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", MagicMock())
         multiple_retrieve = MagicMock()
         monkeypatch.setattr(retrieval, "multiple_retrieve", multiple_retrieve)
@@ -446,3 +480,197 @@ class TestDatasetRetrievalKnowledgeRetrieval:
         sorted_documents = sorted(documents, key=lambda document: document.metadata["score"], reverse=True)
 
         assert [document.metadata["score"] for document in sorted_documents] == [0.95, 0.8, 0.6]
+
+
+@pytest.mark.parametrize("entry", ["single", "multiple", "tool", "retrieve", "knowledge_retrieval"])
+@pytest.mark.parametrize("provider_fails", [False, True])
+def test_external_runtime_releases_read_connections_before_http(
+    retrieval_database: RetrievalDatabase,
+    sqlite_engine: Engine,
+    monkeypatch: pytest.MonkeyPatch,
+    entry: str,
+    provider_fails: bool,
+) -> None:
+    dataset = _persist_dataset(retrieval_database, dataset_id="external", provider="external")
+    document = _persist_document(retrieval_database, dataset_id=dataset.id, document_id="external-document")
+    with retrieval_database.session_maker.begin() as session:
+        stored_document = session.get(DatasetDocument, document.id)
+        assert stored_document is not None
+        stored_document.doc_metadata = {"author": "Alice"}
+    template = ExternalKnowledgeApis(
+        tenant_id="tenant-1",
+        created_by="user-1",
+        updated_by="user-1",
+        name="Provider",
+        description="",
+        settings=json.dumps({"endpoint": "https://provider.example", "api_key": "secret"}),
+    )
+    template.id = "template"
+    with retrieval_database.session_maker.begin() as session:
+        session.add_all(
+            [
+                template,
+                ExternalKnowledgeBindings(
+                    tenant_id="tenant-1",
+                    dataset_id="external",
+                    external_knowledge_api_id="template",
+                    external_knowledge_id="knowledge",
+                    created_by="user-1",
+                ),
+            ]
+        )
+
+    active: set[object] = set()
+    requests: list[ExternalKnowledgeApiSetting] = []
+    metadata_reads: list[str] = []
+
+    def checkout(_connection: object, record: object, _proxy: object) -> None:
+        active.add(record)
+
+    def checkin(_connection: object, record: object) -> None:
+        active.discard(record)
+
+    def send(request: ExternalKnowledgeApiSetting) -> httpx.Response:
+        assert not active
+        requests.append(request)
+        return (
+            httpx.Response(502, text="provider failed") if provider_fails else httpx.Response(200, json={"records": []})
+        )
+
+    def executed(_connection, _cursor, statement, _parameters, _context, _executemany) -> None:
+        if statement.lstrip().upper().startswith("SELECT") and "doc_metadata" in statement:
+            metadata_reads.append(statement)
+
+    monkeypatch.setattr(ExternalKnowledgeGateway, "send_retrieval_request", send)
+    external_retrieval = _external_retrieval(retrieval_database.session_maker)
+    retrieval = DatasetRetrieval(
+        external_retrieval=external_retrieval,
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
+    monkeypatch.setattr(retrieval, "_on_query", lambda *_args: None)
+    monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", lambda *_args: None)
+    router = create_autospec(retrieval_module.ReactMultiDatasetRouter, instance=True, spec_set=True)
+    router.invoke.return_value = ("external", LLMUsage.empty_usage())
+    monkeypatch.setattr(retrieval_module, "ReactMultiDatasetRouter", lambda: router)
+    metadata = MetadataFilteringCondition.model_validate(
+        {"logical_operator": "and", "conditions": [{"name": "author", "comparison_operator": "is", "value": "Alice"}]}
+    )
+    event.listen(sqlite_engine, "checkout", checkout)
+    event.listen(sqlite_engine, "checkin", checkin)
+    event.listen(sqlite_engine, "before_cursor_execute", executed)
+    try:
+        with retrieval_database.session_maker() as caller:
+            pending = Dataset(id="pending", tenant_id="tenant-1", name="Unrelated", created_by="user-1")
+            caller.add(pending)
+            transaction = caller.get_transaction()
+            app = Flask(__name__)
+
+            def run() -> None:
+                if entry == "knowledge_retrieval":
+                    request = KnowledgeRetrievalRequest.model_validate(
+                        {
+                            **_request(dataset_ids=[dataset.id], metadata_filtering_mode="manual").model_dump(),
+                            "query": '"query"',
+                            "metadata_filtering_conditions": metadata.model_dump(),
+                        }
+                    )
+                    retrieval.knowledge_retrieval(caller, request)
+                elif entry == "retrieve":
+                    model = create_autospec(ModelInstance, instance=True)
+                    llm = create_autospec(LargeLanguageModel, instance=True)
+                    schema = AIModelEntity.model_construct(features=[])
+                    llm.get_model_schema.return_value = schema
+                    model.model_type_instance = llm
+                    model.model_name = "model"
+                    model.credentials = {}
+                    model.provider_model_bundle = create_autospec(ProviderModelBundle, instance=True)
+                    manager = create_autospec(retrieval_module.ModelManager, instance=True)
+                    manager.get_model_instance.return_value = model
+                    monkeypatch.setattr(retrieval_module.ModelManager, "for_tenant", lambda **_kwargs: manager)
+                    retrieval.retrieve(
+                        caller,
+                        app_id="app-1",
+                        user_id="user-1",
+                        tenant_id="tenant-1",
+                        model_config=ModelConfigWithCredentialsEntity.model_construct(
+                            provider="provider", model="model"
+                        ),
+                        config=DatasetEntity(
+                            dataset_ids=[dataset.id],
+                            retrieve_config=DatasetRetrieveConfigEntity(
+                                retrieve_strategy=DatasetRetrieveConfigEntity.RetrieveStrategy.MULTIPLE,
+                                metadata_filtering_mode="manual",
+                                metadata_filtering_conditions=AppMetadataFilteringCondition.model_validate(
+                                    metadata.model_dump()
+                                ),
+                            ),
+                        ),
+                        query='"query"',
+                        invoke_from=InvokeFrom.DEBUGGER,
+                        show_retrieve_source=False,
+                        hit_callback=create_autospec(
+                            retrieval_module.DatasetIndexToolCallbackHandler, instance=True, spec_set=True
+                        ),
+                        message_id="message",
+                    )
+                elif entry == "single":
+                    retrieval.single_retrieve(
+                        caller,
+                        app_id="app-1",
+                        tenant_id="tenant-1",
+                        user_id="user-1",
+                        user_from="web",
+                        query='"query"',
+                        available_datasets=[dataset],
+                        model_instance=create_autospec(ModelInstance, instance=True, spec_set=True),
+                        model_config=create_autospec(ModelConfigWithCredentialsEntity, instance=True, spec_set=True),
+                        planning_strategy=retrieval_module.PlanningStrategy.REACT_ROUTER,
+                        metadata_condition=metadata,
+                    )
+                elif entry == "multiple":
+                    retrieval._retriever(
+                        app,
+                        dataset,
+                        '"query"',
+                        4,
+                        [],
+                        metadata_condition=metadata,
+                    )
+                else:
+                    from core.tools.utils.dataset_retriever.dataset_retriever_tool import DatasetRetrieverTool
+
+                    tool = DatasetRetrieverTool(
+                        retrieval_finalizer=build_retrieval_finalizer(),
+                        tenant_id="tenant-1",
+                        dataset_id="external",
+                        external_retrieval=external_retrieval,
+                        inputs={},
+                        return_resource=False,
+                        retriever_from="prod",
+                        retrieve_config=DatasetRetrieveConfigEntity(
+                            retrieve_strategy=DatasetRetrieveConfigEntity.RetrieveStrategy.SINGLE,
+                            metadata_filtering_mode="disabled",
+                        ),
+                    )
+                    tool.run(caller, '"query"')
+
+            with app.app_context():
+                if provider_fails and entry not in {"retrieve", "knowledge_retrieval"}:
+                    with pytest.raises(ExternalKnowledgeRetrievalError, match="provider failed"):
+                        run()
+                else:
+                    run()
+            assert pending in caller.new
+            assert caller.get_transaction() is transaction
+            assert not active
+    finally:
+        event.remove(sqlite_engine, "checkout", checkout)
+        event.remove(sqlite_engine, "checkin", checkin)
+        event.remove(sqlite_engine, "before_cursor_execute", executed)
+    if entry in {"retrieve", "knowledge_retrieval"}:
+        assert metadata_reads
+    assert len(requests) == 1
+    assert requests[0].params is not None
+    assert requests[0].params["query"] == '"query"'
+    assert requests[0].params["knowledge_id"] == "knowledge"
+    assert requests[0].params["metadata_condition"] == (None if entry == "tool" else metadata.model_dump())

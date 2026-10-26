@@ -1,17 +1,18 @@
 import threading
 from collections.abc import Generator
 from contextlib import contextmanager, nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import MagicMock, Mock, patch
+from typing import Any, cast
+from unittest.mock import MagicMock, Mock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
 from flask import Flask, current_app
 from sqlalchemy import event, select
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import Connection, Engine
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import Session
 
@@ -30,17 +31,21 @@ from core.app.app_config.entities import ModelConfig as WorkflowModelConfig
 from core.app.entities.app_invoke_entities import InvokeFrom, ModelConfigWithCredentialsEntity
 from core.entities.agent_entities import PlanningStrategy
 from core.entities.model_entities import ModelStatus
+from core.model_manager import ModelInstance
 from core.rag.data_post_processor.data_post_processor import WeightsDict
 from core.rag.datasource.retrieval_service import RetrievalService
+from core.rag.embedding.retrieval import RetrievalSegments
 from core.rag.entities import Condition as AppCondition
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.index_processor.constant.doc_type import DocType
-from core.rag.index_processor.constant.index_type import IndexStructureType
+from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from core.rag.models.document import Document
 from core.rag.rerank.rerank_type import RerankMode
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.rag.retrieval.retrieval_methods import RetrievalMethod
 from core.workflow.nodes.knowledge_retrieval import exc
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from extensions.storage.storage_type import StorageType
 from graphon.model_runtime.entities.llm_entities import LLMUsage
 from graphon.model_runtime.entities.model_entities import ModelFeature
@@ -51,13 +56,28 @@ from models.dataset import (
     DatasetMetadata,
     DatasetQuery,
     DocumentSegment,
+    DocumentSegmentSummary,
     RateLimitLog,
     SegmentAttachmentBinding,
 )
 from models.dataset import Document as DatasetDocument
-from models.enums import CreatorUserRole
+from models.enums import CreatorUserRole, SegmentStatus, SummaryStatus
 
 # ==================== Helper Functions ====================
+
+
+def _dataset_retrieval(
+    external_retrieval: ExternalDatasetRetriever | None = None,
+) -> DatasetRetrieval:
+    return DatasetRetrieval(
+        external_retrieval=external_retrieval
+        or create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
+
+
+def _mock_external_retrieval(retrieval: DatasetRetrieval) -> MagicMock:
+    return cast(MagicMock, retrieval._external_retrieval)
 
 
 def create_mock_document(
@@ -111,6 +131,42 @@ def _dataset(**values: object) -> Dataset:
 
 def _metadata_condition() -> AppMetadataFilteringCondition:
     return AppMetadataFilteringCondition(logical_operator="and", conditions=[])
+
+
+@dataclass(frozen=True)
+class _DatabaseHandle:
+    engine: Engine | Connection
+
+
+@dataclass(frozen=True)
+class _ModelSchemaHandle:
+    features: list[ModelFeature]
+
+
+class _ModelManagerHandle:
+    def __init__(self, model_instance: ModelInstance) -> None:
+        self._model_instance = model_instance
+
+    def get_model_instance(self, **_kwargs: object) -> ModelInstance:
+        return self._model_instance
+
+
+class _FailingModelInstance:
+    def invoke_llm(self, **_kwargs: object) -> None:
+        raise RuntimeError("nope")
+
+
+def _model_config_with_features(features: list[ModelFeature] | None = None) -> ModelConfigWithCredentialsEntity:
+    return ModelConfigWithCredentialsEntity.model_construct(
+        provider="openai",
+        model="gpt-4",
+        model_schema=_ModelSchemaHandle(features or []),
+        mode="chat",
+        provider_model_bundle=object(),
+        credentials={},
+        parameters={},
+        stop=[],
+    )
 
 
 def create_side_effect_for_search(documents: list[Document]):
@@ -1687,7 +1743,7 @@ class TestRetrievalService:
     # ==================== Multiple Retrieve Thread Tests ====================
 
     @patch("core.rag.retrieval.dataset_retrieval.DataPostProcessor")
-    @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval._retriever")
+    @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval._run_retriever_thread")
     def test_multiple_retrieve_thread_skips_second_reranking_with_single_dataset(
         self, mock_retriever, mock_data_processor_class, mock_flask_app, mock_dataset
     ):
@@ -1705,7 +1761,7 @@ class TestRetrievalService:
         - Standard scoring logic is applied instead
         """
         # Arrange
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         tenant_id = str(uuid4())
 
         # Create test documents
@@ -1723,7 +1779,6 @@ class TestRetrievalService:
         # Mock _retriever to return documents
         def side_effect_retriever(
             flask_app,
-            session,
             dataset_id,
             query,
             top_k,
@@ -1770,7 +1825,7 @@ class TestRetrievalService:
         assert all_documents[1].page_content == "Test content 2"
 
     @patch("core.rag.retrieval.dataset_retrieval.DataPostProcessor")
-    @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval._retriever")
+    @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval._run_retriever_thread")
     @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval.calculate_vector_score")
     def test_multiple_retrieve_thread_performs_second_reranking_with_multiple_datasets(
         self, mock_calculate_vector_score, mock_retriever, mock_data_processor_class, mock_flask_app, mock_dataset
@@ -1788,7 +1843,7 @@ class TestRetrievalService:
         - Documents are processed correctly
         """
         # Arrange
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         tenant_id = str(uuid4())
 
         # Create test documents
@@ -1806,7 +1861,6 @@ class TestRetrievalService:
         # Mock _retriever to return documents
         def side_effect_retriever(
             flask_app,
-            session,
             dataset_id,
             query,
             top_k,
@@ -1875,6 +1929,7 @@ class TestRetrievalService:
 
         # Verify invoke was called with correct parameters
         mock_processor_instance.invoke.assert_called_once()
+        assert mock_processor_instance.invoke.call_args.kwargs["top_n"] == 4
 
         # Documents should be added to all_documents after reranking
         assert len(all_documents) == 2
@@ -1883,7 +1938,7 @@ class TestRetrievalService:
         assert all_documents[1].page_content == "Test content 1"
 
     @patch("core.rag.retrieval.dataset_retrieval.DataPostProcessor")
-    @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval._retriever")
+    @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval._run_retriever_thread")
     @patch("core.rag.retrieval.dataset_retrieval.DatasetRetrieval.calculate_vector_score")
     def test_multiple_retrieve_thread_single_dataset_uses_standard_scoring(
         self, mock_calculate_vector_score, mock_retriever, mock_data_processor_class, mock_flask_app, mock_dataset
@@ -1902,7 +1957,7 @@ class TestRetrievalService:
         - Documents are scored correctly
         """
         # Arrange
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         tenant_id = str(uuid4())
 
         # Create test documents
@@ -1920,7 +1975,6 @@ class TestRetrievalService:
         # Mock _retriever to return documents
         def side_effect_retriever(
             flask_app,
-            session,
             dataset_id,
             query,
             top_k,
@@ -1974,7 +2028,7 @@ class TestRetrievalService:
         # calculate_vector_score SHOULD be called for high_quality datasets
         mock_calculate_vector_score.assert_called_once()
         call_args = mock_calculate_vector_score.call_args
-        assert call_args[0][1] == 5  # top_k
+        assert call_args[0][1] == 0  # global top-k is applied after persisted eligibility
 
         # Documents should be added after standard scoring
         assert len(all_documents) == 1
@@ -2315,7 +2369,7 @@ class TestCheckKnowledgeRateLimit:
         """
         # Arrange
         tenant_id = str(uuid4())
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock rate limit disabled
         mock_limit = Mock()
@@ -2352,7 +2406,7 @@ class TestCheckKnowledgeRateLimit:
         """
         # Arrange
         tenant_id = str(uuid4())
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock rate limit enabled with limit of 100 requests per minute
         mock_limit = Mock()
@@ -2400,7 +2454,7 @@ class TestCheckKnowledgeRateLimit:
         """
         # Arrange
         tenant_id = str(uuid4())
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock rate limit enabled with limit of 100 requests per minute
         mock_limit = Mock()
@@ -2458,7 +2512,7 @@ class TestGetAvailableDatasets:
         - Accepts tenant_id and dataset_ids parameters
         """
         # Arrange
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Assert - method exists
         assert hasattr(dataset_retrieval, "_get_available_datasets")
@@ -2569,7 +2623,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
             reranking_model={"reranking_provider_name": "cohere", "reranking_model_name": "rerank-v2"},
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock _check_knowledge_rate_limit
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -2633,7 +2687,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock dependencies
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -2683,7 +2737,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock dependencies
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -2738,7 +2792,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock dependencies
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -2778,7 +2832,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock _check_knowledge_rate_limit to raise exception
         with patch.object(
@@ -2815,7 +2869,7 @@ class TestDatasetRetrievalKnowledgeRetrieval:
             top_k=5,
         )
 
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
 
         # Mock dependencies
         with patch.object(dataset_retrieval, "_check_knowledge_rate_limit"):
@@ -2866,7 +2920,14 @@ class TestProcessMetadataFilterFunc:
     Method Signature:
     ==================
     def process_metadata_filter_func(
-        self, sequence: int, condition: str, metadata_name: str, value: Any | None, filters: list
+        self,
+        sequence: int,
+        condition: str,
+        metadata_name: str,
+        value: Any | None,
+        filters: list,
+        *,
+        dialect_name: str,
     ) -> list:
 
     The method builds SQLAlchemy filter expressions by:
@@ -2887,7 +2948,7 @@ class TestProcessMetadataFilterFunc:
         Returns:
             DatasetRetrieval: Instance to test process_metadata_filter_func
         """
-        return DatasetRetrieval()
+        return _dataset_retrieval()
 
     # ==================== String Condition Tests ====================
 
@@ -2905,7 +2966,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = "John"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -2924,7 +2987,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "title"
         value = "banned"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -2943,7 +3008,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = "tech"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -2962,7 +3029,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "filename"
         value = ".pdf"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -2983,7 +3052,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = "Jane Doe"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3002,7 +3073,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = "technology"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3021,7 +3094,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = 2023
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3040,7 +3115,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "price"
         value = 19.99
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3059,7 +3136,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = "Unknown"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3078,7 +3157,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = "archived"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3097,7 +3178,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = 2000
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3118,7 +3201,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = None
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3137,7 +3222,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "description"
         value = None
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3158,7 +3245,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = 2020
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3177,7 +3266,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "price"
         value = 100.0
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3196,7 +3287,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = 2020
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3215,7 +3308,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "rating"
         value = 4.5
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3234,7 +3329,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "price"
         value = 50.0
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3253,7 +3350,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = 2023
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3272,7 +3371,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "rating"
         value = 3.5
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3291,7 +3392,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = 2000
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3313,7 +3416,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = "tech, science,  AI  "
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3333,7 +3438,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "tags"
         value = ["python", "javascript", None, "golang"]
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3352,7 +3459,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = ("tech", "science", "ai")
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3371,7 +3480,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = ""
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3392,7 +3503,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = "   ,   ,   "
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3411,7 +3524,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "category"
         value = "technology"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3432,7 +3547,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = None
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 0  # No filter added
@@ -3451,7 +3568,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = None
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 0
@@ -3470,7 +3589,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "year"
         value = None
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 0
@@ -3490,7 +3611,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = "test"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 2
@@ -3507,15 +3630,15 @@ class TestProcessMetadataFilterFunc:
         filters = []
 
         # First filter
-        retrieval.process_metadata_filter_func(0, "contains", "author", "John", filters)
+        retrieval.process_metadata_filter_func(0, "contains", "author", "John", filters, dialect_name="sqlite")
         assert len(filters) == 1
 
         # Second filter
-        retrieval.process_metadata_filter_func(1, ">", "year", 2020, filters)
+        retrieval.process_metadata_filter_func(1, ">", "year", 2020, filters, dialect_name="sqlite")
         assert len(filters) == 2
 
         # Third filter
-        retrieval.process_metadata_filter_func(2, "is", "category", "tech", filters)
+        retrieval.process_metadata_filter_func(2, "is", "category", "tech", filters, dialect_name="sqlite")
         assert len(filters) == 3
 
     def test_unknown_condition(self, retrieval):
@@ -3532,7 +3655,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = "test"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 0
@@ -3551,7 +3676,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "author"
         value = ""
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3570,7 +3697,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "title"
         value = "C++ & Python's features"
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3589,7 +3718,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "price"
         value = 0
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3608,7 +3739,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "temperature"
         value = -10.5
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3627,7 +3760,9 @@ class TestProcessMetadataFilterFunc:
         metadata_name = "rating"
         value = 4.5
 
-        result = retrieval.process_metadata_filter_func(sequence, condition, metadata_name, value, filters)
+        result = retrieval.process_metadata_filter_func(
+            sequence, condition, metadata_name, value, filters, dialect_name="sqlite"
+        )
 
         assert result == filters
         assert len(filters) == 1
@@ -3652,7 +3787,7 @@ class TestKnowledgeRetrievalRegression:
         The outer thread entry point catches exceptions from the traced retrieval method
         and stores them in `thread_exceptions`.
         """
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         flask_app = Flask(__name__)
         tenant_id = str(uuid4())
 
@@ -3677,7 +3812,6 @@ class TestKnowledgeRetrievalRegression:
 
         def fake_retriever(
             flask_app,
-            session,
             dataset_id,
             query,
             top_k,
@@ -3691,6 +3825,8 @@ class TestKnowledgeRetrievalRegression:
         called = {"init": 0, "invoke": 0}
 
         class ContextRequiredPostProcessor:
+            rerank_runner = object()
+
             def __init__(self, *args, **kwargs):
                 called["init"] += 1
                 # will raise RuntimeError if no Flask app context exists
@@ -3708,7 +3844,7 @@ class TestKnowledgeRetrievalRegression:
 
         def target():
             with (
-                patch.object(dataset_retrieval, "_retriever", side_effect=fake_retriever),
+                patch.object(dataset_retrieval, "_run_retriever_thread", side_effect=fake_retriever),
                 patch(
                     "core.rag.retrieval.dataset_retrieval.DataPostProcessor",
                     ContextRequiredPostProcessor,
@@ -3745,33 +3881,116 @@ class TestKnowledgeRetrievalRegression:
 
         assert not thread_exceptions, thread_exceptions
 
-    def test_run_retriever_thread_provides_session_to_retriever(self):
-        dataset_retrieval = DatasetRetrieval()
-        all_documents: list[Document] = []
+    @pytest.mark.parametrize("reverse_datasets", [False, True])
+    def test_multiple_retrieve_rejects_mixed_indexes_when_configured_reranker_is_unavailable(
+        self,
+        reverse_datasets: bool,
+        sqlite_session: Session,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        dataset_retrieval = _dataset_retrieval()
+        datasets = [
+            Dataset(id="high-quality", indexing_technique=IndexTechniqueType.HIGH_QUALITY, provider="dify"),
+            Dataset(id="economy", indexing_technique=IndexTechniqueType.ECONOMY, provider="dify"),
+        ]
+        if reverse_datasets:
+            datasets.reverse()
 
-        with patch.object(dataset_retrieval, "_retriever") as mock_retriever:
-            dataset_retrieval._run_retriever_thread(
+        def retrieve_dataset(**kwargs: object) -> None:
+            documents = cast(list[Document], kwargs["all_documents"])
+            documents.append(_doc(dataset_id=str(kwargs["dataset_id"])))
+
+        class UnavailablePostProcessor:
+            rerank_runner = None
+
+            def __init__(self, *_args: object, **_kwargs: object) -> None:
+                pass
+
+        monkeypatch.setattr(dataset_retrieval, "_run_retriever_thread", retrieve_dataset)
+        monkeypatch.setattr(dataset_retrieval_module, "DataPostProcessor", UnavailablePostProcessor)
+        monkeypatch.setattr(dataset_retrieval_module.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(
+            dataset_retrieval_module.session_factory,
+            "create_session",
+            lambda: nullcontext(sqlite_session),
+        )
+
+        with pytest.raises(ValueError, match="reranking model is unavailable"):
+            dataset_retrieval._multiple_retrieve_thread(
                 flask_app=_FakeFlaskApp(),
-                dataset_id="dataset-1",
-                query="test query",
-                top_k=3,
-                all_documents=all_documents,
-                document_ids_filter=None,
+                available_datasets=datasets,
                 metadata_condition=None,
-                attachment_ids=None,
+                metadata_filter_document_ids=None,
+                all_documents=[],
+                tenant_id="tenant-1",
+                reranking_enable=True,
+                reranking_mode=RerankMode.RERANKING_MODEL,
+                reranking_model={
+                    "reranking_provider_name": "provider",
+                    "reranking_model_name": "model",
+                },
+                weights=None,
+                top_k=1,
+                score_threshold=0.0,
+                query="question",
+                attachment_id=None,
+                dataset_count=2,
             )
 
-        mock_retriever.assert_called_once()
-        assert isinstance(mock_retriever.call_args.kwargs["session"], Session)
+    def test_run_retriever_thread_closes_read_session_before_external_io(
+        self, sqlite_session: Session, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+        dataset_retrieval = _dataset_retrieval(external_retrieval)
+        all_documents: list[Document] = []
+        dataset = Dataset(
+            id=str(uuid4()),
+            tenant_id=str(uuid4()),
+            name="External",
+            provider="external",
+            indexing_technique="high_quality",
+            created_by=str(uuid4()),
+        )
+        sqlite_session.add(dataset)
+        sqlite_session.commit()
+        events: list[str] = []
+
+        @contextmanager
+        def create_read_session() -> Generator[Session]:
+            events.append("opened")
+            with Session(bind=sqlite_session.get_bind()) as read_session:
+                yield read_session
+            events.append("closed")
+
+        def retrieve_external(**_kwargs: object) -> list[dict[str, object]]:
+            assert events == ["opened", "closed"]
+            events.append("external")
+            return []
+
+        monkeypatch.setattr(dataset_retrieval_module.session_factory, "create_session", create_read_session)
+        external_retrieval.retrieve.side_effect = retrieve_external
+
+        dataset_retrieval._run_retriever_thread(
+            flask_app=_FakeFlaskApp(),
+            dataset_id=dataset.id,
+            query="test query",
+            top_k=3,
+            all_documents=all_documents,
+            document_ids_filter=None,
+            metadata_condition=None,
+            attachment_ids=None,
+        )
+
+        assert events == ["opened", "closed", "external"]
 
     def test_run_retriever_thread_safely_records_retriever_exception(self):
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         all_documents: list[Document] = []
         cancel_event = threading.Event()
         thread_exceptions: list[Exception] = []
         expected_error = RuntimeError("retrieval failed")
 
-        with patch.object(dataset_retrieval, "_retriever", side_effect=expected_error):
+        with patch.object(dataset_retrieval, "_run_retriever_thread", side_effect=expected_error):
             dataset_retrieval._run_retriever_thread_safely(
                 flask_app=_FakeFlaskApp(),
                 dataset_id="dataset-1",
@@ -3789,13 +4008,13 @@ class TestKnowledgeRetrievalRegression:
         assert thread_exceptions == [expected_error]
 
     def test_run_retriever_thread_safely_skips_failed_dataset_when_requested(self, caplog):
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         all_documents: list[Document] = []
         cancel_event = threading.Event()
         thread_exceptions: list[Exception] = []
         expected_error = RuntimeError("retrieval failed")
 
-        with patch.object(dataset_retrieval, "_retriever", side_effect=expected_error):
+        with patch.object(dataset_retrieval, "_run_retriever_thread", side_effect=expected_error):
             dataset_retrieval._run_retriever_thread_safely(
                 flask_app=_FakeFlaskApp(),
                 dataset_id="dataset-1",
@@ -3816,7 +4035,7 @@ class TestKnowledgeRetrievalRegression:
         assert "Skipping dataset retrieval because retriever failed" in caplog.text
 
     def test_multiple_retrieve_thread_skips_failed_dataset(self, mock_dataset, caplog):
-        dataset_retrieval = DatasetRetrieval()
+        dataset_retrieval = _dataset_retrieval()
         flask_app = Flask(__name__)
         successful_dataset = Dataset(
             id=str(uuid4()),
@@ -3836,7 +4055,6 @@ class TestKnowledgeRetrievalRegression:
 
         def fake_retriever(
             flask_app,
-            session,
             dataset_id,
             query,
             top_k,
@@ -3851,7 +4069,7 @@ class TestKnowledgeRetrievalRegression:
 
         all_documents: list[Document] = []
 
-        with patch.object(dataset_retrieval, "_retriever", side_effect=fake_retriever):
+        with patch.object(dataset_retrieval, "_run_retriever_thread", side_effect=fake_retriever):
             dataset_retrieval._multiple_retrieve_thread(
                 flask_app=flask_app,
                 available_datasets=[mock_dataset, successful_dataset],
@@ -3902,7 +4120,7 @@ class _ImmediateThread:
 class TestDatasetRetrievalAdditionalHelpers:
     @pytest.fixture
     def retrieval(self) -> DatasetRetrieval:
-        return DatasetRetrieval()
+        return _dataset_retrieval()
 
     def test_llm_usage_and_record_usage(self, retrieval: DatasetRetrieval) -> None:
         empty_usage = retrieval.llm_usage
@@ -3933,6 +4151,7 @@ class TestDatasetRetrievalAdditionalHelpers:
             metadata_name="category",
             value=123,
             filters=filters,
+            dialect_name="sqlite",
         )
         assert result is filters
         assert len(filters) == 1
@@ -4252,22 +4471,25 @@ class TestDatasetRetrievalAdditionalHelpers:
         dataset_id = str(uuid4())
         document_id = str(uuid4())
         user_id = str(uuid4())
-        sqlite_session.add(
-            DatasetDocument(
-                id=document_id,
-                tenant_id=tenant_id,
-                dataset_id=dataset_id,
-                position=1,
-                data_source_type="upload_file",
-                batch="batch-1",
-                name="document",
-                created_from="api",
-                created_by=user_id,
-                indexing_status="completed",
-                enabled=True,
-                archived=False,
-                doc_metadata={"author": "Alice"},
-            )
+        sqlite_session.add_all(
+            [
+                Dataset(id=dataset_id, tenant_id=tenant_id, name="Dataset", created_by=user_id),
+                DatasetDocument(
+                    id=document_id,
+                    tenant_id=tenant_id,
+                    dataset_id=dataset_id,
+                    position=1,
+                    data_source_type="upload_file",
+                    batch="batch-1",
+                    name="document",
+                    created_from="api",
+                    created_by=user_id,
+                    indexing_status="completed",
+                    enabled=True,
+                    archived=False,
+                    doc_metadata={"author": "Alice"},
+                ),
+            ]
         )
         sqlite_session.commit()
 
@@ -4275,7 +4497,7 @@ class TestDatasetRetrievalAdditionalHelpers:
             sqlite_session,
             dataset_ids=[dataset_id],
             query="python",
-            tenant_id="tenant-1",
+            tenant_id=tenant_id,
             user_id="u1",
             metadata_filtering_mode="disabled",
             metadata_model_config=AppModelConfig(provider="openai", name="gpt", mode="chat"),
@@ -4293,7 +4515,7 @@ class TestDatasetRetrievalAdditionalHelpers:
                 sqlite_session,
                 dataset_ids=[dataset_id],
                 query="python",
-                tenant_id="tenant-1",
+                tenant_id=tenant_id,
                 user_id="u1",
                 metadata_filtering_mode="automatic",
                 metadata_model_config=AppModelConfig(provider="openai", name="gpt", mode="chat"),
@@ -4312,7 +4534,7 @@ class TestDatasetRetrievalAdditionalHelpers:
             sqlite_session,
             dataset_ids=[dataset_id],
             query="python",
-            tenant_id="tenant-1",
+            tenant_id=tenant_id,
             user_id="u1",
             metadata_filtering_mode="manual",
             metadata_model_config=AppModelConfig(provider="openai", name="gpt", mode="chat"),
@@ -4325,12 +4547,30 @@ class TestDatasetRetrievalAdditionalHelpers:
         first_condition = condition.conditions[0]
         assert first_condition.value == "Alice"
 
+        mapping, condition = retrieval.get_metadata_filter_condition(
+            sqlite_session,
+            dataset_ids=[dataset_id],
+            query="python",
+            tenant_id=tenant_id,
+            user_id="u1",
+            metadata_filtering_mode="manual",
+            metadata_model_config=AppModelConfig(provider="openai", name="gpt", mode="chat"),
+            metadata_filtering_conditions=AppMetadataFilteringCondition(
+                logical_operator="and",
+                conditions=None,
+            ),
+            inputs={},
+        )
+        assert mapping == {dataset_id: [document_id]}
+        assert condition is not None
+        assert condition.conditions == []
+
         with pytest.raises(ValueError, match="Invalid metadata filtering mode"):
             retrieval.get_metadata_filter_condition(
                 sqlite_session,
                 dataset_ids=[dataset_id],
                 query="python",
-                tenant_id="tenant-1",
+                tenant_id=tenant_id,
                 user_id="u1",
                 metadata_filtering_mode="unsupported",
                 metadata_model_config=AppModelConfig(provider="openai", name="gpt", mode="chat"),
@@ -4495,6 +4735,533 @@ def _timer():
     yield {"cost": 1}
 
 
+@pytest.mark.parametrize("rerank", [False, True])
+def test_multiple_retrieve_applies_global_top_k_after_real_formatter_eligibility(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+    rerank: bool,
+) -> None:
+    tenant_id = str(uuid4())
+    creator_id = str(uuid4())
+
+    def dataset(name: str) -> Dataset:
+        return Dataset(
+            id=str(uuid4()),
+            tenant_id=tenant_id,
+            name=name,
+            created_by=creator_id,
+            indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+            embedding_model="embedding",
+            embedding_model_provider="provider",
+        )
+
+    disabled_dataset = dataset("disabled")
+    summary_dataset = dataset("summary")
+    parent_dataset = dataset("parent")
+    external_dataset = dataset("external")
+    external_dataset.provider = "external"
+
+    def document(owner: Dataset, name: str, *, form: str = IndexStructureType.PARAGRAPH_INDEX) -> DatasetDocument:
+        return DatasetDocument(
+            id=str(uuid4()),
+            tenant_id=tenant_id,
+            dataset_id=owner.id,
+            position=1,
+            data_source_type="upload_file",
+            batch=str(uuid4()),
+            name=name,
+            created_from="api",
+            created_by=creator_id,
+            indexing_status="completed",
+            enabled=True,
+            archived=False,
+            doc_form=form,
+        )
+
+    disabled_document = document(disabled_dataset, "disabled.txt")
+    summary_document = document(summary_dataset, "summary.txt")
+    parent_document = document(parent_dataset, "parent.txt", form=IndexStructureType.PARENT_CHILD_INDEX)
+
+    def segment(owner: Dataset, source: DatasetDocument, content: str, node_id: str) -> DocumentSegment:
+        return DocumentSegment(
+            tenant_id=tenant_id,
+            dataset_id=owner.id,
+            document_id=source.id,
+            position=1,
+            content=content,
+            word_count=1,
+            tokens=1,
+            created_by=creator_id,
+            enabled=True,
+            status=SegmentStatus.COMPLETED,
+            index_node_id=node_id,
+            index_node_hash=f"hash-{node_id}",
+        )
+
+    disabled_segment = segment(disabled_dataset, disabled_document, "disabled high", "disabled-node")
+    disabled_segment.enabled = False
+    summary_segment = segment(summary_dataset, summary_document, "summary body", "summary-segment-node")
+    child_segment = segment(parent_dataset, parent_document, "parent child", "parent-child-node")
+    attachment_segment = segment(parent_dataset, parent_document, "parent attachment", "parent-attachment-node")
+    child = ChildChunk(
+        tenant_id=tenant_id,
+        dataset_id=parent_dataset.id,
+        document_id=parent_document.id,
+        segment_id=child_segment.id,
+        position=1,
+        content="child detail",
+        word_count=1,
+        created_by=creator_id,
+        index_node_id="child-node",
+    )
+    upload = UploadFile(
+        tenant_id=tenant_id,
+        storage_type=StorageType.LOCAL,
+        key=f"retrieval/{uuid4()}.png",
+        name="attachment.png",
+        size=1,
+        extension="png",
+        mime_type="image/png",
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by=creator_id,
+        created_at=datetime.now(),
+        used=True,
+    )
+    summary = DocumentSegmentSummary(
+        dataset_id=summary_dataset.id,
+        document_id=summary_document.id,
+        chunk_id=summary_segment.id,
+        summary_content="current summary",
+        summary_index_node_id="current-summary-node",
+        status=SummaryStatus.COMPLETED,
+    )
+    sqlite_session.add_all(
+        [
+            disabled_dataset,
+            summary_dataset,
+            parent_dataset,
+            external_dataset,
+            disabled_document,
+            summary_document,
+            parent_document,
+            disabled_segment,
+            summary_segment,
+            child_segment,
+            attachment_segment,
+            child,
+            upload,
+            summary,
+            SegmentAttachmentBinding(
+                tenant_id=tenant_id,
+                dataset_id=parent_dataset.id,
+                document_id=parent_document.id,
+                segment_id=attachment_segment.id,
+                attachment_id=upload.id,
+            ),
+        ]
+    )
+    sqlite_session.commit()
+
+    hits = {
+        disabled_dataset.id: [
+            Document(
+                page_content="disabled high",
+                metadata={
+                    "document_id": disabled_document.id,
+                    "dataset_id": disabled_dataset.id,
+                    "doc_id": "disabled-node",
+                    "score": 0.99,
+                },
+            )
+        ],
+        summary_dataset.id: [
+            Document(
+                page_content="stale summary",
+                metadata={
+                    "document_id": summary_document.id,
+                    "dataset_id": summary_dataset.id,
+                    "doc_id": "stale-summary-node",
+                    "is_summary": True,
+                    "original_chunk_id": summary_segment.id,
+                    "score": 0.98,
+                },
+            ),
+            Document(
+                page_content="current summary",
+                metadata={
+                    "document_id": summary_document.id,
+                    "dataset_id": summary_dataset.id,
+                    "doc_id": "current-summary-node",
+                    "is_summary": True,
+                    "original_chunk_id": summary_segment.id,
+                    "score": 0.65,
+                },
+            ),
+        ],
+        parent_dataset.id: [
+            Document(
+                page_content="child detail",
+                metadata={
+                    "document_id": parent_document.id,
+                    "dataset_id": parent_dataset.id,
+                    "doc_id": "child-node",
+                    "score": 0.8,
+                },
+            ),
+            Document(
+                page_content="attachment",
+                metadata={
+                    "document_id": parent_document.id,
+                    "dataset_id": parent_dataset.id,
+                    "doc_id": upload.id,
+                    "doc_type": DocType.IMAGE,
+                    "score": 0.7,
+                },
+            ),
+        ],
+        external_dataset.id: [
+            Document(
+                page_content="external result",
+                provider="external",
+                metadata={
+                    "document_id": "external-document",
+                    "dataset_id": external_dataset.id,
+                    "dataset_name": external_dataset.name,
+                    "title": "External",
+                    "score": 0.75,
+                },
+            )
+        ],
+    }
+    retrieval = _dataset_retrieval()
+
+    def retrieve_dataset(**kwargs: object) -> None:
+        dataset_id = cast(str, kwargs["dataset_id"])
+        all_documents = cast(list[Document], kwargs["all_documents"])
+        all_documents.extend(
+            document.model_copy(
+                update={
+                    "metadata": {
+                        **document.metadata,
+                        "_retrieval_source_dataset_id": dataset_id,
+                    }
+                }
+            )
+            if document.provider == "dify"
+            else document
+            for document in hits[dataset_id]
+        )
+
+    rerank_top_n: list[int] = []
+
+    class _Reranker:
+        rerank_runner = object()
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def invoke(self, *, documents: list[Document], top_n: int, **_kwargs: object) -> list[Document]:
+            rerank_top_n.append(top_n)
+            return sorted(documents, key=lambda item: item.metadata.get("score", 0), reverse=True)
+
+    monkeypatch.setattr(retrieval, "_check_knowledge_rate_limit", lambda *_args: None)
+    monkeypatch.setattr(
+        retrieval,
+        "_get_available_datasets",
+        lambda *_args: [disabled_dataset, summary_dataset, parent_dataset, external_dataset],
+    )
+    monkeypatch.setattr(retrieval, "_run_retriever_thread_safely", retrieve_dataset)
+    monkeypatch.setattr(retrieval, "_on_query", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(dataset_retrieval_module.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(dataset_retrieval_module, "db", _DatabaseHandle(sqlite_session.get_bind()))
+    traced_documents: list[list[str]] = []
+    monkeypatch.setattr(
+        retrieval,
+        "_send_trace_task",
+        lambda _message_id, documents, _timer: traced_documents.append(
+            [document.page_content for document in documents]
+        ),
+    )
+    monkeypatch.setattr(dataset_retrieval_module, "DataPostProcessor", _Reranker)
+    request = KnowledgeRetrievalRequest(
+        tenant_id=tenant_id,
+        user_id=creator_id,
+        app_id=str(uuid4()),
+        user_from="web",
+        dataset_ids=list(hits),
+        query="question",
+        retrieval_mode="multiple",
+        metadata_filtering_mode="disabled",
+        top_k=4,
+        score_threshold=0,
+        reranking_enable=rerank,
+        reranking_mode=RerankMode.RERANKING_MODEL,
+        reranking_model=({"reranking_provider_name": "provider", "reranking_model_name": "model"} if rerank else None),
+    )
+
+    app = Flask(__name__)
+    with app.app_context():
+        sources = retrieval.knowledge_retrieval(sqlite_session, request)
+
+    assert [source.metadata.segment_id for source in sources] == [
+        child_segment.id,
+        None,
+        attachment_segment.id,
+        summary_segment.id,
+    ]
+    assert [source.metadata.score for source in sources] == [0.8, 0.75, 0.7, 0.65]
+    assert sources[0].metadata.child_chunks[0].id == child.id
+    assert sources[1].metadata.data_source_type == "external"
+    assert sources[2].files is not None
+    assert [file["id"] for file in sources[2].files] == [upload.id]
+    assert sources[3].summary == "current summary"
+    assert rerank_top_n == ([6] if rerank else [])
+    sqlite_session.expire_all()
+    assert sqlite_session.get(DocumentSegment, disabled_segment.id).hit_count == 0
+    assert sqlite_session.get(DocumentSegment, child_segment.id).hit_count == 1
+    assert sqlite_session.get(DocumentSegment, attachment_segment.id).hit_count == 1
+    assert sqlite_session.get(DocumentSegment, summary_segment.id).hit_count == 1
+    assert traced_documents == [["parent child", "external result", "parent attachment", "summary body"]]
+
+
+def test_single_retrieve_finalizes_only_current_enabled_records(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tenant_id = str(uuid4())
+    creator_id = str(uuid4())
+    dataset = Dataset(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        name="Single dataset",
+        created_by=creator_id,
+        indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+    )
+    document = DatasetDocument(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        dataset_id=dataset.id,
+        position=1,
+        data_source_type="upload_file",
+        batch=str(uuid4()),
+        name="single.txt",
+        created_from="api",
+        created_by=creator_id,
+        indexing_status="completed",
+        enabled=True,
+        archived=False,
+    )
+
+    def segment(content: str, node_id: str) -> DocumentSegment:
+        return DocumentSegment(
+            tenant_id=tenant_id,
+            dataset_id=dataset.id,
+            document_id=document.id,
+            position=1,
+            content=content,
+            word_count=1,
+            tokens=1,
+            created_by=creator_id,
+            enabled=True,
+            status=SegmentStatus.COMPLETED,
+            index_node_id=node_id,
+            index_node_hash=f"hash-{node_id}",
+            hit_count=0,
+        )
+
+    disabled_segment = segment("disabled", "disabled-node")
+    disabled_segment.enabled = False
+    summary_segment = segment("summary target", "summary-segment-node")
+    valid_segment = segment("valid content", "valid-node")
+    summary = DocumentSegmentSummary(
+        dataset_id=dataset.id,
+        document_id=document.id,
+        chunk_id=summary_segment.id,
+        summary_content="current summary",
+        summary_index_node_id="current-summary-node",
+        status=SummaryStatus.COMPLETED,
+    )
+    sqlite_session.add_all([dataset, document, disabled_segment, summary_segment, valid_segment, summary])
+    sqlite_session.commit()
+
+    raw_documents = [
+        Document(
+            page_content="disabled",
+            provider="dify",
+            metadata={
+                "dataset_id": dataset.id,
+                "document_id": document.id,
+                "doc_id": disabled_segment.index_node_id,
+                "score": 0.99,
+            },
+        ),
+        Document(
+            page_content="stale summary",
+            provider="dify",
+            metadata={
+                "dataset_id": dataset.id,
+                "document_id": document.id,
+                "doc_id": "stale-summary-node",
+                "is_summary": True,
+                "original_chunk_id": summary_segment.id,
+                "score": 0.98,
+            },
+        ),
+        Document(
+            page_content="valid content",
+            provider="dify",
+            metadata={
+                "dataset_id": dataset.id,
+                "document_id": document.id,
+                "doc_id": valid_segment.index_node_id,
+                "score": 0.5,
+            },
+        ),
+    ]
+    retrieval = _dataset_retrieval()
+    monkeypatch.setattr(retrieval, "_get_available_datasets", lambda *_args: [dataset])
+    monkeypatch.setattr(retrieval, "get_metadata_filter_condition", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(dataset_retrieval_module.RetrievalService, "retrieve", lambda **_kwargs: raw_documents)
+    monkeypatch.setattr(dataset_retrieval_module.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(dataset_retrieval_module, "db", _DatabaseHandle(sqlite_session.get_bind()))
+    traced_documents: list[list[str]] = []
+    monkeypatch.setattr(
+        retrieval,
+        "_send_trace_task",
+        lambda _message_id, documents, _timer: traced_documents.append(
+            [document.page_content for document in documents]
+        ),
+    )
+    model_instance = Mock()
+    model_instance.model_name = "gpt-4"
+    model_instance.credentials = {}
+    model_instance.provider_model_bundle = Mock()
+    model_instance.model_type_instance.get_model_schema.return_value = SimpleNamespace(features=[])
+    monkeypatch.setattr(
+        dataset_retrieval_module.ModelManager,
+        "for_tenant",
+        lambda **_kwargs: _ModelManagerHandle(cast(ModelInstance, model_instance)),
+    )
+    monkeypatch.setattr(
+        dataset_retrieval_module.ReactMultiDatasetRouter,
+        "invoke",
+        lambda *_args, **_kwargs: (dataset.id, LLMUsage.empty_usage()),
+    )
+    model_config = ModelConfigWithCredentialsEntity.model_construct(
+        provider="openai",
+        model="gpt-4",
+        model_schema=Mock(),
+        mode="chat",
+        provider_model_bundle=Mock(),
+        credentials={},
+        parameters={},
+        stop=[],
+    )
+
+    app = Flask(__name__)
+    with app.app_context():
+        context, _files = retrieval.retrieve(
+            sqlite_session,
+            app_id=str(uuid4()),
+            user_id=creator_id,
+            tenant_id=tenant_id,
+            model_config=model_config,
+            config=DatasetEntity(
+                dataset_ids=[dataset.id],
+                retrieve_config=DatasetRetrieveConfigEntity(
+                    retrieve_strategy=DatasetRetrieveConfigEntity.RetrieveStrategy.SINGLE,
+                    metadata_filtering_mode="disabled",
+                ),
+            ),
+            query="question",
+            invoke_from=InvokeFrom.DEBUGGER,
+            show_retrieve_source=True,
+            hit_callback=Mock(),
+            message_id="message-id",
+        )
+
+    assert context == "valid content"
+    sqlite_session.expire_all()
+    assert sqlite_session.get(DocumentSegment, disabled_segment.id).hit_count == 0
+    assert sqlite_session.get(DocumentSegment, summary_segment.id).hit_count == 0
+    assert sqlite_session.get(DocumentSegment, valid_segment.id).hit_count == 1
+    assert traced_documents == [["valid content"]]
+
+
+def test_multiple_retrieve_keeps_all_threshold_candidates_for_eligibility_filtering(
+    sqlite_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tenant_id = str(uuid4())
+    creator_id = str(uuid4())
+    first = Dataset(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        name="First external",
+        provider="external",
+        indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+        created_by=creator_id,
+    )
+    second = Dataset(
+        id=str(uuid4()),
+        tenant_id=tenant_id,
+        name="Second external",
+        provider="external",
+        indexing_technique=IndexTechniqueType.HIGH_QUALITY,
+        created_by=creator_id,
+    )
+    sqlite_session.add_all([first, second])
+    sqlite_session.commit()
+
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    responses = {
+        first.id: [
+            {"content": "below", "metadata": {}, "score": 0.1, "title": "Below"},
+            {"content": "middle", "metadata": {}, "score": 0.6, "title": "Middle"},
+        ],
+        second.id: [{"content": "highest", "metadata": {}, "score": 0.9, "title": "Highest"}],
+    }
+    external_retrieval.retrieve.side_effect = lambda **kwargs: responses[kwargs["dataset_id"]]
+    retrieval = _dataset_retrieval(external_retrieval)
+
+    @contextmanager
+    def create_read_session() -> Generator[Session]:
+        with Session(bind=sqlite_session.get_bind(), expire_on_commit=False) as read_session:
+            yield read_session
+
+    monkeypatch.setattr(dataset_retrieval_module.session_factory, "create_session", create_read_session)
+    monkeypatch.setattr(dataset_retrieval_module.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(retrieval, "_on_query", lambda *_args, **_kwargs: None)
+    hooked_documents: list[list[str]] = []
+    monkeypatch.setattr(
+        retrieval,
+        "_on_retrieval_end",
+        lambda *, documents, **_kwargs: hooked_documents.append([document.page_content for document in documents]),
+    )
+    app = Flask(__name__)
+
+    def retrieve(datasets: list[Dataset], *, reranking_enable: bool = True, top_k: int = 2) -> list[Document]:
+        with app.app_context():
+            return retrieval.multiple_retrieve(
+                app_id="app-1",
+                tenant_id=tenant_id,
+                user_id="user-1",
+                user_from="workflow",
+                available_datasets=datasets,
+                query="question",
+                top_k=top_k,
+                score_threshold=0.5,
+                reranking_mode=RerankMode.RERANKING_MODEL,
+                reranking_enable=reranking_enable,
+                reranking_model=None,
+            )
+
+    expected = ["highest", "middle"]
+    assert [document.page_content for document in retrieve([first, second], reranking_enable=False)] == expected
+    assert [document.page_content for document in retrieve([second, first], reranking_enable=False)] == expected
+    assert [document.page_content for document in retrieve([first, second], top_k=1)] == expected
+    assert hooked_documents == []
+
+
 class TestKnowledgeRetrievalCoverage:
     @pytest.fixture(autouse=True)
     def _orm_session(self, sqlite_session: Session) -> None:
@@ -4502,7 +5269,7 @@ class TestKnowledgeRetrievalCoverage:
 
     @pytest.fixture
     def retrieval(self) -> DatasetRetrieval:
-        return DatasetRetrieval()
+        return _dataset_retrieval()
 
     def test_returns_empty_when_query_missing(self, retrieval: DatasetRetrieval) -> None:
         request = KnowledgeRetrievalRequest(
@@ -4599,7 +5366,7 @@ class TestRetrieveCoverage:
 
     @pytest.fixture
     def retrieval(self) -> DatasetRetrieval:
-        return DatasetRetrieval()
+        return _dataset_retrieval()
 
     def _build_model_config(self, features: list[ModelFeature] | None = None):
         model_type_instance = Mock()
@@ -4744,7 +5511,7 @@ class TestRetrieveCoverage:
             bound_model_instance.model_name = "gpt-4"
             bound_model_instance.credentials = {}
             bound_model_instance.provider_model_bundle = Mock()
-            bound_model_instance.model_type_instance.get_model_schema.return_value = SimpleNamespace(features=[])
+            bound_model_instance.model_type_instance.get_model_schema.return_value = _ModelSchemaHandle(features=[])
             mock_model_manager.return_value.get_model_instance.return_value = bound_model_instance
             context, files = retrieval.retrieve(
                 self.orm_session,
@@ -4861,7 +5628,7 @@ class TestRetrieveCoverage:
             )
         )
         sqlite_session.commit()
-        record = SimpleNamespace(
+        record = RetrievalSegments(
             segment=segment,
             score=0.9,
             summary="short summary",
@@ -4916,7 +5683,7 @@ class TestSingleAndMultipleRetrieveCoverage:
 
     @pytest.fixture
     def retrieval(self) -> DatasetRetrieval:
-        return DatasetRetrieval()
+        return _dataset_retrieval()
 
     def test_single_retrieve_external_path(self, retrieval: DatasetRetrieval) -> None:
         dataset_id = str(uuid4())
@@ -4935,20 +5702,19 @@ class TestSingleAndMultipleRetrieveCoverage:
         usage = LLMUsage.from_metadata({"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2})
         self.orm_session.add(dataset)
         self.orm_session.commit()
+        external_retrieval = _mock_external_retrieval(retrieval)
+        external_retrieval.retrieve.return_value = [
+            {"content": "ext result", "metadata": {"k": "v"}, "score": 0.9, "title": "Ext Doc"}
+        ]
+        completion_timer: dict[str, Any] = {}
         with app.app_context():
             with (
                 patch("core.rag.retrieval.dataset_retrieval.ReactMultiDatasetRouter") as mock_router_cls,
-                patch(
-                    "core.rag.retrieval.dataset_retrieval.ExternalDatasetService.fetch_external_knowledge_retrieval"
-                ) as mock_external,
                 patch("core.rag.retrieval.dataset_retrieval.threading.Thread", _ImmediateThread),
                 patch.object(retrieval, "_on_retrieval_end") as mock_end,
                 patch.object(retrieval, "_on_query"),
             ):
                 mock_router_cls.return_value.invoke.return_value = (dataset_id, usage)
-                mock_external.return_value = [
-                    {"content": "ext result", "metadata": {"k": "v"}, "score": 0.9, "title": "Ext Doc"}
-                ]
                 result = retrieval.single_retrieve(
                     self.orm_session,
                     app_id="app-1",
@@ -4961,11 +5727,21 @@ class TestSingleAndMultipleRetrieveCoverage:
                     model_config=Mock(),
                     planning_strategy=PlanningStrategy.REACT_ROUTER,
                     message_id="m1",
+                    completion_timer=completion_timer,
                 )
 
         assert len(result) == 1
         assert result[0].provider == "external"
-        mock_end.assert_called_once()
+        external_retrieval.retrieve.assert_called_once_with(
+            tenant_id=tenant_id,
+            dataset_id=dataset_id,
+            query="python",
+            retrieval_model={"top_k": 2},
+            metadata_filters=None,
+        )
+        mock_end.assert_not_called()
+        assert completion_timer["start"] is not None
+        assert completion_timer["end"] is not None
         assert retrieval.llm_usage.total_tokens == 2
 
     def test_single_retrieve_dify_path_and_filters(self, retrieval: DatasetRetrieval) -> None:
@@ -5024,6 +5800,7 @@ class TestSingleAndMultipleRetrieveCoverage:
 
         assert results == [result_doc]
         assert mock_retrieve.call_args.kwargs["document_ids_filter"] == [document_id]
+        assert mock_retrieve.call_args.kwargs["allowed_document_ids_filter"] == (document_id,)
         assert retrieval.llm_usage.total_tokens == 1
 
     def test_single_retrieve_returns_empty_when_no_dataset_selected(self, retrieval: DatasetRetrieval) -> None:
@@ -5058,10 +5835,6 @@ class TestSingleAndMultipleRetrieveCoverage:
 
         with (
             patch("core.rag.retrieval.dataset_retrieval.ReactMultiDatasetRouter") as mock_router_cls,
-            patch(
-                "core.rag.retrieval.dataset_retrieval.ExternalDatasetService.fetch_external_knowledge_retrieval",
-                return_value=[],
-            ) as mock_external_retrieve,
             patch.object(retrieval, "_on_query") as mock_on_query,
         ):
             mock_router_cls.return_value.invoke.return_value = ("ds-2", LLMUsage.empty_usage())
@@ -5080,7 +5853,7 @@ class TestSingleAndMultipleRetrieveCoverage:
 
         assert results == []
         session.scalar.assert_not_called()
-        mock_external_retrieve.assert_not_called()
+        _mock_external_retrieval(retrieval).retrieve.assert_not_called()
         mock_on_query.assert_not_called()
 
     def test_single_retrieve_rejects_allowlisted_dataset_owned_by_another_tenant(
@@ -5108,9 +5881,6 @@ class TestSingleAndMultipleRetrieveCoverage:
         with (
             patch("core.rag.retrieval.dataset_retrieval.ReactMultiDatasetRouter") as mock_router_cls,
             patch(
-                "core.rag.retrieval.dataset_retrieval.ExternalDatasetService.fetch_external_knowledge_retrieval",
-            ) as mock_external_retrieve,
-            patch(
                 "core.rag.retrieval.dataset_retrieval.RetrievalService.retrieve",
             ) as mock_internal_retrieve,
             patch.object(retrieval, "_on_query") as mock_on_query,
@@ -5131,7 +5901,7 @@ class TestSingleAndMultipleRetrieveCoverage:
 
         assert results == []
         mock_internal_retrieve.assert_not_called()
-        mock_external_retrieve.assert_not_called()
+        _mock_external_retrieval(retrieval).retrieve.assert_not_called()
         mock_on_query.assert_not_called()
 
     def test_single_retrieve_respects_metadata_filter_shortcuts(self, retrieval: DatasetRetrieval) -> None:
@@ -5217,6 +5987,20 @@ class TestSingleAndMultipleRetrieveCoverage:
                 reranking_mode="weighted_score",
                 reranking_enable=False,
             )
+        with pytest.raises(ValueError, match="different indexing technique"):
+            retrieval.multiple_retrieve(
+                app_id="app-1",
+                tenant_id="tenant-1",
+                user_id="user-1",
+                user_from="workflow",
+                available_datasets=mixed,
+                query="python",
+                top_k=2,
+                score_threshold=0.0,
+                reranking_mode=RerankMode.RERANKING_MODEL,
+                reranking_enable=True,
+                reranking_model=None,
+            )
 
         high_quality_mismatch = [
             _dataset(
@@ -5244,6 +6028,28 @@ class TestSingleAndMultipleRetrieveCoverage:
                 score_threshold=0.0,
                 reranking_mode=RerankMode.WEIGHTED_SCORE,
                 reranking_enable=True,
+                weights={
+                    "vector_setting": {
+                        "vector_weight": 0.5,
+                        "embedding_provider_name": "",
+                        "embedding_model_name": "",
+                    },
+                    "keyword_setting": {"keyword_weight": 0.5},
+                },
+            )
+
+        with pytest.raises(ValueError, match="weights is required"):
+            retrieval.multiple_retrieve(
+                app_id="app-1",
+                tenant_id="tenant-1",
+                user_id="user-1",
+                user_from="workflow",
+                available_datasets=high_quality_mismatch[:1],
+                query="python",
+                top_k=2,
+                score_threshold=0.0,
+                reranking_mode=RerankMode.WEIGHTED_SCORE,
+                reranking_enable=True,
             )
 
     def test_multiple_retrieve_threads_and_dedup(self, retrieval: DatasetRetrieval) -> None:
@@ -5261,8 +6067,22 @@ class TestSingleAndMultipleRetrieveCoverage:
                 embedding_model_provider="provider-a",
             ),
         ]
-        doc_a = _doc(provider="dify", score=0.8, dataset_id="d1", document_id="doc-1", doc_id="dup")
-        doc_b = _doc(provider="dify", score=0.7, dataset_id="d2", document_id="doc-2", doc_id="dup")
+        doc_a = _doc(
+            provider="dify",
+            score=0.8,
+            dataset_id="d1",
+            document_id="doc-1",
+            doc_id="dup",
+            extra={"_retrieval_source_dataset_id": "d1"},
+        )
+        doc_b = _doc(
+            provider="dify",
+            score=0.7,
+            dataset_id="d2",
+            document_id="doc-2",
+            doc_id="dup",
+            extra={"_retrieval_source_dataset_id": "d2"},
+        )
         doc_external = _doc(
             provider="external",
             score=0.9,
@@ -5279,7 +6099,7 @@ class TestSingleAndMultipleRetrieveCoverage:
 
         def fake_multiple_thread(**kwargs):
             if kwargs["query"]:
-                kwargs["all_documents"].extend([doc_a, doc_b])
+                kwargs["all_documents"].extend([doc_a, doc_a.model_copy(deep=True), doc_b])
             if kwargs["attachment_id"]:
                 kwargs["all_documents"].append(doc_external)
 
@@ -5307,12 +6127,17 @@ class TestSingleAndMultipleRetrieveCoverage:
                     message_id="m1",
                 )
 
-        assert len(result) == 2
+        assert len(result) == 3
+        assert {
+            (document.metadata.get("_retrieval_source_dataset_id"), document.metadata["doc_id"])
+            for document in result
+            if document.provider == "dify"
+        } == {("d1", "dup"), ("d2", "dup")}
         assert any(doc.provider == "external" for doc in result)
         assert weights["vector_setting"]["embedding_provider_name"] == "provider-a"
         assert weights["vector_setting"]["embedding_model_name"] == "model-a"
         mock_on_query.assert_called_once()
-        mock_end.assert_called_once()
+        mock_end.assert_not_called()
 
     def test_multiple_retrieve_propagates_thread_exception(self, retrieval: DatasetRetrieval) -> None:
         datasets = [
@@ -5356,7 +6181,7 @@ class TestInternalHooksCoverage:
 
     @pytest.fixture
     def retrieval(self) -> DatasetRetrieval:
-        return DatasetRetrieval()
+        return _dataset_retrieval()
 
     def test_on_retrieval_end_without_dify_documents(self, retrieval: DatasetRetrieval) -> None:
         app = Flask(__name__)
@@ -5620,22 +6445,9 @@ class TestInternalHooksCoverage:
         all_documents: list[Document] = []
         tenant_id = str(uuid4())
         creator_id = str(uuid4())
-        missing_id = str(uuid4())
         external_id = str(uuid4())
         economy_id = str(uuid4())
         high_quality_id = str(uuid4())
-
-        assert (
-            retrieval._retriever(
-                flask_app=flask_app,  # type: ignore[arg-type]
-                session=self.orm_session,
-                dataset_id=missing_id,
-                query="python",
-                top_k=1,
-                all_documents=all_documents,
-            )
-            == []
-        )
 
         external_dataset = Dataset(
             id=external_id,
@@ -5675,20 +6487,22 @@ class TestInternalHooksCoverage:
         )
         self.orm_session.add_all([external_dataset, economy_dataset, high_dataset])
         self.orm_session.commit()
-        with (
-            patch(
-                "core.rag.retrieval.dataset_retrieval.ExternalDatasetService.fetch_external_knowledge_retrieval"
-            ) as mock_external,
-        ):
-            mock_external.return_value = [{"content": "e", "metadata": {}, "score": 0.8, "title": "Ext"}]
-            retrieval._retriever(
-                flask_app=flask_app,  # type: ignore[arg-type]
-                session=self.orm_session,
-                dataset_id=external_id,
-                query="python",
-                top_k=1,
-                all_documents=all_documents,
-            )
+        external_retrieval = _mock_external_retrieval(retrieval)
+        external_retrieval.retrieve.return_value = [{"content": "e", "metadata": {}, "score": 0.8, "title": "Ext"}]
+        retrieval._retriever(
+            flask_app=flask_app,  # type: ignore[arg-type]
+            dataset=external_dataset,
+            query="python",
+            top_k=1,
+            all_documents=all_documents,
+        )
+        external_retrieval.retrieve.assert_called_once_with(
+            tenant_id=tenant_id,
+            dataset_id=external_id,
+            query="python",
+            retrieval_model={"top_k": 2},
+            metadata_filters=None,
+        )
 
         with (
             patch(
@@ -5697,16 +6511,14 @@ class TestInternalHooksCoverage:
         ):
             retrieval._retriever(
                 flask_app=flask_app,  # type: ignore[arg-type]
-                session=self.orm_session,
-                dataset_id=economy_id,
+                dataset=economy_dataset,
                 query="python",
                 top_k=2,
                 all_documents=all_documents,
             )
             retrieval._retriever(
                 flask_app=flask_app,  # type: ignore[arg-type]
-                session=self.orm_session,
-                dataset_id=high_quality_id,
+                dataset=high_dataset,
                 query="python",
                 top_k=2,
                 all_documents=all_documents,
@@ -5860,42 +6672,36 @@ class TestInternalHooksCoverage:
             )
         )
         self.orm_session.commit()
+        metadata_model_config = _model_config_with_features()
         with (
-            patch.object(retrieval, "_fetch_model_config", return_value=(Mock(), Mock())),
+            patch.object(
+                retrieval,
+                "_fetch_model_config",
+                return_value=(_FailingModelInstance(), metadata_model_config),
+            ),
             patch.object(retrieval, "_get_prompt_template", return_value=(["prompt"], [])),
             patch.object(retrieval, "_record_usage"),
         ):
-            model_instance = Mock()
-            model_instance.invoke_llm.side_effect = RuntimeError("nope")
-            with patch.object(retrieval, "_fetch_model_config", return_value=(model_instance, Mock())):
-                assert (
-                    retrieval._automatic_metadata_filter_func(
-                        self.orm_session,
-                        dataset_ids=[dataset_id],
-                        query="python",
-                        tenant_id=tenant_id,
-                        user_id=user_id,
-                        metadata_model_config=WorkflowModelConfig(provider="openai", name="gpt", mode="chat"),
-                    )
-                    is None
+            assert (
+                retrieval._automatic_metadata_filter_func(
+                    self.orm_session,
+                    dataset_ids=[dataset_id],
+                    query="python",
+                    tenant_id=tenant_id,
+                    user_id=user_id,
+                    metadata_model_config=WorkflowModelConfig(provider="openai", name="gpt", mode="chat"),
                 )
+                is None
+            )
 
+        unsupported_model_config = _model_config_with_features()
         with (
             patch("core.rag.retrieval.dataset_retrieval.ModelMode", return_value=object()),
             patch("core.rag.retrieval.dataset_retrieval.AdvancedPromptTransform"),
         ):
             with pytest.raises(ValueError, match="not support"):
                 retrieval._get_prompt_template(
-                    model_config=ModelConfigWithCredentialsEntity.model_construct(
-                        provider="openai",
-                        model="gpt",
-                        model_schema=Mock(),
-                        mode="chat",
-                        provider_model_bundle=Mock(),
-                        credentials={},
-                        parameters={},
-                        stop=[],
-                    ),
+                    model_config=unsupported_model_config,
                     mode="chat",
                     metadata_fields=[],
                     query="q",

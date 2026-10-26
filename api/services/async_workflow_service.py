@@ -7,10 +7,9 @@ with support for different subscription tiers, rate limiting, and execution trac
 
 import json
 import logging
-from datetime import UTC, datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
-from celery.result import AsyncResult
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -27,6 +26,7 @@ from services.quota_service import QuotaService, unlimited
 from services.workflow.entities import AsyncTriggerResponse, TriggerData, WorkflowTaskData
 from services.workflow.queue_dispatcher import QueueDispatcherManager, QueuePriority
 from services.workflow_service import WorkflowService
+from services.workflow_trigger_quota_service import WorkflowTriggerQuotaService
 from tasks.async_workflow_tasks import (
     execute_workflow_professional,
     execute_workflow_sandbox,
@@ -34,6 +34,34 @@ from tasks.async_workflow_tasks import (
 )
 
 logger = logging.getLogger(__name__)
+
+_QUOTA_SETTLEMENT_RETRY_SECONDS = 60
+
+
+def _settle_trigger_quota(
+    session: Session,
+    repository: SQLAlchemyWorkflowTriggerLogRepository,
+    trigger_log_id: str,
+) -> None:
+    """Attempt one durable quota settlement without holding a database lock."""
+    candidate = repository.claim_quota_settlement(
+        trigger_log_id,
+        retry_interval=timedelta(seconds=_QUOTA_SETTLEMENT_RETRY_SECONDS),
+    )
+    session.commit()
+    if candidate is None:
+        return
+
+    settlement_status = WorkflowTriggerQuotaService.settle(candidate)
+    if settlement_status is None:
+        return
+
+    repository.confirm_quota_settlement(
+        candidate.trigger_log_id,
+        attempted_at=candidate.attempted_at,
+        settlement_status=settlement_status,
+    )
+    session.commit()
 
 
 class AsyncWorkflowService:
@@ -163,46 +191,73 @@ class AsyncWorkflowService:
 
         task_data = WorkflowTaskData(workflow_trigger_log_id=trigger_log.id)
 
-        # 9. Dispatch to appropriate queue
+        # 9. Persist the executable state before dispatch. A fast worker may
+        # claim the row before apply_async returns, so the producer must not
+        # write QUEUED again after handing the task to the broker.
         task_data_dict = task_data.model_dump(mode="json")
+        celery_task_id = str(uuid4())
+        queued = trigger_log_repo.queue_pending_execution(
+            trigger_log.id,
+            celery_task_id=celery_task_id,
+            triggered_at=datetime.now(UTC),
+            quota_reservation_id=quota_charge.charge_id,
+        )
+        session.commit()
+        if not queued:
+            quota_charge.refund()
+            logger.error("Async workflow dispatch was abandoned before publish: %s", trigger_log.id)
+            raise RuntimeError(f"Async workflow dispatch was abandoned before publish: {trigger_log.id}")
 
         try:
-            task: AsyncResult[Any] | None = None
             if queue_name == QueuePriority.PROFESSIONAL:
-                task = execute_workflow_professional.delay(task_data_dict)
+                execute_workflow_professional.apply_async(args=(task_data_dict,), task_id=celery_task_id)
             elif queue_name == QueuePriority.TEAM:
-                task = execute_workflow_team.delay(task_data_dict)
+                execute_workflow_team.apply_async(args=(task_data_dict,), task_id=celery_task_id)
             else:  # SANDBOX
-                task = execute_workflow_sandbox.delay(task_data_dict)
-            quota_charge.commit()
+                execute_workflow_sandbox.apply_async(args=(task_data_dict,), task_id=celery_task_id)
         except Exception as e:
-            # Mark the trigger log as FAILED so it does not stay PENDING when the broker
-            # or dispatcher refuses the task, then re-raise so the caller still surfaces
-            # the error.
-            trigger_log.status = WorkflowTriggerStatus.FAILED
-            trigger_log.error = f"Failed to dispatch workflow task: {e}"
-            trigger_log_repo.update(trigger_log)
-            session.commit()
-            quota_charge.refund()
-            logger.exception(
-                "Failed to dispatch workflow task for tenant %s, app %s, workflow %s, trigger log %s",
-                trigger_data.tenant_id,
-                trigger_data.app_id,
-                workflow.id,
+            # The broker may report a failure after delivering the message.
+            # Only fail a task that no worker has claimed in the meantime.
+            dispatch_failed = trigger_log_repo.mark_dispatch_failed(
                 trigger_log.id,
+                celery_task_id=celery_task_id,
+                error=f"Failed to dispatch workflow task: {e}",
             )
-            raise
+            session.commit()
+            if dispatch_failed:
+                _settle_trigger_quota(session, trigger_log_repo, trigger_log.id)
+                logger.exception(
+                    "Failed to dispatch workflow task for tenant %s, app %s, workflow %s, trigger log %s",
+                    trigger_data.tenant_id,
+                    trigger_data.app_id,
+                    workflow.id,
+                    trigger_log.id,
+                )
+                raise
 
-        # 10. Update trigger log with task info
-        trigger_log.status = WorkflowTriggerStatus.QUEUED
-        trigger_log.celery_task_id = task.id
-        trigger_log.triggered_at = datetime.now(UTC)
-        trigger_log_repo.update(trigger_log)
-        session.commit()
+            # A worker has already claimed (and may have completed) this task.
+            # Charge the accepted execution and return its preallocated task ID.
+            _settle_trigger_quota(session, trigger_log_repo, trigger_log.id)
+            logger.warning(
+                "Workflow task %s was claimed despite a dispatch error for trigger log %s",
+                celery_task_id,
+                trigger_log.id,
+                exc_info=True,
+            )
+        else:
+            published = trigger_log_repo.confirm_dispatch_published(
+                trigger_log.id,
+                celery_task_id=celery_task_id,
+            )
+            session.commit()
+            if not published:
+                _settle_trigger_quota(session, trigger_log_repo, trigger_log.id)
+                raise RuntimeError(f"Async workflow dispatch expired before broker confirmation: {trigger_log.id}")
+            _settle_trigger_quota(session, trigger_log_repo, trigger_log.id)
 
         return AsyncTriggerResponse(
             workflow_trigger_log_id=trigger_log.id,
-            task_id=task.id,
+            task_id=celery_task_id,
             status="queued",
             queue=queue_name,
         )

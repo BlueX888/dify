@@ -1,155 +1,187 @@
-"""External knowledge persistence and network adapters with bounded sessions."""
+"""External knowledge HTTP and access-policy adapters."""
 
+import json
 from collections.abc import Mapping
 from typing import Any
 
-from sqlalchemy import select
-from sqlalchemy.orm import Session, sessionmaker
+import httpx
 
-from core.rag.entities import MetadataFilteringCondition
-from libs.pagination import clamp_pagination
+from core.helper import ssrf_proxy
 from machinery.context import RequestContext
-from models.dataset import DatasetQuery, ExternalKnowledgeApis
-from models.enums import CreatorUserRole, DatasetQuerySource
-from repositories.knowledge.dataset_read_repository import (
-    get_external_api_bindings_batch,
-    get_external_api_dataset_bindings,
+from services.enterprise import rbac_service
+from services.errors.knowledge_retrieval import ExternalKnowledgeRetrievalError
+from services.knowledge.entities.external import (
+    ExternalKnowledgeApiSetting,
+    ExternalKnowledgeRetrievalRequest,
+    validate_external_knowledge_api_settings,
 )
-from services.entities.external_knowledge_entities.external_knowledge_entities import ExternalDatasetCreatePayload
-from services.hit_testing_service import HitTestingService
-from services.knowledge.dataset_read_service import load_dataset_detail
-from services.knowledge.datasets.adapters import require_dataset
-from services.knowledge.entities.datasets import DatasetDetailRecord
-from services.knowledge.external.application import ExternalTemplateNotFoundError
-from services.knowledge.external.service import ExternalDatasetService
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
+from services.knowledge.external.application import ExternalKnowledgeRepository
 from services.rbac.contracts import RBACResourceType
-from services.rbac.members import MemberService
 
 
-class SQLAlchemyExternalKnowledgeOperations:
-    def __init__(self, *, session_factory: sessionmaker[Session], members: MemberService) -> None:
-        self._sessions = session_factory
-        self._members = members
+def sync_external_dataset_creator_access(context: RequestContext, ref: DatasetRef) -> None:
+    rbac_service.try_sync_creator_access_policy_member_bindings(
+        context.active_workspace_id, context.account_id, RBACResourceType.DATASET, ref.dataset_id
+    )
+
+
+class ExternalKnowledgeGateway:
+    def check_settings(self, settings: Mapping[str, Any]) -> None:
+        self.check_endpoint_and_api_key(settings)
+
+    def retrieve(self, request: ExternalKnowledgeRetrievalRequest) -> list[dict[str, Any]]:
+        """Send the query unchanged; JSON serialization handles transport escaping."""
+        http_request = self.build_external_knowledge_retrieval_request(request)
+        return self.execute_external_knowledge_retrieval(http_request)
 
     @staticmethod
-    def _template(session: Session, workspace_id: str, template_id: str) -> ExternalKnowledgeApis:
-        template = session.scalar(
-            select(ExternalKnowledgeApis).where(
-                ExternalKnowledgeApis.id == template_id, ExternalKnowledgeApis.tenant_id == workspace_id
+    def check_endpoint_and_api_key(settings: Mapping[str, Any]) -> None:
+        validate_external_knowledge_api_settings(settings)
+        endpoint = f"{settings['endpoint']}/retrieval"
+        api_key = settings["api_key"]
+        # Send a minimal body shaped like the External Knowledge API retrieval contract so providers
+        # that require a JSON payload (e.g. RAGFlow) accept the validation probe instead of rejecting
+        # a body-less POST. Mirrors the request built in build_external_knowledge_retrieval_request.
+        validation_payload = {
+            "knowledge_id": "",
+            "query": "",
+            "retrieval_setting": {"top_k": 1, "score_threshold": 0.0},
+        }
+        try:
+            response = ssrf_proxy.post(
+                endpoint,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                data=json.dumps(validation_payload),
             )
+        except Exception as e:
+            raise ValueError(f"failed to connect to the endpoint: {endpoint}") from e
+        if response.status_code == 502:
+            raise ValueError(f"Bad Gateway: failed to connect to the endpoint: {endpoint}")
+        if response.status_code == 404:
+            raise ValueError(f"Not Found: failed to connect to the endpoint: {endpoint}")
+        if response.status_code == 401:
+            raise ValueError("Unauthorized: Authorization failed with the provided api_key")
+        if response.status_code == 403:
+            raise ValueError("Forbidden: Authorization failed with the provided api_key")
+
+    @staticmethod
+    def send_retrieval_request(request: ExternalKnowledgeApiSetting) -> httpx.Response:
+        """POST a retrieval request through the SSRF-safe transport."""
+        return ssrf_proxy.post(
+            request.url,
+            headers=request.headers,
+            data=json.dumps(request.params),
+            follow_redirects=True,
         )
-        if template is None:
-            raise ExternalTemplateNotFoundError("API template not found.")
-        return template
 
     @staticmethod
-    def _values(session: Session, template: ExternalKnowledgeApis) -> dict[str, Any]:
-        return dict(template.to_dict(dataset_bindings=get_external_api_dataset_bindings(template, session=session)))
+    def build_external_knowledge_retrieval_request(
+        request: ExternalKnowledgeRetrievalRequest,
+    ) -> ExternalKnowledgeApiSetting:
+        """Adapt domain retrieval input to the external provider's HTTP contract."""
+        headers = {"Content-Type": "application/json"}
+        if request.api_key:
+            headers["Authorization"] = f"Bearer {request.api_key}"
+        parameters = request.retrieval_model
+        threshold = parameters.get("score_threshold", 0.0) if parameters.get("score_threshold_enabled") else 0.0
+        return ExternalKnowledgeApiSetting(
+            url=f"{request.endpoint}/retrieval",
+            headers=headers,
+            params={
+                "retrieval_setting": {"top_k": parameters.get("top_k"), "score_threshold": threshold},
+                "query": request.query,
+                "knowledge_id": request.knowledge_id,
+                "metadata_condition": request.metadata_filters,
+            },
+        )
 
-    def list_templates(self, workspace_id: str, *, page: int, limit: int, keyword: str | None) -> dict[str, Any]:
-        page, limit = clamp_pagination(page, limit, 100)
-        with self._sessions() as session:
-            templates, total = ExternalDatasetService.get_external_knowledge_apis(
-                page, limit, workspace_id, keyword, session=session
-            )
-            bindings = get_external_api_bindings_batch(templates, session=session)
-            return {
-                "data": [item.to_dict(dataset_bindings=bindings.get(item.id, [])) for item in templates],
-                "has_more": page * limit < total,
-                "total": total,
-                "page": page,
-                "limit": limit,
-            }
+    @staticmethod
+    def execute_external_knowledge_retrieval(request: ExternalKnowledgeApiSetting) -> list[dict[str, Any]]:
+        """Execute and validate a prepared request without holding a database session."""
+        try:
+            response = ExternalKnowledgeGateway.send_retrieval_request(request)
+        except Exception as exc:
+            raise ExternalKnowledgeRetrievalError(str(exc)) from exc
 
-    def get_template(self, workspace_id: str, template_id: str) -> dict[str, Any]:
-        with self._sessions() as session:
-            return self._values(session, self._template(session, workspace_id, template_id))
+        if response.status_code != 200:
+            raise ExternalKnowledgeRetrievalError(response.text)
 
-    def create_template(self, context: RequestContext, *, name: str, settings: Mapping[str, Any]) -> dict[str, Any]:
-        # The legacy creator probes the endpoint before its first SQL statement.
-        # An unopened session keeps that external request outside a transaction.
-        with self._sessions() as session:
-            template = ExternalDatasetService.create_external_knowledge_api(
-                context.active_workspace_id,
-                context.account_id,
-                {"name": name, "settings": dict(settings)},
-                session=session,
-            )
-            result = self._values(session, template)
-            session.commit()
-            return result
+        try:
+            response_payload = response.json()
+        except Exception as exc:
+            raise ExternalKnowledgeRetrievalError("invalid external knowledge response") from exc
 
-    def update_template(
-        self, context: RequestContext, template_id: str, *, name: str, settings: Mapping[str, Any]
-    ) -> dict[str, Any]:
-        with self._sessions.begin() as session:
-            self._template(session, context.active_workspace_id, template_id)
-            template = ExternalDatasetService.update_external_knowledge_api(
-                context.active_workspace_id,
-                context.account_id,
-                template_id,
-                {"name": name, "settings": dict(settings)},
-                session=session,
-            )
-            return self._values(session, template)
+        if not isinstance(response_payload, dict):
+            raise ExternalKnowledgeRetrievalError("invalid external knowledge response")
 
-    def delete_template(self, workspace_id: str, template_id: str) -> None:
-        with self._sessions.begin() as session:
-            session.delete(self._template(session, workspace_id, template_id))
+        records = response_payload.get("records")
+        if not isinstance(records, list):
+            raise ExternalKnowledgeRetrievalError("invalid external knowledge response: records must be a list")
 
-    def template_usage(self, workspace_id: str, template_id: str) -> tuple[bool, int]:
-        with self._sessions() as session:
-            return ExternalDatasetService.external_knowledge_api_use_check(template_id, workspace_id, session=session)
+        validated_records: list[dict[str, Any]] = []
+        for index, record in enumerate(records):
+            if not isinstance(record, dict):
+                raise ExternalKnowledgeRetrievalError(
+                    f"invalid external knowledge response: records[{index}] must be an object"
+                )
 
-    def create_dataset(self, context: RequestContext, payload: ExternalDatasetCreatePayload) -> DatasetDetailRecord:
-        with self._sessions() as session:
-            self._template(session, context.active_workspace_id, payload.external_knowledge_api_id)
-            dataset = ExternalDatasetService.create_external_dataset(
-                context.active_workspace_id, context.account_id, payload, session=session
-            )
-            permissions = self._members.resource_permissions(
-                context.active_workspace_id, context.account_id, RBACResourceType.DATASET, [dataset.id]
-            )
-            result = load_dataset_detail(dataset, session=session)
-            result["permission_keys"] = permissions.get(dataset.id, [])
-            session.commit()
-            return result
+            if "content" in record and not isinstance(record["content"], str):
+                raise ExternalKnowledgeRetrievalError(
+                    f"invalid external knowledge response: records[{index}].content must be a string"
+                )
+
+            if "score" in record:
+                score = record["score"]
+                if isinstance(score, bool) or not isinstance(score, int | float):
+                    raise ExternalKnowledgeRetrievalError(
+                        f"invalid external knowledge response: records[{index}].score must be a number"
+                    )
+
+            if "title" in record and not isinstance(record["title"], str):
+                raise ExternalKnowledgeRetrievalError(
+                    f"invalid external knowledge response: records[{index}].title must be a string"
+                )
+
+            if "metadata" in record and not isinstance(record["metadata"], dict):
+                raise ExternalKnowledgeRetrievalError(
+                    f"invalid external knowledge response: records[{index}].metadata must be an object"
+                )
+
+            # The public provider contract permits missing fields. Normalize
+            # the runtime-sensitive values to finite, sortable representations
+            # while retaining any provider-specific fields.
+            normalized_record = dict(record)
+            normalized_record.setdefault("content", "")
+            normalized_record.setdefault("score", 0.0)
+            normalized_record.setdefault("metadata", {})
+            validated_records.append(normalized_record)
+
+        return validated_records
+
+
+class ExternalDatasetRetrievalAdapter:
+    """Combine a short configuration read with external provider I/O."""
+
+    def __init__(self, *, repository: ExternalKnowledgeRepository, gateway: ExternalKnowledgeGateway) -> None:
+        self._repository = repository
+        self._gateway = gateway
 
     def retrieve(
         self,
-        context: RequestContext,
-        ref: DatasetRef,
         *,
+        tenant_id: str,
+        dataset_id: str,
         query: str,
         retrieval_model: dict[str, Any] | None,
         metadata_filters: dict[str, Any] | None,
-    ) -> dict[str, Any]:
-        with self._sessions() as session:
-            dataset = require_dataset(session, ref)
-            if dataset.provider != "external":
-                return {"query": {"content": query}, "records": []}
-            request = ExternalDatasetService.prepare_external_knowledge_retrieval(
-                tenant_id=ref.tenant_id,
-                dataset_id=ref.dataset_id,
-                query=HitTestingService.escape_query_for_search(query),
-                external_retrieval_parameters=retrieval_model or {},
-                metadata_condition=MetadataFilteringCondition.model_validate(metadata_filters)
-                if metadata_filters
-                else None,
-                session=session,
-            )
-        documents = ExternalDatasetService.execute_external_knowledge_retrieval(request)
-        with self._sessions.begin() as session:
-            require_dataset(session, ref)
-            session.add(
-                DatasetQuery(
-                    dataset_id=ref.dataset_id,
-                    content=query,
-                    source=DatasetQuerySource.HIT_TESTING,
-                    source_app_id=None,
-                    created_by_role=CreatorUserRole.ACCOUNT,
-                    created_by=context.account_id,
-                )
-            )
-        return dict(HitTestingService.compact_external_retrieve_response(dataset, query, documents))
+    ) -> list[dict[str, Any]]:
+        request = self._repository.prepare_retrieval(
+            DatasetRef(tenant_id, dataset_id),
+            query=query,
+            retrieval_model=retrieval_model,
+            metadata_filters=metadata_filters,
+        )
+        if request is None:
+            return []
+        return self._gateway.retrieve(request)

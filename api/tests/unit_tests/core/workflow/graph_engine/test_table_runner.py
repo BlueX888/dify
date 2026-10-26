@@ -22,6 +22,7 @@ from typing import Any
 from core.app.entities.app_invoke_entities import DIFY_RUN_CONTEXT_KEY, InvokeFrom, UserFrom
 from core.tools.utils.yaml_utils import _load_yaml_file
 from core.workflow.node_factory import DifyNodeFactory, get_default_root_node_id
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.system_variables import build_bootstrap_variables, build_system_variables
 from core.workflow.variable_pool_initializer import add_node_inputs_to_pool, add_variables_to_pool
 from core.workflow.workflow_entry import iter_dify_graph_engine_events
@@ -43,6 +44,7 @@ from graphon.variables import (
     ObjectVariable,
     StringVariable,
 )
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 
 from .test_mock_config import MockConfig
 from .test_mock_factory import MockNodeFactory
@@ -219,10 +221,19 @@ class WorkflowRunner:
 
         if use_mock_factory:
             node_factory = MockNodeFactory(
-                init_params=graph_init_params, runtime_state=graph_runtime_state, mock_config=mock_config
+                init_params=graph_init_params,
+                runtime_state=graph_runtime_state,
+                external_retrieval=make_external_dataset_retriever(),
+                knowledge_index_runtime=build_knowledge_index_runtime(),
+                mock_config=mock_config,
             )
         else:
-            node_factory = DifyNodeFactory(init_params=graph_init_params, runtime_state=graph_runtime_state)
+            node_factory = DifyNodeFactory(
+                init_params=graph_init_params,
+                runtime_state=graph_runtime_state,
+                external_retrieval=make_external_dataset_retriever(),
+                knowledge_index_runtime=build_knowledge_index_runtime(),
+            )
 
         graph = Graph.init(
             graph_config=graph_config,

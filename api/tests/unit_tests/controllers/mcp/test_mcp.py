@@ -6,7 +6,7 @@ import json
 import types
 from collections.abc import Iterator
 from inspect import unwrap
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 from uuid import uuid4
 
 import pytest
@@ -16,6 +16,7 @@ from sqlalchemy import inspect
 from sqlalchemy.orm import Session, sessionmaker
 
 import controllers.mcp.mcp as module
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models.engine import db
 from models.enums import EndUserType
 from models.model import App, AppAnnotationSetting, AppMCPServer, AppModelConfig, EndUser, IconType
@@ -41,6 +42,14 @@ def app() -> Iterator[Flask]:
             table.create(db.engine)
         with patch.object(module.session_factory, "get_session_maker", return_value=sessionmaker(db.engine)):
             yield app
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval() -> Iterator[ExternalDatasetRetriever]:
+    retriever = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    with patch.object(module, "application_services", autospec=True) as services:
+        services.return_value.knowledge.external_retrieval = retriever
+        yield retriever
 
 
 @pytest.fixture(autouse=True)
@@ -148,7 +157,7 @@ class DummyResult:
 @pytest.mark.usefixtures("flask_req_ctx")
 class TestMCPAppApi:
     @patch.object(module, "handle_mcp_request", return_value=DummyResult(), autospec=True)
-    def test_success_request(self, mock_handle):
+    def test_success_request(self, mock_handle, external_retrieval):
         fake_payload(
             {
                 "jsonrpc": "2.0",
@@ -173,6 +182,7 @@ class TestMCPAppApi:
 
         assert isinstance(response, Response)
         mock_handle.assert_called_once()
+        assert mock_handle.call_args.kwargs["external_retrieval"] is external_retrieval
 
     def test_notification_initialized(self):
         fake_payload(

@@ -2,6 +2,7 @@ import json
 from collections.abc import Generator, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
+from unittest.mock import create_autospec
 
 import pytest
 from flask import Flask, got_request_exception
@@ -11,6 +12,7 @@ from sqlalchemy.orm import Session, sessionmaker
 import controllers.console.explore.workflow as workflow_module
 import services.app_task_service as app_task_module
 from core.errors.error import ModelCurrentlyNotSupportError, ProviderTokenNotInitError, QuotaExceededError
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from graphon.enums import WorkflowExecutionStatus, WorkflowType
 from graphon.model_runtime.errors.invoke import InvokeError
 from models import App, AppMode, InstalledApp, Tenant
@@ -423,7 +425,14 @@ def test_workflow_run_revalidates_app_while_stop_uses_admission_snapshot(
         installed_apps=_InstalledAppServices(
             generation=InstalledAppGenerationService(
                 usage=SQLAlchemyInstalledAppRepository(session_factory=sqlite_session_factory),
-                runtime=AppGenerateServiceRuntime(session_factory=sqlite_session_factory),
+                runtime=AppGenerateServiceRuntime(
+                    session_factory=sqlite_session_factory,
+                    external_retrieval=create_autospec(
+                        ExternalDatasetRetriever,
+                        instance=True,
+                        spec_set=True,
+                    ),
+                ),
             )
         ),
         app_tasks=AppTaskControlService(redis_client=stop_redis),

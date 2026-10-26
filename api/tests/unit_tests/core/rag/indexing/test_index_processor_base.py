@@ -194,6 +194,7 @@ class TestBaseIndexProcessor:
         remote_upload = _persist_upload(sqlite_session, upload_id=str(uuid4()), name="remote.png")
         sqlite_session.commit()
         current_user = _account()
+        created_upload_file_ids: list[str] = []
 
         with (
             patch.object(processor, "_extract_markdown_images", return_value=images),
@@ -205,6 +206,7 @@ class TestBaseIndexProcessor:
                 current_user=current_user,
                 tenant_id="tenant-1",
                 session=sqlite_session,
+                on_upload_file_created=created_upload_file_ids.append,
             )
 
         assert len(files) == 5
@@ -221,6 +223,7 @@ class TestBaseIndexProcessor:
             session=sqlite_session,
         )
         mock_image_download.assert_called_once()
+        assert created_upload_file_ids == [tool_upload.id, remote_upload.id]
 
     def test_get_content_files_skips_tool_and_remote_download_without_user(
         self, processor: _ForwardingBaseIndexProcessor, unbound_session: Session
@@ -334,6 +337,7 @@ class TestBaseIndexProcessor:
             content=b"data",
             mimetype="image/png",
             user=current_user,
+            temporary=True,
         )
 
     def test_download_image_validates_size_and_empty_content(self, processor: _ForwardingBaseIndexProcessor) -> None:

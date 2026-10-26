@@ -5,8 +5,10 @@ import mimetypes
 import os
 import re
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
-from typing import TYPE_CHECKING, Any, NotRequired, TypedDict
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, NotRequired, Protocol, TypedDict
 from urllib.parse import unquote, urlparse
 
 import httpx
@@ -17,7 +19,8 @@ from werkzeug.http import parse_options_header
 from configs import dify_config
 from core.entities.knowledge_entities import PreviewDetail
 from core.file import remote_fetcher
-from core.rag.extractor.entity.extract_setting import ExtractSetting
+from core.rag.embedding.retrieval import RetrievalFinalizer
+from core.rag.extractor.entity.extract_setting import ExtractionResult, ExtractSetting
 from core.rag.index_processor.constant.doc_type import DocType
 from core.rag.models.document import AttachmentDocument, Document
 from core.rag.splitter.fixed_text_splitter import (
@@ -31,6 +34,109 @@ from models import Account, ToolFile
 from models.dataset import Dataset, DatasetProcessRule
 from models.dataset import Document as DatasetDocument
 from models.model import UploadFile
+
+IndexingMutationGuard = Callable[[Session], AbstractContextManager[None]]
+PipelineIndexingRouteRecorder = Callable[[str, str, str], None]
+type AttachmentRef = tuple[str, str]
+
+
+class AttachmentVectorStore(Protocol):
+    """Persistence port used by index processors to fence shared attachment vectors."""
+
+    def publish_bound(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        attachment_refs: Sequence[AttachmentRef],
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None = None,
+        publish: Callable[
+            [frozenset[AttachmentRef], Callable[[Sequence[str]], None], Callable[[Sequence[str]], None]], None
+        ],
+        mutation_guard: IndexingMutationGuard | None = None,
+    ) -> frozenset[AttachmentRef]: ...
+
+    def delete_unreferenced(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None = None,
+        document_ids: Sequence[str] | None = None,
+        segment_ids: Sequence[str] | None = None,
+        candidate_attachment_ids: Sequence[str] | None = None,
+        mutation_guard: IndexingMutationGuard | None = None,
+        validate: Callable[[Session], None] | None = None,
+    ) -> tuple[str, ...]: ...
+
+
+class ChildVectorRouteStore(Protocol):
+    """Persistence port for the physical route of published child vectors."""
+
+    def persist(
+        self,
+        session: Session,
+        *,
+        tenant_id: str,
+        dataset_id: str,
+        collection_binding_id: str | None,
+        indexing_technique: str,
+        doc_form: str,
+        node_ids: Sequence[str],
+        vector_type: str,
+        collection_name: str,
+        routing_index_struct: str | None = None,
+    ) -> None: ...
+
+
+class PipelineIndexingGuardFactory(Protocol):
+    """Resolve the fencing guard for one durable indexing attempt."""
+
+    def __call__(
+        self,
+        session: Session,
+        *,
+        dataset_id: str,
+        document_id: str,
+        indexing_request_id: str | None,
+        claim_id: str | None,
+    ) -> IndexingMutationGuard | None: ...
+
+
+class PipelineIndexingRouteRecorderFactory(Protocol):
+    """Resolve a durable physical-route recorder for one document claim."""
+
+    def __call__(
+        self,
+        session: Session,
+        *,
+        dataset_id: str,
+        document_id: str,
+        indexing_request_id: str | None,
+        claim_id: str | None,
+    ) -> PipelineIndexingRouteRecorder | None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class KnowledgeIndexRuntime:
+    """Persistence-aware runtime dependencies consumed by knowledge workflow nodes."""
+
+    attachment_vectors: AttachmentVectorStore
+    child_vector_routes: ChildVectorRouteStore
+    indexing_guard_factory: PipelineIndexingGuardFactory
+    indexing_route_recorder_factory: PipelineIndexingRouteRecorderFactory
+    retrieval_finalizer: RetrievalFinalizer
+
 
 if TYPE_CHECKING:
     from core.model_manager import ModelInstance
@@ -46,8 +152,29 @@ class SummaryIndexSettingDict(TypedDict):
 class BaseIndexProcessor(ABC):
     """Interface for extract files."""
 
+    def __init__(
+        self,
+        *,
+        attachment_vectors: AttachmentVectorStore | None = None,
+        child_vector_routes: ChildVectorRouteStore | None = None,
+    ) -> None:
+        self._attachment_vectors = attachment_vectors
+        self._child_vector_routes = child_vector_routes
+
+    @property
+    def attachment_vectors(self) -> AttachmentVectorStore:
+        if self._attachment_vectors is None:
+            raise RuntimeError("attachment vector store is required for multimodal indexing")
+        return self._attachment_vectors
+
+    @property
+    def child_vector_routes(self) -> ChildVectorRouteStore:
+        if self._child_vector_routes is None:
+            raise RuntimeError("child vector route store is required for parent-child indexing")
+        return self._child_vector_routes
+
     @abstractmethod
-    def extract(self, extract_setting: ExtractSetting, *, session: Session, **kwargs) -> list[Document]:
+    def extract(self, extract_setting: ExtractSetting, *, session: Session, **kwargs) -> ExtractionResult:
         raise NotImplementedError
 
     @abstractmethod
@@ -100,7 +227,15 @@ class BaseIndexProcessor(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def index(self, dataset: Dataset, document: DatasetDocument, chunks: Any, session: Session) -> None:
+    def index(
+        self,
+        dataset: Dataset,
+        document: DatasetDocument,
+        chunks: Any,
+        session: Session,
+        *,
+        mutation_guard: IndexingMutationGuard | None = None,
+    ) -> None:
         raise NotImplementedError
 
     @abstractmethod
@@ -153,6 +288,7 @@ class BaseIndexProcessor(ABC):
         *,
         tenant_id: str,
         session: Session,
+        on_upload_file_created: Callable[[str], None] | None = None,
     ) -> list[AttachmentDocument]:
         """
         Get the content files from the document.
@@ -197,6 +333,8 @@ class BaseIndexProcessor(ABC):
                         session=session,
                     )
                     if upload_file_id:
+                        if on_upload_file_created is not None:
+                            on_upload_file_created(upload_file_id)
                         upload_file_id_list.append(upload_file_id)
                 continue
             if current_user:
@@ -211,6 +349,8 @@ class BaseIndexProcessor(ABC):
                     continue
                 upload_file_id = self._download_image(image_url, current_user)
                 if upload_file_id:
+                    if on_upload_file_created is not None:
+                        on_upload_file_created(upload_file_id)
                     upload_file_id_list.append(upload_file_id)
 
         if not upload_file_id_list:
@@ -317,6 +457,7 @@ class BaseIndexProcessor(ABC):
                 content=blob,
                 mimetype=content_type,
                 user=current_user,
+                temporary=True,
             )
             return upload_file.id
         except httpx.TimeoutException:
@@ -353,5 +494,6 @@ class BaseIndexProcessor(ABC):
             content=blob,
             mimetype=tool_file.mimetype,
             user=current_user,
+            temporary=True,
         )
         return upload_file.id

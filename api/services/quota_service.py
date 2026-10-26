@@ -3,11 +3,21 @@ from __future__ import annotations
 import logging
 import uuid
 from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import Literal
 
 from configs import dify_config
 from enums import DeploymentEdition, QuotaType
 
 logger = logging.getLogger(__name__)
+
+
+class QuotaSettlementResult(StrEnum):
+    """Durable interpretation of one idempotent quota settlement request."""
+
+    CONFIRMED = "confirmed"
+    RETRYABLE_ERROR = "retryable_error"
+    PERMANENT_ERROR = "permanent_error"
 
 
 @dataclass
@@ -171,6 +181,68 @@ class QuotaService:
         except Exception:
             logger.exception("Failed to reserve quota for %s, feature %s", tenant_id, quota_type.value)
             return unlimited()
+
+    @staticmethod
+    def settle_reservation(
+        quota_type: QuotaType,
+        tenant_id: str,
+        reservation_id: str,
+        *,
+        settlement: Literal["committed", "refunded"],
+        amount: int = 1,
+    ) -> QuotaSettlementResult:
+        """Settle a durable reservation without hiding an unknown remote result.
+
+        Billing settlement endpoints are keyed by ``reservation_id`` and are
+        safe to retry. A successful response is terminal. Network failures,
+        throttling, server errors, and undecodable responses remain retryable
+        because the remote side may already have applied the request. Other
+        4xx responses are preserved as an observable permanent error; the
+        billing contract does not identify those responses as "expired".
+        """
+        from services.billing_service import BillingService
+        from services.errors.billing import BillingUpstreamInvalidResponseError, BillingUpstreamUnavailableError
+
+        try:
+            if settlement == "committed":
+                BillingService.quota_commit(
+                    tenant_id=tenant_id,
+                    feature_key=quota_type.billing_key,
+                    reservation_id=reservation_id,
+                    actual_amount=amount,
+                )
+            else:
+                BillingService.quota_release(
+                    tenant_id=tenant_id,
+                    feature_key=quota_type.billing_key,
+                    reservation_id=reservation_id,
+                )
+        except BillingUpstreamInvalidResponseError:
+            logger.exception(
+                "Permanent quota %s error for tenant %s, reservation_id: %s",
+                settlement,
+                tenant_id,
+                reservation_id,
+            )
+            return QuotaSettlementResult.PERMANENT_ERROR
+        except BillingUpstreamUnavailableError:
+            logger.warning(
+                "Retryable quota %s error for tenant %s, reservation_id: %s",
+                settlement,
+                tenant_id,
+                reservation_id,
+                exc_info=True,
+            )
+            return QuotaSettlementResult.RETRYABLE_ERROR
+        except Exception:
+            logger.exception(
+                "Unexpected quota %s error for tenant %s, reservation_id: %s",
+                settlement,
+                tenant_id,
+                reservation_id,
+            )
+            return QuotaSettlementResult.RETRYABLE_ERROR
+        return QuotaSettlementResult.CONFIRMED
 
     @staticmethod
     def check(quota_type: QuotaType, tenant_id: str, amount: int = 1) -> bool:

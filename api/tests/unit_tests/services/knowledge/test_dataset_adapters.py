@@ -5,6 +5,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
+import tasks.dataset_indexing_outbox_task as dataset_indexing_task_module
 from controllers.console.datasets.datasets import (
     DatasetDetailResponse,
     DatasetListResponse,
@@ -22,15 +23,19 @@ from models.dataset import (
     DocumentSegment,
 )
 from models.enums import CreatorUserRole, DatasetQuerySource, IndexingStatus, SegmentStatus
+from models.model import DatasetIndexingOutbox
 from repositories.app.console_repository import ConsoleAppRepository
+from repositories.knowledge.dataset_indexing_outbox_repository import SQLAlchemyDatasetIndexingOutboxRepository
+from repositories.knowledge.external_repository import SQLAlchemyExternalKnowledgeRepository
 from services.enterprise import rbac_service
-from services.knowledge.dataset_access import DatasetNotFoundError
+from services.errors.dataset import DatasetNotFoundError
+from services.knowledge.dataset_service import DatasetService
 from services.knowledge.datasets.adapters import SQLAlchemyDatasetOperations
 from services.knowledge.datasets.application import DatasetListFilter
 from services.knowledge.documents.adapters import SQLAlchemyDocumentOperations
 from services.knowledge.entities.document_creation import DocumentIndexingJobs
 from services.knowledge.entities.knowledge_entities import KnowledgeConfig
-from services.knowledge.resource_scope import DatasetRef
+from services.knowledge.entities.resource_scope import DatasetRef
 from services.rbac import contracts as rbac_contracts
 from services.tag_application_service import CreateTagInput, TagApplicationService, TagBindingInput
 from tests.unit_tests.config_override import apply_config_overrides
@@ -38,6 +43,20 @@ from tests.unit_tests.rbac_fakes import RBACDomain
 
 CONTEXT = RequestContext("request", None, "actor", "tenant")
 REF = DatasetRef("tenant", "dataset")
+
+
+class _UnexpectedActorCredentials:
+    def resolve(
+        self,
+        *,
+        workspace_id: str,
+        actor_id: str,
+        credential_id: str,
+        provider: str,
+        plugin_id: str,
+    ) -> dict[str, object]:
+        del workspace_id, actor_id, credential_id, provider, plugin_id
+        raise AssertionError("dataset adapter test did not select a datasource credential")
 
 
 def dataset(**values: object) -> Dataset:
@@ -100,6 +119,7 @@ def operations(
         tags=application_tags,
         app_queries=ConsoleAppRepository(session_factory=sqlite_session_factory),
         members=rbac_domain.rbac.members,
+        external_templates=SQLAlchemyExternalKnowledgeRepository(session_factory=sqlite_session_factory),
     )
 
 
@@ -219,6 +239,144 @@ def test_create_update_and_api_status_commit_owned_changes(
         assert session.get(Dataset, created["id"]) is not None
 
 
+def test_index_dispatch_observes_committed_settings_and_permissions(
+    operations: SQLAlchemyDatasetOperations,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with sqlite_session_factory.begin() as session:
+        row = session.get(Dataset, REF.dataset_id)
+        assert row is not None
+        row.indexing_technique = "high_quality"
+        row.embedding_model = "previous-model"
+        row.embedding_model_provider = "previous-provider"
+        row.permission = DatasetPermissionEnum.PARTIAL_TEAM
+        session.add(DatasetPermission(tenant_id=REF.tenant_id, dataset_id=REF.dataset_id, account_id="actor"))
+    dispatched: list[tuple[str, str]] = []
+
+    def dispatch(intent_id: str) -> None:
+        with sqlite_session_factory() as observer:
+            intent = observer.get(DatasetIndexingOutbox, intent_id)
+            assert intent is not None
+            row = observer.get(Dataset, intent.dataset_id)
+            assert row is not None
+            assert row.indexing_technique == "economy"
+            assert row.embedding_model is None
+            assert row.embedding_model_provider is None
+            assert row.permission == DatasetPermissionEnum.ALL_TEAM
+            assert row.indexing_request_id == intent.generation_id
+            assert observer.scalar(select(func.count()).select_from(DatasetPermission)) == 0
+        dispatched.append((intent.operation, intent.action or ""))
+
+    monkeypatch.setattr("services.knowledge.dataset_service.enqueue_dataset_indexing_intent", dispatch)
+
+    result = operations.update_dataset(
+        CONTEXT, REF, {"indexing_technique": "economy", "permission": "all_team_members"}
+    )
+
+    assert result["indexing_technique"] == "economy"
+    assert result["partial_member_list"] == []
+    assert dispatched == [("rebuild", "remove")]
+
+
+def test_configuration_patch_survives_broker_failure_and_same_patch_does_not_lose_work(
+    operations: SQLAlchemyDatasetOperations,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with sqlite_session_factory.begin() as session:
+        row = session.get_one(Dataset, REF.dataset_id)
+        row.indexing_technique = "high_quality"
+        row.embedding_model = "previous-model"
+        row.embedding_model_provider = "previous-provider"
+
+    repository = SQLAlchemyDatasetIndexingOutboxRepository(session_factory=sqlite_session_factory)
+    monkeypatch.setattr(dataset_indexing_task_module, "_repository", lambda: repository)
+    monkeypatch.setattr(
+        dataset_indexing_task_module.process_dataset_indexing_intent_task,
+        "delay",
+        lambda _intent_id: (_ for _ in ()).throw(OSError("broker unavailable")),
+    )
+
+    operations.update_dataset(CONTEXT, REF, {"indexing_technique": "economy"})
+    operations.update_dataset(CONTEXT, REF, {"indexing_technique": "economy"})
+
+    with sqlite_session_factory() as session:
+        intents = session.scalars(select(DatasetIndexingOutbox)).all()
+        assert len(intents) == 1
+        intent_id = intents[0].id
+
+    executed: list[tuple[str, str, str]] = []
+    monkeypatch.setattr(
+        dataset_indexing_task_module.deal_dataset_vector_index_task,
+        "run",
+        lambda dataset_id, action, generation_id, **_kwargs: (
+            executed.append((dataset_id, action, generation_id)) or True
+        ),
+    )
+    monkeypatch.setattr(
+        dataset_indexing_task_module.process_dataset_indexing_intent_task,
+        "delay",
+        dataset_indexing_task_module.process_dataset_indexing_intent_task.run,
+    )
+
+    dataset_indexing_task_module.drain_dataset_indexing_outbox_task.run()
+
+    assert len(executed) == 1
+    assert executed[0][:2] == (REF.dataset_id, "remove")
+    with sqlite_session_factory() as session:
+        assert session.get(DatasetIndexingOutbox, intent_id) is None
+
+
+@pytest.mark.parametrize("intent_ids", [(), ("one",), ("one", "two")])
+def test_committed_index_intents_are_dispatched(monkeypatch: pytest.MonkeyPatch, intent_ids: tuple[str, ...]) -> None:
+    dispatched: list[str] = []
+    monkeypatch.setattr("services.knowledge.dataset_service.enqueue_dataset_indexing_intent", dispatched.append)
+
+    DatasetService.dispatch_dataset_indexing(intent_ids)
+
+    assert dispatched == list(intent_ids)
+
+
+@pytest.mark.parametrize("failure_stage", ["response", "permissions"])
+def test_update_failure_rolls_back_settings_and_does_not_dispatch(
+    operations: SQLAlchemyDatasetOperations,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+) -> None:
+    with sqlite_session_factory.begin() as session:
+        row = session.get(Dataset, REF.dataset_id)
+        assert row is not None
+        row.indexing_technique = "high_quality"
+        row.embedding_model = "previous-model"
+        row.embedding_model_provider = "previous-provider"
+    dispatched: list[object] = []
+
+    def fail(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError(f"{failure_stage} failed")
+
+    monkeypatch.setattr("services.knowledge.dataset_service.enqueue_dataset_indexing_intent", dispatched.append)
+    if failure_stage == "response":
+        monkeypatch.setattr(operations, "_detail", fail)
+    else:
+        monkeypatch.setattr(
+            "services.knowledge.datasets.adapters.DatasetPermissionService.clear_partial_member_list", fail
+        )
+
+    with pytest.raises(RuntimeError, match=f"{failure_stage} failed"):
+        operations.update_dataset(CONTEXT, REF, {"indexing_technique": "economy", "permission": "all_team_members"})
+
+    assert dispatched == []
+    with sqlite_session_factory() as observer:
+        row = observer.get(Dataset, REF.dataset_id)
+        assert row is not None
+        assert row.indexing_technique == "high_quality"
+        assert row.embedding_model == "previous-model"
+        assert row.embedding_model_provider == "previous-provider"
+        assert observer.scalar(select(func.count()).select_from(DatasetIndexingOutbox)) == 0
+
+
 @pytest.mark.parametrize("entry_point", ["empty", "documents"])
 @pytest.mark.parametrize("rbac_enabled", [False, True])
 def test_created_dataset_initializes_rbac_access(
@@ -231,8 +389,14 @@ def test_created_dataset_initializes_rbac_access(
     apply_config_overrides(monkeypatch, RBAC_ENABLED=rbac_enabled)
 
     def save_documents(
-        created_dataset: Dataset, _config: KnowledgeConfig, _account: Account, *, session: Session
+        created_dataset: Dataset,
+        _config: KnowledgeConfig,
+        _account: Account,
+        *,
+        session: Session,
+        website_job_ref: None,
     ) -> tuple[list[Document], str, DocumentIndexingJobs]:
+        assert website_job_ref is None
         row = document(id="created-document", dataset_id=created_dataset.id, data_source_type="upload_file")
         session.add(row)
         session.flush()
@@ -256,7 +420,10 @@ def test_created_dataset_initializes_rbac_access(
             )
             dataset_id = result["id"]
         else:
-            result = SQLAlchemyDocumentOperations(session_factory=sqlite_session_factory).initialize_dataset(
+            result = SQLAlchemyDocumentOperations(
+                session_factory=sqlite_session_factory,
+                actor_credentials=_UnexpectedActorCredentials(),
+            ).initialize_dataset(
                 CONTEXT,
                 {
                     "indexing_technique": "economy",

@@ -46,6 +46,7 @@ from models.model import Conversation, Message, MessageAgentThought, MessageFile
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 logger = logging.getLogger(__name__)
 _file_access_controller = DatabaseFileAccessController()
@@ -56,6 +57,7 @@ class BaseAgentRunner(AppRunner):
         self,
         *,
         execution_driver: "WorkflowRunDriver",
+        external_retrieval: "ExternalDatasetRetriever",
         session: Session,
         tenant_id: str,
         application_generate_entity: AgentChatAppGenerateEntity,
@@ -71,6 +73,7 @@ class BaseAgentRunner(AppRunner):
         prompt_messages: list[PromptMessage] | None = None,
     ):
         self._execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
         self.tenant_id = tenant_id
         self.application_generate_entity = application_generate_entity
         self.conversation = conversation
@@ -98,6 +101,7 @@ class BaseAgentRunner(AppRunner):
         )
         self.dataset_tools = DatasetRetrieverTool.get_dataset_tools(
             session=session,
+            external_retrieval=external_retrieval,
             tenant_id=tenant_id,
             dataset_ids=app_config.dataset.dataset_ids if app_config.dataset else [],
             retrieve_config=app_config.dataset.retrieve_config if app_config.dataset else None,
@@ -154,6 +158,7 @@ class BaseAgentRunner(AppRunner):
             agent_tool=tool,
             user_id=self.user_id,
             invoke_from=self.application_generate_entity.invoke_from,
+            external_retrieval=self._external_retrieval,
         )
         assert tool_entity.entity.description
         message_tool = PromptMessageTool(

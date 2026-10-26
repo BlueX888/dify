@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from decimal import Decimal
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import create_autospec
 
 from pytest_mock import MockerFixture
 from sqlalchemy.orm import Session
@@ -12,8 +13,10 @@ import core.workflow.nodes.human_input.entities  # noqa: F401
 from core.app.apps.advanced_chat import app_generator as adv_app_gen_module
 from core.app.apps.workflow import app_generator as wf_app_gen_module
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow import node_factory as node_factory_module
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.system_variables import build_system_variables
 from graphon.engine import Engine
 from graphon.engine.command import InMemoryChannel
@@ -180,6 +183,8 @@ def _build_graph(runtime_state: RuntimeState, *, pause_on: str | None) -> Graph:
     node_factory = DifyNodeFactory(
         init_params=params,
         runtime_state=runtime_state,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        knowledge_index_runtime=build_knowledge_index_runtime(),
     )
 
     return Graph.init(graph_config=graph_config, node_factory=node_factory, root_node_id="start")
@@ -288,7 +293,10 @@ def test_workflow_app_pause_resume_matches_baseline(mocker: MockerFixture):
 
     resumed_state = RuntimeState.from_snapshot(snapshot)
 
-    generator = wf_app_gen_module.WorkflowAppGenerator(execution_driver=WorkflowRunAgg.run)
+    generator = wf_app_gen_module.WorkflowAppGenerator(
+        execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+    )
 
     def _fake_generate(**kwargs):
         state: RuntimeState = kwargs["graph_runtime_state"]
@@ -332,7 +340,10 @@ def test_advanced_chat_pause_resume_matches_baseline(mocker: MockerFixture, unbo
 
     resumed_state = RuntimeState.from_snapshot(snapshot)
 
-    generator = adv_app_gen_module.AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run)
+    generator = adv_app_gen_module.AdvancedChatAppGenerator(
+        execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+    )
 
     def _fake_generate(**kwargs):
         state: RuntimeState = kwargs["graph_runtime_state"]

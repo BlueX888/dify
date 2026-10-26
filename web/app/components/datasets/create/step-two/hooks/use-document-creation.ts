@@ -39,6 +39,7 @@ type UseDocumentCreationOptions = {
   crawlOptions?: CrawlOptions
   websiteCrawlProvider?: DataSourceProvider
   websiteCrawlJobId?: string
+  websiteCrawlSourceHandle?: string
   canCreateDocument?: boolean
   // Callbacks
   onStepChange?: (delta: number) => void
@@ -72,6 +73,7 @@ export const useDocumentCreation = (options: UseDocumentCreationOptions) => {
     crawlOptions,
     websiteCrawlProvider = DataSourceProvider.jinaReader,
     websiteCrawlJobId = '',
+    websiteCrawlSourceHandle,
     canCreateDocument = true,
     onStepChange,
     updateIndexingTypeCache,
@@ -195,6 +197,7 @@ export const useDocumentCreation = (options: UseDocumentCreationOptions) => {
         params.data_source!.info_list.website_info_list = getWebsiteInfo({
           websiteCrawlProvider,
           websiteCrawlJobId,
+          websiteCrawlSourceHandle,
           websitePages,
           crawlOptions,
         })
@@ -211,6 +214,7 @@ export const useDocumentCreation = (options: UseDocumentCreationOptions) => {
       websitePages,
       websiteCrawlProvider,
       websiteCrawlJobId,
+      websiteCrawlSourceHandle,
       crawlOptions,
     ],
   )

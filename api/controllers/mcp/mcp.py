@@ -12,6 +12,7 @@ from controllers.mcp import mcp_ns
 from core.db.session_factory import session_factory
 from core.mcp import types as mcp_types
 from core.mcp.server.streamable_http import handle_mcp_request, negotiate_protocol_version
+from extensions.ext_application_services import application_services
 from fields.base import ResponseModel
 from graphon.variables.input_entities import VariableEntity, VariableEntityType
 from libs import helper
@@ -337,5 +338,13 @@ class MCPAppApi(Resource):
             end_user = self._create_end_user(client_name, app.tenant_id, app.id, mcp_server.id, session)
 
         return handle_mcp_request(
-            session, app, mcp_request, user_input_form, mcp_server, end_user, request_id, protocol_version
+            session,
+            app,
+            mcp_request,
+            user_input_form,
+            mcp_server,
+            end_user,
+            request_id,
+            protocol_version,
+            external_retrieval=application_services().knowledge.external_retrieval,
         )

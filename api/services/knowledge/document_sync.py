@@ -1,10 +1,15 @@
-"""Request-side document synchronization use cases."""
+"""Document synchronization request and execution contracts."""
 
+from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
 from machinery.context import RequestContext
 from services.knowledge.dataset_access import DatasetAccess
-from services.knowledge.resource_scope import DatasetRef, DocumentRef
+from services.knowledge.entities.resource_scope import DatasetRef, DocumentRef
+
+NOTION_SYNC_LEASE_SECONDS = 300
+NOTION_SYNC_HEARTBEAT_SECONDS = 30
 
 
 class SyncDocumentRecord(NamedTuple):
@@ -12,6 +17,23 @@ class SyncDocumentRecord(NamedTuple):
 
     id: str
     data_source_type: str
+
+
+@dataclass(frozen=True)
+class ClaimedNotionDocument:
+    """Immutable inputs owned by one persisted Notion synchronization claim."""
+
+    ref: DocumentRef
+    claim_id: str
+    workspace_id: str
+    page_id: str
+    page_type: str
+    page_edited_time: str | None
+    credential_id: str | None
+    source_info: Mapping[str, object]
+    index_type: str
+    recovery_required: bool
+    dataset_generation_id: str | None = None
 
 
 class DocumentSyncReader(Protocol):

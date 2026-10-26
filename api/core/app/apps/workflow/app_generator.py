@@ -60,6 +60,7 @@ from services.workflow_draft_variable_service import DraftVarLoader, WorkflowDra
 if TYPE_CHECKING:
     from controllers.console.app.workflow import LoopNodeRunPayload
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 logger = logging.getLogger(__name__)
 
@@ -71,8 +72,14 @@ def _extract_trace_session_id_from_debug_args(args: Mapping[str, Any] | Any) -> 
 
 
 class WorkflowAppGenerator(BaseAppGenerator):
-    def __init__(self, *, execution_driver: WorkflowRunDriver) -> None:
+    def __init__(
+        self,
+        *,
+        execution_driver: WorkflowRunDriver,
+        external_retrieval: ExternalDatasetRetriever,
+    ) -> None:
         self._execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
 
     @staticmethod
     def _ensure_snippet_start_node_in_worker(*, session: Session, workflow: Workflow) -> Workflow:
@@ -104,6 +111,7 @@ class WorkflowAppGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: Literal[True],
         call_depth: int,
+        task_id: str | None = None,
         workflow_run_id: str | uuid.UUID | None = None,
         triggered_from: WorkflowRunTriggeredFrom | None = None,
         root_node_id: str | None = None,
@@ -123,6 +131,7 @@ class WorkflowAppGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: Literal[False],
         call_depth: int,
+        task_id: str | None = None,
         workflow_run_id: str | uuid.UUID | None = None,
         triggered_from: WorkflowRunTriggeredFrom | None = None,
         root_node_id: str | None = None,
@@ -142,6 +151,7 @@ class WorkflowAppGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: bool,
         call_depth: int,
+        task_id: str | None = None,
         workflow_run_id: str | uuid.UUID | None = None,
         triggered_from: WorkflowRunTriggeredFrom | None = None,
         root_node_id: str | None = None,
@@ -160,6 +170,7 @@ class WorkflowAppGenerator(BaseAppGenerator):
         invoke_from: InvokeFrom,
         streaming: bool = True,
         call_depth: int = 0,
+        task_id: str | None = None,
         workflow_run_id: str | uuid.UUID | None = None,
         triggered_from: WorkflowRunTriggeredFrom | None = None,
         root_node_id: str | None = None,
@@ -218,7 +229,7 @@ class WorkflowAppGenerator(BaseAppGenerator):
                 )
             # init application generate entity
             application_generate_entity = WorkflowAppGenerateEntity(
-                task_id=str(uuid.uuid4()),
+                task_id=task_id or str(uuid.uuid4()),
                 app_config=app_config,
                 file_upload_config=file_extra_config,
                 inputs=inputs,
@@ -628,7 +639,6 @@ class WorkflowAppGenerator(BaseAppGenerator):
         :param flask_app: Flask app
         :param application_generate_entity: application generate entity
         :param queue_manager: queue manager
-        :param workflow_thread_pool_id: workflow thread pool id
         :return:
         """
         with preserve_flask_contexts(flask_app, context_vars=context):
@@ -668,6 +678,7 @@ class WorkflowAppGenerator(BaseAppGenerator):
             runner = WorkflowAppRunner(
                 application_generate_entity=application_generate_entity,
                 execution_driver=self._execution_driver,
+                external_retrieval=self._external_retrieval,
                 queue_manager=queue_manager,
                 variable_loader=variable_loader,
                 workflow=workflow,

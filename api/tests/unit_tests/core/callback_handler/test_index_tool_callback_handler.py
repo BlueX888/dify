@@ -228,6 +228,36 @@ class TestOnToolEnd:
         sqlite_session.expire_all()
         assert sqlite_session.get(DocumentSegment, segment.id).hit_count == 1  # type: ignore[union-attr]
 
+    def test_on_tool_end_uses_finalized_segment_identity(
+        self,
+        handler: DatasetIndexToolCallbackHandler,
+        sqlite_session: Session,
+        caller_session_boundary: _CallerSessionBoundary,
+    ) -> None:
+        dataset_document = _dataset_document(doc_form=IndexStructureType.PARENT_CHILD_INDEX)
+        sqlite_session.add(dataset_document)
+        sqlite_session.flush()
+        selected_segment = _segment(dataset_document, index_node_id="selected-parent")
+        stale_segment = _segment(dataset_document, index_node_id="stale-parent")
+        stale_segment.position = 2
+        sqlite_session.add_all([selected_segment, stale_segment])
+        sqlite_session.commit()
+        document = Document(
+            page_content="selected content",
+            metadata={
+                "dataset_id": dataset_document.dataset_id,
+                "document_id": dataset_document.id,
+                "doc_id": stale_segment.index_node_id,
+                "segment_id": selected_segment.id,
+            },
+        )
+
+        handler.on_tool_end([document], caller_session_boundary.session)
+
+        sqlite_session.expire_all()
+        assert sqlite_session.get(DocumentSegment, selected_segment.id).hit_count == 1  # type: ignore[union-attr]
+        assert sqlite_session.get(DocumentSegment, stale_segment.id).hit_count == 0  # type: ignore[union-attr]
+
     def test_on_tool_end_non_parent_child_index(
         self,
         handler: DatasetIndexToolCallbackHandler,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from pydantic import ValidationError
@@ -12,6 +12,7 @@ from core.app.apps.workflow.app_runner import WorkflowAppRunner
 from core.app.apps.workflow_app_runner import WorkflowBasedAppRunner
 from core.app.entities.app_invoke_entities import InvokeFrom, WorkflowAppGenerateEntity
 from core.credit_usage import CreditUsageAppType
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.system_variables import default_system_variables
 from graphon.runtime import RuntimeState, VariablePool
 from models.model import AppMode
@@ -80,6 +81,7 @@ def test_run_uses_single_node_execution_branch(
     runner = WorkflowAppRunner(
         application_generate_entity=app_generate_entity,
         queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         variable_loader=MagicMock(),
         workflow=workflow,
         system_user_id="system-user",
@@ -124,6 +126,7 @@ def test_run_uses_single_node_execution_branch(
 def test_single_node_run_validates_target_node_config(queue_manager: WorkflowAppQueueManager) -> None:
     runner = WorkflowBasedAppRunner(
         queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         variable_loader=MagicMock(),
         app_id="app",
     )
@@ -160,6 +163,7 @@ def test_single_node_run_validates_target_node_config(queue_manager: WorkflowApp
 def test_single_node_run_rejects_invalid_loop_count(queue_manager: WorkflowAppQueueManager) -> None:
     runner = WorkflowBasedAppRunner(
         queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         app_id="app",
     )
 
@@ -231,6 +235,7 @@ def test_run_adds_inputs_with_snippet_compatible_start_aliases(queue_manager: Wo
     runner = WorkflowAppRunner(
         application_generate_entity=app_generate_entity,
         queue_manager=queue_manager,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
         variable_loader=MagicMock(),
         workflow=workflow,
         system_user_id="system-user",

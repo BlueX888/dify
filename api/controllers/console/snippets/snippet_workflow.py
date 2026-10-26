@@ -46,6 +46,7 @@ from controllers.console.wraps import (
 )
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.db.session_factory import session_factory
+from extensions.ext_application_services import application_services
 from fields.workflow_run_fields import (
     WorkflowRunDetailResponse,
     WorkflowRunNodeExecutionListResponse,
@@ -643,6 +644,7 @@ class SnippetDraftNodeRunApi(Resource):
         files = SnippetGenerateService.parse_files(draft_workflow, req_data.files)
 
         workflow_node_execution = SnippetGenerateService.run_draft_node(
+            external_retrieval=application_services().knowledge.external_retrieval,
             snippet=snippet,
             node_id=node_id,
             user_inputs=user_inputs,
@@ -733,6 +735,7 @@ class SnippetDraftRunIterationNodeApi(Resource):
 
         try:
             response = SnippetGenerateService.generate_single_iteration(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 snippet=snippet,
                 user=current_user,
                 node_id=node_id,
@@ -784,6 +787,7 @@ class SnippetDraftRunLoopNodeApi(Resource):
 
         try:
             response = SnippetGenerateService.generate_single_loop(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 snippet=snippet,
                 user=current_user,
                 node_id=node_id,
@@ -828,6 +832,7 @@ class SnippetDraftWorkflowRunApi(Resource):
 
         try:
             response = SnippetGenerateService.generate(
+                external_retrieval=application_services().knowledge.external_retrieval,
                 snippet=snippet,
                 user=current_user,
                 args=args,

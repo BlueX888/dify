@@ -21,6 +21,7 @@ from core.app.layers.pause_state_persist_layer import (
     _AdvancedChatAppGenerateEntityWrapper,
     _WorkflowGenerateEntityWrapper,
 )
+from core.app.layers.trigger_post_layer import TriggerPostLayer
 from core.db.session_factory import session_factory
 from core.repositories.factory import WorkflowExecutionRepository, WorkflowNodeExecutionRepository
 from core.repositories.human_input_repository import HumanInputFormRecord, HumanInputFormSubmissionRepository
@@ -55,7 +56,12 @@ from graphon.file.runtime import use_workflow_file_runtime
 from graphon.runtime.container_state import CustomContainerRunState
 from repositories.factory import DifyAPIRepositoryFactory
 from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
-from repositories.sqlalchemy_api_workflow_run_repository import WorkflowPauseStoppedError
+from repositories.sqlalchemy_api_workflow_run_repository import (
+    WorkflowPausePublicationOutcomeUnknownError,
+    WorkflowPausePublicationSupersededError,
+    WorkflowPauseStoppedError,
+    WorkflowPauseTriggerOwnershipLostError,
+)
 from repositories.workflow_tool_source_repository import SQLAlchemyWorkflowToolSourceRepository
 from services.conversation_variable_updater import ConversationVariableUpdater
 from services.workflow_persistence import PersistenceWorkflowInfo, WorkflowPersistenceLayer
@@ -159,6 +165,15 @@ class WorkflowRunAgg:
                 ConversationVariablePersistenceLayer(ConversationVariableUpdater(session_factory.get_session_maker()))
             )
         self._application_layers = (*application_layers, *prepared.application_layers)
+        self._deferred_trigger_layers = (
+            tuple(
+                layer
+                for layer in self._application_layers
+                if isinstance(layer, TriggerPostLayer) and layer.defer_owned_pause()
+            )
+            if pause_state_config is not None
+            else ()
+        )
         for layer in self._application_layers:
             self._entry.graph_engine.add_layer(layer)
         self.index = WorkflowRunIndex(histories)
@@ -274,9 +289,33 @@ class WorkflowRunAgg:
                     aborted = GraphRunAbortedEvent(reason="User requested stop")
                     for layer in self._application_layers:
                         layer.on_event(aborted)
+                    # The first stop call can only arm a RUNNING execution. The
+                    # aborted persistence above makes it terminal; retry once so
+                    # pending forms and any unpublished pause remnants are cleaned.
+                    self._api_run_repository().stop_paused_workflow_task(
+                        tenant_id=self._run_context.tenant_id,
+                        app_id=self._prepared.generate_entity.app_config.app_id,
+                        task_id=self._prepared.generate_entity.task_id,
+                        owner=None,
+                    )
                     yield aborted
                 else:
                     yield paused_event
+        except WorkflowPausePublicationOutcomeUnknownError as error:
+            for layer in self._deferred_trigger_layers:
+                layer.mark_pause_publication_outcome_unknown()
+            logger.warning("Workflow pause publication outcome is unknown: %s", error)
+            yield GraphRunFailedEvent(
+                error=str(error), exceptions_count=self._runtime_state.graph_execution.exceptions_count
+            )
+        except (WorkflowPauseTriggerOwnershipLostError, WorkflowPausePublicationSupersededError) as error:
+            # A successor owns this trigger. This attempt may close its local
+            # stream, but an uncertain/foreign-owned attempt must not run
+            # terminal persistence layers against durable workflow state.
+            logger.warning("Workflow pause publication could not be confirmed: %s", error)
+            yield GraphRunFailedEvent(
+                error=str(error), exceptions_count=self._runtime_state.graph_execution.exceptions_count
+            )
         except Exception as error:
             logger.exception("Workflow run orchestration failed")
             failed = GraphRunFailedEvent(
@@ -366,12 +405,32 @@ class WorkflowRunAgg:
         )
         execution.finished_at = None
         self._persistence_layer.persist_unfinished_nodes_synchronously()
-        self._workflow_execution_repository.save_synchronously(execution)
         if config is not None and snapshot is not None:
+            trigger_updates = tuple(layer.prepare_deferred_pause() for layer in self._deferred_trigger_layers)
             repository = self._api_run_repository()
-            repository.create_workflow_pause(
-                workflow_run_id=self._run_id,
+            published_pause = repository.publish_workflow_pause(
+                workflow_execution=execution,
                 state_owner_user_id=config.state_owner_user_id,
                 state=snapshot,
                 pause_reasons=self.pause_reasons,
+                trigger_updates=trigger_updates,
             )
+            history_revision = published_pause.history_revision
+            history_claim_id = published_pause.history_claim_id
+            if history_revision is None or history_claim_id is None:
+                raise AssertionError("atomic workflow pause did not return its history claim")
+            try:
+                self._workflow_execution_repository.publish_committed_pause(
+                    execution,
+                    history_revision=history_revision,
+                    history_claim_id=history_claim_id,
+                )
+            except Exception:
+                # SQL control and the resumable snapshot are already committed.
+                # The configured history backend owns its retry policy; a
+                # failed append must not turn a valid pause into FAILED.
+                logger.exception("Failed to publish committed workflow pause history: %s", self._run_id)
+            for layer, trigger_update in zip(self._deferred_trigger_layers, trigger_updates, strict=True):
+                layer.confirm_deferred_pause(trigger_update)
+        else:
+            self._workflow_execution_repository.save_synchronously(execution)

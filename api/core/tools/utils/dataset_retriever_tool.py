@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from core.app.app_config.entities import DatasetRetrieveConfigEntity
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.callback_handler.index_tool_callback_handler import DatasetIndexToolCallbackHandler
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.tools.__base.tool import Tool
 from core.tools.__base.tool_runtime import ToolRuntime
@@ -19,6 +20,7 @@ from core.tools.entities.tool_entities import (
     ToolProviderType,
 )
 from core.tools.utils.dataset_retriever.dataset_retriever_base_tool import DatasetRetrieverBaseTool
+from core.workflow.node_runtime import build_retrieval_finalizer
 
 
 class DatasetRetrieverTool(Tool):
@@ -29,6 +31,7 @@ class DatasetRetrieverTool(Tool):
     @staticmethod
     def get_dataset_tools(
         session: Session,
+        external_retrieval: ExternalDatasetRetriever,
         tenant_id: str,
         dataset_ids: list[str],
         retrieve_config: DatasetRetrieveConfigEntity | None,
@@ -47,7 +50,10 @@ class DatasetRetrieverTool(Tool):
         if retrieve_config is None:
             return []
 
-        feature = DatasetRetrieval()
+        feature = DatasetRetrieval(
+            external_retrieval=external_retrieval,
+            retrieval_finalizer=build_retrieval_finalizer(),
+        )
 
         # save original retrieve strategy, and set retrieve strategy to SINGLE
         # Agent only support SINGLE mode

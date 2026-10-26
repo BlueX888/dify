@@ -5,10 +5,11 @@ import logging
 import uuid
 from collections.abc import Callable, Generator, Mapping
 from contextlib import nullcontext
+from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import ANY, MagicMock
+from unittest.mock import ANY, MagicMock, create_autospec
 
 import pytest
 from pydantic import BaseModel
@@ -16,31 +17,43 @@ from sqlalchemy import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.app.app_config.entities import WorkflowUIBasedAppConfig
+from core.app.apps.advanced_chat.app_generator import AdvancedChatAppGenerator
 from core.app.apps.workflow.app_generator import WorkflowAppGenerator
 from core.app.entities.app_invoke_entities import AdvancedChatAppGenerateEntity, InvokeFrom, WorkflowAppGenerateEntity
 from core.app.layers.pause_state_persist_layer import (
+    PauseStateLayerConfig,
     WorkflowResumptionContext,
     _AdvancedChatAppGenerateEntityWrapper,
     _WorkflowGenerateEntityWrapper,
 )
+from core.app.layers.trigger_post_layer import TriggerPostLayer
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+from graphon.engine.layer import Layer
 from graphon.entities import WorkflowStartReason
 from graphon.enums import WorkflowExecutionStatus
 from graphon.runtime import RuntimeState, VariablePool
 from models.account import Account
-from models.enums import ConversationFromSource, CreatorUserRole, WorkflowRunTriggeredFrom
+from models.enums import (
+    AppTriggerType,
+    ConversationFromSource,
+    CreatorUserRole,
+    WorkflowRunTriggeredFrom,
+    WorkflowTriggerStatus,
+)
 from models.model import App, AppMode, Conversation, Message
+from models.trigger import WorkflowTriggerLog
 from models.workflow import Workflow, WorkflowPause, WorkflowRun, WorkflowType
 from repositories.entities.workflow_pause import WorkflowPauseEntity
 from repositories.sqlalchemy_api_workflow_run_repository import (
     DifyAPISQLAlchemyWorkflowRunRepository,
-    WorkflowRunNotPausedError,
     _WorkflowRunError,
 )
-from tasks import async_workflow_tasks
+from services.workflow.queue_dispatcher import QueuePriority
 from tasks.app_generate import workflow_execute_task as workflow_execute_task_module
 from tasks.app_generate.workflow_execute_task import (
     AppExecutionParams,
     _AppRunner,
+    _get_trigger_resume_layers,
     _publish_streaming_response,
     _resume_advanced_chat,
     _resume_app_execution,
@@ -52,6 +65,29 @@ class _StreamEventModel(BaseModel):
     event: object | None = None
     task_id: object | None = None
     message: object | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeServicesStub:
+    external_retrieval: ExternalDatasetRetriever
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationServicesStub:
+    knowledge: _KnowledgeServicesStub
+
+
+@dataclass(frozen=True, slots=True)
+class _DatabaseStub:
+    engine: Engine
+
+
+@pytest.fixture(autouse=True)
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> ExternalDatasetRetriever:
+    retriever = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = _ApplicationServicesStub(knowledge=_KnowledgeServicesStub(external_retrieval=retriever))
+    monkeypatch.setattr("extensions.ext_application_services.application_services", lambda: services)
+    return retriever
 
 
 def _build_advanced_chat_generate_entity(conversation_id: str | None) -> AdvancedChatAppGenerateEntity:
@@ -306,6 +342,92 @@ def _persist_resumption_models(
         ]
         session.add(conversation)
         session.add_all(messages)
+
+
+@pytest.mark.parametrize(
+    ("app_mode", "generator_class", "generator_name"),
+    [
+        (AppMode.ADVANCED_CHAT, AdvancedChatAppGenerator, "AdvancedChatAppGenerator"),
+        (AppMode.WORKFLOW, WorkflowAppGenerator, "WorkflowAppGenerator"),
+    ],
+)
+def test_app_runner_forwards_external_retrieval_to_generator(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
+    app_mode: AppMode,
+    generator_class: type[AdvancedChatAppGenerator] | type[WorkflowAppGenerator],
+    generator_name: str,
+) -> None:
+    exec_params = AppExecutionParams(
+        app_id="app-id",
+        workflow_id="workflow-id",
+        tenant_id="tenant-id",
+        app_mode=app_mode,
+        user={"TYPE": "account", "user_id": "user-id"},
+        args={"inputs": {}, "query": "test"},
+        invoke_from=InvokeFrom.EXPLORE,
+        streaming=False,
+        workflow_run_id="workflow-run-id",
+    )
+    runner = _AppRunner(
+        session_factory=sqlite_session_factory,
+        exec_params=exec_params,
+        external_retrieval=external_retrieval,
+    )
+    generator = create_autospec(generator_class, spec_set=True)
+    generator.return_value.generate.return_value = {"result": "ok"}
+    monkeypatch.setattr(workflow_execute_task_module, generator_name, generator)
+
+    result = runner._run_app(
+        app=_make_app(),
+        workflow=_make_workflow(),
+        user=_make_account(),
+        pause_state_config=create_autospec(PauseStateLayerConfig, instance=True, spec_set=True),
+        session=create_autospec(Session, instance=True, spec_set=True),
+    )
+
+    assert result == {"result": "ok"}
+    assert generator.call_args.kwargs["external_retrieval"] is external_retrieval
+
+
+def test_workflow_execution_task_forwards_external_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    sqlite_engine: Engine,
+    external_retrieval: ExternalDatasetRetriever,
+) -> None:
+    exec_params = AppExecutionParams(
+        app_id="app-id",
+        workflow_id="workflow-id",
+        tenant_id="tenant-id",
+        app_mode=AppMode.WORKFLOW,
+        user={"TYPE": "account", "user_id": "user-id"},
+        args={"inputs": {}},
+        invoke_from=InvokeFrom.EXPLORE,
+        streaming=False,
+        workflow_run_id="workflow-run-id",
+    )
+    runner = create_autospec(_AppRunner, spec_set=True)
+    monkeypatch.setattr(workflow_execute_task_module, "_AppRunner", runner)
+    monkeypatch.setattr(workflow_execute_task_module, "db", _DatabaseStub(engine=sqlite_engine))
+
+    workflow_execute_task_module.workflow_based_app_execution_task.run(exec_params.model_dump_json())
+
+    assert runner.call_args.kwargs["external_retrieval"] is external_retrieval
+    runner.return_value.run.assert_called_once_with()
+
+
+def test_resume_execution_task_forwards_external_retrieval(
+    monkeypatch: pytest.MonkeyPatch,
+    external_retrieval: ExternalDatasetRetriever,
+) -> None:
+    resume = create_autospec(_resume_app_execution, spec_set=True)
+    monkeypatch.setattr(workflow_execute_task_module, "_resume_app_execution", resume)
+    payload = {"workflow_run_id": "workflow-run-id"}
+
+    workflow_execute_task_module.resume_app_execution.run(payload)
+
+    resume.assert_called_once_with(payload, external_retrieval=external_retrieval)
 
 
 @pytest.mark.parametrize(
@@ -674,6 +796,7 @@ def test_app_runner_streaming_failure_publishes_started_then_failed_workflow_fin
     mock_topic: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     exec_params = AppExecutionParams(
         app_id="app-id",
@@ -687,7 +810,11 @@ def test_app_runner_streaming_failure_publishes_started_then_failed_workflow_fin
         workflow_run_id="workflow-run-id",
     )
     _persist_app_and_workflow(sqlite_session_factory)
-    runner = _AppRunner(session_factory=sqlite_session_factory, exec_params=exec_params)
+    runner = _AppRunner(
+        session_factory=sqlite_session_factory,
+        exec_params=exec_params,
+        external_retrieval=external_retrieval,
+    )
 
     monkeypatch.setattr(runner, "_resolve_user", _make_account)
     monkeypatch.setattr(runner, "_setup_flask_context", lambda _user: nullcontext())
@@ -724,6 +851,7 @@ def test_app_runner_streaming_failure_publishes_started_then_failed_workflow_fin
 
 def test_app_runner_resolves_account_without_switching_tenant(
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     account_id = str(uuid.uuid4())
     exec_params = AppExecutionParams(
@@ -742,7 +870,11 @@ def test_app_runner_resolves_account_without_switching_tenant(
         account.id = account_id
         session.add(account)
         session.commit()
-    runner = _AppRunner(session_factory=sqlite_session_factory, exec_params=exec_params)
+    runner = _AppRunner(
+        session_factory=sqlite_session_factory,
+        exec_params=exec_params,
+        external_retrieval=external_retrieval,
+    )
 
     resolved_user = runner._resolve_user()
 
@@ -768,6 +900,7 @@ def test_app_runner_streaming_failure_keeps_existing_pre_runtime_helper_behavior
     mock_topic: MagicMock,
     monkeypatch: pytest.MonkeyPatch,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     exec_params = AppExecutionParams(
         app_id="app-id",
@@ -781,7 +914,11 @@ def test_app_runner_streaming_failure_keeps_existing_pre_runtime_helper_behavior
         workflow_run_id="workflow-run-id",
     )
     _persist_app_and_workflow(sqlite_session_factory)
-    runner = _AppRunner(session_factory=sqlite_session_factory, exec_params=exec_params)
+    runner = _AppRunner(
+        session_factory=sqlite_session_factory,
+        exec_params=exec_params,
+        external_retrieval=external_retrieval,
+    )
 
     monkeypatch.setattr(runner, "_resolve_user", _make_account)
     monkeypatch.setattr(runner, "_setup_flask_context", lambda _user: nullcontext())
@@ -802,6 +939,7 @@ def test_app_runner_streaming_failure_keeps_existing_pre_runtime_helper_behavior
 def test_app_runner_streaming_success_calls_publish_streaming_response_with_full_signature(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     exec_params = AppExecutionParams(
         app_id="app-id",
@@ -815,7 +953,11 @@ def test_app_runner_streaming_success_calls_publish_streaming_response_with_full
         workflow_run_id="workflow-run-id",
     )
     _persist_app_and_workflow(sqlite_session_factory)
-    runner = _AppRunner(session_factory=sqlite_session_factory, exec_params=exec_params)
+    runner = _AppRunner(
+        session_factory=sqlite_session_factory,
+        exec_params=exec_params,
+        external_retrieval=external_retrieval,
+    )
     response_stream = _single_event_generator({"event": "message"})
     publish_streaming_response = MagicMock()
 
@@ -843,6 +985,7 @@ def test_resume_app_execution_queries_message_by_conversation_and_workflow_run(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: Engine,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     workflow_run_id = "run-id"
     conversation_id = "conversation-id"
@@ -884,18 +1027,20 @@ def test_resume_app_execution_queries_message_by_conversation_and_workflow_run(
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task._resume_advanced_chat", resume_advanced_chat)
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task._resume_workflow", MagicMock())
 
-    _resume_app_execution({"workflow_run_id": workflow_run_id})
+    _resume_app_execution({"workflow_run_id": workflow_run_id}, external_retrieval=external_retrieval)
 
     workflow_run_repo.resume_workflow_pause.assert_called_once_with(workflow_run_id, pause_entity, before_resume=ANY)
     resume_advanced_chat.assert_called_once()
     assert resume_advanced_chat.call_args.kwargs["conversation"].id == conversation_id
     assert resume_advanced_chat.call_args.kwargs["message"].id == "expected-message-id"
+    assert resume_advanced_chat.call_args.kwargs["external_retrieval"] is external_retrieval
 
 
 def test_resume_app_execution_returns_early_when_advanced_chat_missing_conversation_id(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: Engine,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     workflow_run_id = "run-id"
     _persist_resumption_models(sqlite_session_factory, workflow_run_id=workflow_run_id)
@@ -931,7 +1076,7 @@ def test_resume_app_execution_returns_early_when_advanced_chat_missing_conversat
     resume_advanced_chat = MagicMock()
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task._resume_advanced_chat", resume_advanced_chat)
 
-    _resume_app_execution({"workflow_run_id": workflow_run_id})
+    _resume_app_execution({"workflow_run_id": workflow_run_id}, external_retrieval=external_retrieval)
 
     workflow_run_repo.resume_workflow_pause.assert_not_called()
     resume_advanced_chat.assert_not_called()
@@ -941,6 +1086,7 @@ def test_resume_app_execution_clears_stale_cancellation_signals_before_resuming(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: Engine,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     """A resumed run reuses the paused task ID, so it must not inherit its cancellation signals.
 
@@ -986,9 +1132,10 @@ def test_resume_app_execution_clears_stale_cancellation_signals_before_resuming(
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task.clear_app_task_cancellation_signals", clear_signals)
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task._resume_workflow", resume_workflow)
 
-    _resume_app_execution({"workflow_run_id": workflow_run_id})
+    _resume_app_execution({"workflow_run_id": workflow_run_id}, external_retrieval=external_retrieval)
 
     clear_signals.assert_called_once_with(generate_entity.task_id)
+    assert resume_workflow.call_args.kwargs["external_retrieval"] is external_retrieval
     # Clearing after the engine started would let it observe the stale abort first.
     assert calls == [f"clear:{generate_entity.task_id}", "resume"]
 
@@ -997,6 +1144,7 @@ def test_resume_app_execution_keeps_cancellation_signals_when_resume_is_abandone
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: Engine,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     """No attempt is starting, so nothing may clear the signals guarding this task."""
     workflow_run_id = "run-id"
@@ -1035,12 +1183,12 @@ def test_resume_app_execution_keeps_cancellation_signals_when_resume_is_abandone
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task.clear_app_task_cancellation_signals", clear_signals)
     monkeypatch.setattr("tasks.app_generate.workflow_execute_task._resume_advanced_chat", MagicMock())
 
-    _resume_app_execution({"workflow_run_id": workflow_run_id})
+    _resume_app_execution({"workflow_run_id": workflow_run_id}, external_retrieval=external_retrieval)
 
     clear_signals.assert_not_called()
 
 
-@pytest.mark.parametrize("entry_point", ["workflow", "chat", "async"])
+@pytest.mark.parametrize("entry_point", ["workflow", "chat"])
 @pytest.mark.parametrize(
     "scenario",
     [
@@ -1060,6 +1208,7 @@ def test_resume_recovers_legacy_task_before_claiming_pause(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_engine: Engine,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
     entry_point: str,
     scenario: str,
 ) -> None:
@@ -1112,14 +1261,12 @@ def test_resume_recovers_legacy_task_before_claiming_pause(
     )
     monkeypatch.setattr("repositories.sqlalchemy_api_workflow_run_repository.storage.delete", lambda _: None)
     repository = DifyAPISQLAlchemyWorkflowRunRepository(sqlite_session_factory)
-    module = async_workflow_tasks if entry_point == "async" else workflow_execute_task_module
+    module = workflow_execute_task_module
     monkeypatch.setattr(type(module.db), "engine", property(lambda _: sqlite_engine))
     monkeypatch.setattr(
         module.DifyAPIRepositoryFactory, "create_api_workflow_run_repository", lambda *_args, **_kwargs: repository
     )
-    monkeypatch.setattr(
-        module, "_get_user" if entry_point == "async" else "_resolve_user_for_run", lambda *_args: _make_account()
-    )
+    monkeypatch.setattr(module, "_resolve_user_for_run", lambda *_args: _make_account())
     resumed_entities: list[AdvancedChatAppGenerateEntity | WorkflowAppGenerateEntity] = []
 
     def record_app_resume(
@@ -1127,20 +1274,10 @@ def test_resume_recovers_legacy_task_before_claiming_pause(
     ) -> None:
         resumed_entities.append(generate_entity)
 
-    def record_workflow_resume(
-        _self: WorkflowAppGenerator, *, application_generate_entity: WorkflowAppGenerateEntity, **_kwargs: object
-    ) -> dict[str, object]:
-        resumed_entities.append(application_generate_entity)
-        return {}
-
-    if entry_point == "async":
-        monkeypatch.setattr(module, "_query_trigger_log_info", lambda *_args: None)
-        monkeypatch.setattr(WorkflowAppGenerator, "resume", record_workflow_resume)
-    else:
-        monkeypatch.setattr(module, "clear_app_task_cancellation_signals", lambda _: None)
-        monkeypatch.setattr(
-            module, "_resume_advanced_chat" if entry_point == "chat" else "_resume_workflow", record_app_resume
-        )
+    monkeypatch.setattr(module, "clear_app_task_cancellation_signals", lambda _: None)
+    monkeypatch.setattr(
+        module, "_resume_advanced_chat" if entry_point == "chat" else "_resume_workflow", record_app_resume
+    )
 
     if scenario in {"concurrent-index", "concurrent-stop"}:
         index_pause = repository.backfill_workflow_pause_task_id
@@ -1167,12 +1304,8 @@ def test_resume_recovers_legacy_task_before_claiming_pause(
         return resume_pause(workflow_run_id, pause_entity, before_resume=before_resume)
 
     monkeypatch.setattr(repository, "resume_workflow_pause", record_resume_pause)
-    invoke = async_workflow_tasks.resume_workflow_execution.run if entry_point == "async" else _resume_app_execution
-    if entry_point == "async" and scenario == "concurrent-stop":
-        with pytest.raises(WorkflowRunNotPausedError):
-            invoke({"workflow_run_id": workflow_run_id})
-    else:
-        invoke({"workflow_run_id": workflow_run_id})
+
+    _resume_app_execution({"workflow_run_id": workflow_run_id}, external_retrieval=external_retrieval)
 
     with sqlite_session_factory() as session:
         persisted = session.get(WorkflowRun, workflow_run_id)
@@ -1198,10 +1331,49 @@ def test_resume_recovers_legacy_task_before_claiming_pause(
             assert resumed_entities == []
 
 
+def test_triggered_workflow_resume_accepts_community_edition_logical_team_queue(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    with sqlite_session_factory.begin() as session:
+        trigger_log = WorkflowTriggerLog(
+            tenant_id="tenant-id",
+            app_id="app-id",
+            workflow_id="workflow-id",
+            workflow_run_id="workflow-run-id",
+            root_node_id="root-node-id",
+            trigger_metadata="{}",
+            trigger_type=AppTriggerType.UNKNOWN,
+            trigger_data="{}",
+            inputs="{}",
+            outputs=None,
+            status=WorkflowTriggerStatus.PAUSED,
+            error=None,
+            queue_name=QueuePriority.TEAM,
+            celery_task_id="celery-task-id",
+            created_by_role=CreatorUserRole.ACCOUNT,
+            created_by="account-id",
+            terminal_owner_id="owner-1",
+        )
+        trigger_log.id = "trigger-log-id"
+        session.add(trigger_log)
+
+    layers = _get_trigger_resume_layers(sqlite_session_factory, "workflow-run-id")
+
+    assert len(layers) == 1
+    assert isinstance(layers[0], TriggerPostLayer)
+    assert layers[0].trigger_log_id == "trigger-log-id"
+    assert layers[0].execution_owner_id is None
+    with sqlite_session_factory() as session:
+        resumed_trigger = session.get(WorkflowTriggerLog, "trigger-log-id")
+        assert resumed_trigger is not None
+        assert resumed_trigger.terminal_owner_id == "owner-1"
+
+
 def test_resume_advanced_chat_publishes_events_for_originally_blocking_runs(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_session: Session,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     generate_entity = _build_advanced_chat_generate_entity(conversation_id="conversation-id")
     generate_entity.stream = False
@@ -1210,10 +1382,9 @@ def test_resume_advanced_chat_publishes_events_for_originally_blocking_runs(
     generator_instance = MagicMock()
     response_stream = _single_event_generator({"event": "message"})
     generator_instance.resume.return_value = response_stream
-    monkeypatch.setattr(
-        "tasks.app_generate.workflow_execute_task.AdvancedChatAppGenerator",
-        lambda *, execution_driver: generator_instance,
-    )
+    generator = create_autospec(AdvancedChatAppGenerator, spec_set=True, return_value=generator_instance)
+    monkeypatch.setattr("tasks.app_generate.workflow_execute_task.AdvancedChatAppGenerator", generator)
+    trigger_layer = create_autospec(Layer, instance=True, spec_set=True)
 
     publish_streaming_response = MagicMock()
     monkeypatch.setattr(
@@ -1228,6 +1399,7 @@ def test_resume_advanced_chat_publishes_events_for_originally_blocking_runs(
         lambda **kwargs: MagicMock(),
     )
     _resume_advanced_chat(
+        external_retrieval=external_retrieval,
         app_model=_make_app(),
         workflow=workflow,
         user=_make_account(),
@@ -1241,11 +1413,14 @@ def test_resume_advanced_chat_publishes_events_for_originally_blocking_runs(
         workflow_run_id="workflow-run-id",
         workflow_run=_make_workflow_run(),
         session=sqlite_session,
+        graph_engine_layers=(trigger_layer,),
     )
 
     resumed_entity = generator_instance.resume.call_args.kwargs["application_generate_entity"]
     assert resumed_entity.stream is True
     assert generator_instance.resume.call_args.kwargs["session"] is sqlite_session
+    assert generator_instance.resume.call_args.kwargs["graph_engine_layers"] == (trigger_layer,)
+    assert generator.call_args.kwargs["external_retrieval"] is external_retrieval
     publish_streaming_response.assert_called_once_with(
         response_stream,
         "workflow-run-id",
@@ -1259,6 +1434,7 @@ def test_resume_advanced_chat_publishes_events_for_originally_blocking_runs(
 def test_resume_workflow_publishes_events_for_originally_blocking_runs(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     generate_entity = _build_workflow_generate_entity(stream=False)
     workflow = _make_workflow()
@@ -1266,10 +1442,9 @@ def test_resume_workflow_publishes_events_for_originally_blocking_runs(
     generator_instance = MagicMock()
     response_stream = _single_event_generator({"event": "workflow_finished"})
     generator_instance.resume.return_value = response_stream
-    monkeypatch.setattr(
-        "tasks.app_generate.workflow_execute_task.WorkflowAppGenerator",
-        lambda *, execution_driver: generator_instance,
-    )
+    generator = create_autospec(WorkflowAppGenerator, spec_set=True, return_value=generator_instance)
+    monkeypatch.setattr("tasks.app_generate.workflow_execute_task.WorkflowAppGenerator", generator)
+    trigger_layer = create_autospec(Layer, instance=True, spec_set=True)
 
     publish_streaming_response = MagicMock()
     monkeypatch.setattr(
@@ -1287,6 +1462,7 @@ def test_resume_workflow_publishes_events_for_originally_blocking_runs(
     pause_entity = MagicMock()
 
     _resume_workflow(
+        external_retrieval=external_retrieval,
         app_model=_make_app(),
         workflow=workflow,
         user=_make_account(),
@@ -1299,10 +1475,13 @@ def test_resume_workflow_publishes_events_for_originally_blocking_runs(
         workflow_run=_make_workflow_run(),
         workflow_run_repo=workflow_run_repo,
         pause_entity=pause_entity,
+        graph_engine_layers=(trigger_layer,),
     )
 
     resumed_entity = generator_instance.resume.call_args.kwargs["application_generate_entity"]
     assert resumed_entity.stream is True
+    assert generator_instance.resume.call_args.kwargs["graph_engine_layers"] == (trigger_layer,)
+    assert generator.call_args.kwargs["external_retrieval"] is external_retrieval
     publish_streaming_response.assert_called_once_with(
         response_stream,
         "workflow-run-id",
@@ -1317,6 +1496,7 @@ def test_resume_workflow_publishes_events_for_originally_blocking_runs(
 def test_resume_workflow_ignores_missing_old_pause_after_repause(
     monkeypatch: pytest.MonkeyPatch,
     sqlite_session_factory: sessionmaker[Session],
+    external_retrieval: ExternalDatasetRetriever,
 ):
     generate_entity = _build_workflow_generate_entity(stream=False)
     workflow = _make_workflow()
@@ -1324,10 +1504,8 @@ def test_resume_workflow_ignores_missing_old_pause_after_repause(
     generator_instance = MagicMock()
     response_stream = _single_event_generator({"event": "workflow_paused"})
     generator_instance.resume.return_value = response_stream
-    monkeypatch.setattr(
-        "tasks.app_generate.workflow_execute_task.WorkflowAppGenerator",
-        lambda *, execution_driver: generator_instance,
-    )
+    generator = create_autospec(WorkflowAppGenerator, spec_set=True, return_value=generator_instance)
+    monkeypatch.setattr("tasks.app_generate.workflow_execute_task.WorkflowAppGenerator", generator)
 
     publish_streaming_response = MagicMock()
     monkeypatch.setattr(
@@ -1346,6 +1524,7 @@ def test_resume_workflow_ignores_missing_old_pause_after_repause(
     pause_entity = MagicMock()
 
     _resume_workflow(
+        external_retrieval=external_retrieval,
         app_model=_make_app(),
         workflow=workflow,
         user=_make_account(),
@@ -1368,4 +1547,5 @@ def test_resume_workflow_ignores_missing_old_pause_after_repause(
         generate_entity.inputs,
         WorkflowStartReason.RESUMPTION,
     )
+    assert generator.call_args.kwargs["external_retrieval"] is external_retrieval
     workflow_run_repo.delete_workflow_pause.assert_called_once_with(pause_entity)

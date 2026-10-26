@@ -33,13 +33,20 @@ from services.conversation_service import ConversationService
 
 if TYPE_CHECKING:
     from core.app.apps.workflow_app_runner import WorkflowRunDriver
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 
 logger = logging.getLogger(__name__)
 
 
 class AgentChatAppGenerator(MessageBasedAppGenerator):
-    def __init__(self, *, execution_driver: "WorkflowRunDriver") -> None:
+    def __init__(
+        self,
+        *,
+        execution_driver: "WorkflowRunDriver",
+        external_retrieval: "ExternalDatasetRetriever",
+    ) -> None:
         self._execution_driver = execution_driver
+        self._external_retrieval = external_retrieval
 
     @overload
     def generate(
@@ -278,7 +285,10 @@ class AgentChatAppGenerator(MessageBasedAppGenerator):
                 message = self._get_message(message_id)
 
                 # chatbot app
-                runner = AgentChatAppRunner(execution_driver=self._execution_driver)
+                runner = AgentChatAppRunner(
+                    execution_driver=self._execution_driver,
+                    external_retrieval=self._external_retrieval,
+                )
                 with session_factory.create_session() as session:
                     runner.run(
                         application_generate_entity=application_generate_entity,

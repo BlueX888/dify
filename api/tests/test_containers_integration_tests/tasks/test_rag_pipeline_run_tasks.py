@@ -1,12 +1,15 @@
 import json
 import uuid
-from unittest.mock import MagicMock, patch
+from collections.abc import Generator
+from dataclasses import dataclass
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from faker import Faker
 from flask import Flask
 from sqlalchemy.orm import Session
 
+from core.app.apps.pipeline.pipeline_generator import PipelineGenerator
 from core.app.entities.app_invoke_entities import InvokeFrom, RagPipelineGenerateEntity
 from core.app.entities.rag_pipeline_invoke_entities import RagPipelineInvokeEntity
 from core.rag.pipeline.queue import TenantIsolatedTaskQueue
@@ -18,6 +21,16 @@ from tasks.rag_pipeline.priority_rag_pipeline_run_task import (
     run_single_rag_pipeline_task,
 )
 from tasks.rag_pipeline.rag_pipeline_run_task import rag_pipeline_run_task
+
+
+@dataclass(frozen=True, slots=True)
+class _KnowledgeServicesStub:
+    pipeline_generator: PipelineGenerator
+
+
+@dataclass(frozen=True, slots=True)
+class _ApplicationServicesStub:
+    knowledge: _KnowledgeServicesStub
 
 
 class TestRagPipelineRunTasks:
@@ -34,12 +47,19 @@ class TestRagPipelineRunTasks:
     """
 
     @pytest.fixture
-    def mock_pipeline_generator(self):
-        """Mock PipelineGenerator._generate method."""
-        with patch("core.app.apps.pipeline.pipeline_generator.PipelineGenerator._generate") as mock_generate:
-            # Mock the _generate method to return a simple response
-            mock_generate.return_value = {"answer": "Test response", "metadata": {"test": "data"}}
-            yield mock_generate
+    def pipeline_generator(self) -> PipelineGenerator:
+        generator = create_autospec(PipelineGenerator, instance=True, spec_set=True)
+
+        def _response_stream(**_kwargs: object) -> Generator[dict[str, object]]:
+            yield {"answer": "Test response", "metadata": {"test": "data"}}
+
+        generator._generate.side_effect = _response_stream
+        return generator
+
+    @pytest.fixture
+    def mock_pipeline_generator(self, pipeline_generator: PipelineGenerator):
+        """Expose the shared generator's execution method for call assertions."""
+        return pipeline_generator._generate
 
     @pytest.fixture
     def mock_file_service(self):
@@ -52,6 +72,14 @@ class TestRagPipelineRunTasks:
                 "get_content": mock_get_content,
                 "delete_file": mock_delete_file,
             }
+
+    @pytest.fixture(autouse=True)
+    def application_services(
+        self, monkeypatch: pytest.MonkeyPatch, pipeline_generator: PipelineGenerator
+    ) -> _ApplicationServicesStub:
+        services = _ApplicationServicesStub(knowledge=_KnowledgeServicesStub(pipeline_generator=pipeline_generator))
+        monkeypatch.setattr("extensions.ext_application_services.application_services", lambda: services)
+        return services
 
     def _create_test_pipeline_and_workflow(self, db_session_with_containers: Session):
         """
@@ -190,7 +218,6 @@ class TestRagPipelineRunTasks:
                 workflow_id=workflow.id,
                 streaming=False,
                 workflow_execution_id=str(uuid.uuid4()),
-                workflow_thread_pool_id=str(uuid.uuid4()),
             )
             entities.append(entity)
 
@@ -210,7 +237,10 @@ class TestRagPipelineRunTasks:
         return json.dumps(entities_data)
 
     def test_priority_rag_pipeline_run_task_success(
-        self, db_session_with_containers: Session, mock_pipeline_generator, mock_file_service
+        self,
+        db_session_with_containers: Session,
+        mock_pipeline_generator,
+        mock_file_service,
     ):
         """
         Test successful priority RAG pipeline run task execution.
@@ -251,11 +281,14 @@ class TestRagPipelineRunTasks:
             assert call_kwargs["workflow_id"] == workflow.id
             assert call_kwargs["user"].id == account.id
             assert call_kwargs["invoke_from"] == InvokeFrom.PUBLISHED_PIPELINE
-            assert call_kwargs["streaming"] is False
+            assert call_kwargs["streaming"] is True
             assert isinstance(call_kwargs["application_generate_entity"], RagPipelineGenerateEntity)
 
     def test_rag_pipeline_run_task_success(
-        self, db_session_with_containers: Session, mock_pipeline_generator, mock_file_service
+        self,
+        db_session_with_containers: Session,
+        mock_pipeline_generator,
+        mock_file_service,
     ):
         """
         Test successful regular RAG pipeline run task execution.
@@ -296,7 +329,7 @@ class TestRagPipelineRunTasks:
             assert call_kwargs["workflow_id"] == workflow.id
             assert call_kwargs["user"].id == account.id
             assert call_kwargs["invoke_from"] == InvokeFrom.PUBLISHED_PIPELINE
-            assert call_kwargs["streaming"] is False
+            assert call_kwargs["streaming"] is True
             assert isinstance(call_kwargs["application_generate_entity"], RagPipelineGenerateEntity)
 
     def test_priority_rag_pipeline_run_task_with_waiting_tasks(
@@ -726,7 +759,11 @@ class TestRagPipelineRunTasks:
             assert queue1._task_key != queue2._task_key
 
     def test_run_single_rag_pipeline_task_success(
-        self, db_session_with_containers: Session, mock_pipeline_generator, flask_app_with_containers: Flask
+        self,
+        db_session_with_containers: Session,
+        mock_pipeline_generator,
+        flask_app_with_containers: Flask,
+        pipeline_generator: PipelineGenerator,
     ):
         """
         Test successful run_single_rag_pipeline_task execution.
@@ -744,7 +781,11 @@ class TestRagPipelineRunTasks:
 
         # Act: Execute the single task
         with flask_app_with_containers.app_context():
-            run_single_rag_pipeline_task(entity_data, flask_app_with_containers)
+            run_single_rag_pipeline_task(
+                entity_data,
+                flask_app_with_containers,
+                pipeline_generator=pipeline_generator,
+            )
 
         # Assert: Verify expected outcomes
         # Verify PipelineGenerator._generate was called
@@ -757,11 +798,15 @@ class TestRagPipelineRunTasks:
         assert call_kwargs["workflow_id"] == workflow.id
         assert call_kwargs["user"].id == account.id
         assert call_kwargs["invoke_from"] == InvokeFrom.PUBLISHED_PIPELINE
-        assert call_kwargs["streaming"] is False
+        assert call_kwargs["streaming"] is True
         assert isinstance(call_kwargs["application_generate_entity"], RagPipelineGenerateEntity)
 
     def test_run_single_rag_pipeline_task_entity_validation_error(
-        self, db_session_with_containers: Session, mock_pipeline_generator, flask_app_with_containers: Flask
+        self,
+        db_session_with_containers: Session,
+        mock_pipeline_generator,
+        flask_app_with_containers: Flask,
+        pipeline_generator: PipelineGenerator,
     ):
         """
         Test run_single_rag_pipeline_task with invalid entity data.
@@ -794,19 +839,26 @@ class TestRagPipelineRunTasks:
             "workflow_id": str(uuid.uuid4()),
             "streaming": False,
             "workflow_execution_id": str(uuid.uuid4()),
-            "workflow_thread_pool_id": str(uuid.uuid4()),
         }
 
         # Act & Assert: Execute the single task with non-existent entities (should raise ValueError)
         with flask_app_with_containers.app_context():
             with pytest.raises(ValueError, match="Account .* not found"):
-                run_single_rag_pipeline_task(invalid_entity_data, flask_app_with_containers)
+                run_single_rag_pipeline_task(
+                    invalid_entity_data,
+                    flask_app_with_containers,
+                    pipeline_generator=pipeline_generator,
+                )
 
         # Assert: Pipeline generator should not be called
         mock_pipeline_generator.assert_not_called()
 
     def test_run_single_rag_pipeline_task_database_entity_not_found(
-        self, db_session_with_containers: Session, mock_pipeline_generator, flask_app_with_containers: Flask
+        self,
+        db_session_with_containers: Session,
+        mock_pipeline_generator,
+        flask_app_with_containers: Flask,
+        pipeline_generator: PipelineGenerator,
     ):
         """
         Test run_single_rag_pipeline_task with non-existent database entities.
@@ -839,13 +891,16 @@ class TestRagPipelineRunTasks:
             "workflow_id": str(uuid.uuid4()),
             "streaming": False,
             "workflow_execution_id": str(uuid.uuid4()),
-            "workflow_thread_pool_id": str(uuid.uuid4()),
         }
 
         # Act & Assert: Execute the single task with non-existent entities (should raise ValueError)
         with flask_app_with_containers.app_context():
             with pytest.raises(ValueError, match="Account .* not found"):
-                run_single_rag_pipeline_task(entity_data, flask_app_with_containers)
+                run_single_rag_pipeline_task(
+                    entity_data,
+                    flask_app_with_containers,
+                    pipeline_generator=pipeline_generator,
+                )
 
         # Assert: Pipeline generator should not be called
         mock_pipeline_generator.assert_not_called()

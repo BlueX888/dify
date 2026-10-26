@@ -2,12 +2,14 @@ import json
 import logging
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import MagicMock, patch
+from uuid import UUID
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, sessionmaker
 
 import services.async_workflow_service as async_workflow_service_module
 from models.account import Account
@@ -15,10 +17,13 @@ from models.enums import AppTriggerType, CreatorUserRole, EndUserType, WorkflowR
 from models.model import App, AppMode, EndUser
 from models.trigger import WorkflowTriggerLog
 from models.workflow import Workflow, WorkflowType
+from repositories.sqlalchemy_workflow_trigger_log_repository import SQLAlchemyWorkflowTriggerLogRepository
+from repositories.workflow_trigger_log_repository import WorkflowQuotaSettlementCandidate
 from services.async_workflow_service import AsyncWorkflowService
 from services.errors.app import QuotaExceededError, WorkflowNotFoundError
 from services.workflow.entities import AsyncTriggerResponse, TriggerData
 from services.workflow.queue_dispatcher import QueuePriority
+from tasks import async_workflow_tasks
 
 
 class AsyncWorkflowServiceTestDataFactory:
@@ -150,6 +155,7 @@ class TestAsyncWorkflowService:
         """
         mock_dispatcher = MagicMock()
         mock_quota_service = MagicMock()
+        mock_quota_service.reserve.return_value.charge_id = None
 
         with (
             patch.object(async_workflow_service_module, "QueueDispatcherManager") as mock_dispatcher_manager_class,
@@ -166,6 +172,11 @@ class TestAsyncWorkflowService:
             patch.object(async_workflow_service_module, "execute_workflow_professional") as mock_professional_task,
             patch.object(async_workflow_service_module, "execute_workflow_team") as mock_team_task,
             patch.object(async_workflow_service_module, "execute_workflow_sandbox") as mock_sandbox_task,
+            patch.object(
+                async_workflow_service_module,
+                "uuid4",
+                return_value=UUID("00000000-0000-0000-0000-000000000123"),
+            ),
         ):
             # Configure dispatcher_manager to return our mock_dispatcher
             mock_dispatcher_manager_class.return_value.get_dispatcher.return_value = mock_dispatcher
@@ -206,13 +217,8 @@ class TestAsyncWorkflowService:
         mocks["dispatcher"].get_queue_name.return_value = queue_name
         mocks["get_workflow"].return_value = workflow
 
-        task_result = MagicMock()
-        task_result.id = "task-123"
-        mocks["professional_task"].delay.return_value = task_result
-        mocks["team_task"].delay.return_value = task_result
-        mocks["sandbox_task"].delay.return_value = task_result
-
         quota_charge_mock = MagicMock()
+        quota_charge_mock.charge_id = None
         mocks["quota_service"].reserve.return_value = quota_charge_mock
 
         user = AsyncWorkflowServiceTestDataFactory.create_account()
@@ -225,12 +231,12 @@ class TestAsyncWorkflowService:
         # Assert
         assert isinstance(result, AsyncTriggerResponse)
         assert result.workflow_trigger_log_id
-        assert result.task_id == "task-123"
+        assert result.task_id == "00000000-0000-0000-0000-000000000123"
         assert result.status == "queued"
         assert result.queue == queue_name
 
         mocks["quota_service"].reserve.assert_called_once()
-        quota_charge_mock.commit.assert_called_once()
+        quota_charge_mock.commit.assert_not_called()
         assert not sqlite_session.in_transaction()
 
         created_log = sqlite_session.scalar(
@@ -243,7 +249,12 @@ class TestAsyncWorkflowService:
         assert created_log.created_by == "account-123"
         assert created_log.trigger_data == trigger_data.model_dump_json()
         assert created_log.inputs == json.dumps(dict(trigger_data.inputs))
-        assert created_log.celery_task_id == "task-123"
+        assert created_log.celery_task_id == "00000000-0000-0000-0000-000000000123"
+        assert created_log.dispatch_prepared_at is not None
+        assert created_log.dispatch_published_at is not None
+        assert created_log.dispatch_abandoned_at is None
+        assert created_log.quota_settlement_status == "committed"
+        assert created_log.quota_sync_pending is False
 
         task_mocks = {
             "execute_workflow_professional": mocks["professional_task"],
@@ -252,9 +263,12 @@ class TestAsyncWorkflowService:
         }
         for task_attr, task_mock in task_mocks.items():
             if task_attr == selected_task_attr:
-                task_mock.delay.assert_called_once_with({"workflow_trigger_log_id": result.workflow_trigger_log_id})
+                task_mock.apply_async.assert_called_once_with(
+                    args=({"workflow_trigger_log_id": result.workflow_trigger_log_id},),
+                    task_id="00000000-0000-0000-0000-000000000123",
+                )
             else:
-                task_mock.delay.assert_not_called()
+                task_mock.apply_async.assert_not_called()
 
     def test_should_set_end_user_role_when_triggered_by_end_user(
         self, async_workflow_trigger_mocks, sqlite_session: Session
@@ -269,9 +283,6 @@ class TestAsyncWorkflowService:
         mocks = async_workflow_trigger_mocks
         mocks["dispatcher"].get_queue_name.return_value = QueuePriority.SANDBOX
         mocks["get_workflow"].return_value = workflow
-
-        task_result = MagicMock(id="task-123")
-        mocks["sandbox_task"].delay.return_value = task_result
 
         user = AsyncWorkflowServiceTestDataFactory.create_end_user()
 
@@ -341,14 +352,15 @@ class TestAsyncWorkflowService:
         updated_log = sqlite_session.scalar(select(WorkflowTriggerLog))
         assert updated_log is not None
         assert updated_log.status == WorkflowTriggerStatus.RATE_LIMITED
+        assert updated_log.error is not None
         assert "Quota limit reached" in updated_log.error
         assert (
             "Workflow quota exceeded for tenant tenant-123, app app-123, workflow workflow-123, "
             f"trigger log {updated_log.id}"
         ) in caplog.messages
-        mocks["professional_task"].delay.assert_not_called()
-        mocks["team_task"].delay.assert_not_called()
-        mocks["sandbox_task"].delay.assert_not_called()
+        mocks["professional_task"].apply_async.assert_not_called()
+        mocks["team_task"].apply_async.assert_not_called()
+        mocks["sandbox_task"].apply_async.assert_not_called()
 
     def test_should_mark_log_failed_and_reraise_when_celery_dispatch_raises(
         self,
@@ -368,10 +380,11 @@ class TestAsyncWorkflowService:
         mocks["get_workflow"].return_value = workflow
 
         quota_charge_mock = MagicMock()
+        quota_charge_mock.charge_id = None
         mocks["quota_service"].reserve.return_value = quota_charge_mock
 
         dispatch_error = RuntimeError("broker unavailable")
-        mocks["sandbox_task"].delay.side_effect = dispatch_error
+        mocks["sandbox_task"].apply_async.side_effect = dispatch_error
         caplog.set_level(logging.ERROR, logger=async_workflow_service_module.__name__)
 
         # Act / Assert
@@ -384,19 +397,278 @@ class TestAsyncWorkflowService:
 
         assert exc_info.value is dispatch_error
         quota_charge_mock.commit.assert_not_called()
-        quota_charge_mock.refund.assert_called_once()
+        quota_charge_mock.refund.assert_not_called()
         assert not sqlite_session.in_transaction()
 
+        sqlite_session.expire_all()
         updated_log = sqlite_session.scalar(select(WorkflowTriggerLog))
         assert updated_log is not None
         assert updated_log.status == WorkflowTriggerStatus.FAILED
         assert updated_log.error is not None
         assert "Failed to dispatch workflow task" in updated_log.error
         assert "broker unavailable" in updated_log.error
+        assert updated_log.dispatch_abandoned_at is not None
+        assert updated_log.quota_settlement_status == "refunded"
+        assert updated_log.quota_sync_pending is False
         assert (
             "Failed to dispatch workflow task for tenant tenant-123, app app-123, workflow workflow-123, "
             f"trigger log {updated_log.id}"
         ) in caplog.text
+
+    def test_abandoned_pending_dispatch_is_not_published(
+        self,
+        async_workflow_trigger_mocks: dict[str, MagicMock],
+        monkeypatch: pytest.MonkeyPatch,
+        sqlite_session: Session,
+    ) -> None:
+        """The current producer must stop if the pending row was fenced before publish."""
+        sqlite_session.add(AsyncWorkflowServiceTestDataFactory.create_app())
+        sqlite_session.commit()
+        trigger_data = AsyncWorkflowServiceTestDataFactory.create_trigger_data()
+        mocks = async_workflow_trigger_mocks
+        mocks["dispatcher"].get_queue_name.return_value = QueuePriority.SANDBOX
+        mocks["get_workflow"].return_value = AsyncWorkflowServiceTestDataFactory.create_workflow()
+        quota_charge = mocks["quota_service"].reserve.return_value
+
+        def abandon_before_queue(
+            repository: SQLAlchemyWorkflowTriggerLogRepository,
+            trigger_log_id: str,
+            *,
+            celery_task_id: str,
+            triggered_at: datetime,
+            quota_reservation_id: str | None = None,
+        ) -> bool:
+            del celery_task_id, triggered_at, quota_reservation_id
+            trigger_log = repository.get_by_id(trigger_log_id)
+            assert trigger_log is not None
+            trigger_log.status = WorkflowTriggerStatus.FAILED
+            trigger_log.error = "legacy dispatch abandoned"
+            trigger_log.finished_at = datetime.now(UTC)
+            trigger_log.pending_dispatch_abandoned_at = trigger_log.finished_at
+            repository.session.flush()
+            return False
+
+        monkeypatch.setattr(
+            SQLAlchemyWorkflowTriggerLogRepository,
+            "queue_pending_execution",
+            abandon_before_queue,
+        )
+
+        with pytest.raises(RuntimeError, match="Async workflow dispatch was abandoned before publish"):
+            AsyncWorkflowService.trigger_workflow_async(
+                session=sqlite_session,
+                user=AsyncWorkflowServiceTestDataFactory.create_end_user("user-123"),
+                trigger_data=trigger_data,
+            )
+
+        quota_charge.refund.assert_called_once()
+        quota_charge.commit.assert_not_called()
+        mocks["sandbox_task"].apply_async.assert_not_called()
+        sqlite_session.expire_all()
+        trigger_log = sqlite_session.scalar(select(WorkflowTriggerLog))
+        assert trigger_log is not None
+        assert trigger_log.status == WorkflowTriggerStatus.FAILED
+        assert trigger_log.pending_dispatch_abandoned_at is not None
+
+    def test_dispatch_failure_does_not_overwrite_a_fast_worker_claim(
+        self,
+        async_workflow_trigger_mocks,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ):
+        """A broker error reported after delivery must not regress RUNNING to FAILED."""
+        sqlite_session.add(AsyncWorkflowServiceTestDataFactory.create_app())
+        sqlite_session.commit()
+        trigger_data = AsyncWorkflowServiceTestDataFactory.create_trigger_data()
+        mocks = async_workflow_trigger_mocks
+        mocks["dispatcher"].get_queue_name.return_value = QueuePriority.SANDBOX
+        mocks["get_workflow"].return_value = AsyncWorkflowServiceTestDataFactory.create_workflow()
+        quota_charge = mocks["quota_service"].reserve.return_value
+
+        def claim_then_report_broker_error(*, args, task_id):
+            assert len(args) == 1
+            trigger_log_id = args[0]["workflow_trigger_log_id"]
+            with sqlite_session_factory() as worker_session:
+                queued_log = worker_session.get(WorkflowTriggerLog, trigger_log_id)
+                assert queued_log is not None
+                assert queued_log.status == WorkflowTriggerStatus.QUEUED
+                assert queued_log.celery_task_id == task_id
+                claimed = SQLAlchemyWorkflowTriggerLogRepository(worker_session).claim_execution(
+                    trigger_log_id,
+                    owner_id="fast-worker",
+                    lease_duration=timedelta(minutes=5),
+                )
+                assert claimed is not None
+                worker_session.commit()
+            raise RuntimeError("broker acknowledgement lost")
+
+        mocks["sandbox_task"].apply_async.side_effect = claim_then_report_broker_error
+
+        response = AsyncWorkflowService.trigger_workflow_async(
+            session=sqlite_session,
+            user=AsyncWorkflowServiceTestDataFactory.create_end_user("user-123"),
+            trigger_data=trigger_data,
+        )
+
+        sqlite_session.expire_all()
+        trigger_log = sqlite_session.scalar(select(WorkflowTriggerLog))
+        assert trigger_log is not None
+        assert trigger_log.status == WorkflowTriggerStatus.RUNNING
+        assert trigger_log.error is None
+        assert trigger_log.quota_settlement_status == "committed"
+        assert trigger_log.quota_sync_pending is False
+        assert response.task_id == trigger_log.celery_task_id
+        quota_charge.commit.assert_not_called()
+        quota_charge.refund.assert_not_called()
+
+    def test_fast_worker_settlement_is_not_reopened_by_late_publication_receipt(
+        self,
+        async_workflow_trigger_mocks: dict[str, MagicMock],
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ) -> None:
+        sqlite_session.add(AsyncWorkflowServiceTestDataFactory.create_app())
+        sqlite_session.commit()
+        mocks = async_workflow_trigger_mocks
+        mocks["dispatcher"].get_queue_name.return_value = QueuePriority.SANDBOX
+        mocks["get_workflow"].return_value = AsyncWorkflowServiceTestDataFactory.create_workflow()
+
+        def claim_and_reconcile_before_broker_ack(*, args: tuple[dict[str, str]], task_id: str) -> None:
+            trigger_log_id = args[0]["workflow_trigger_log_id"]
+            with sqlite_session_factory() as worker_session:
+                repository = SQLAlchemyWorkflowTriggerLogRepository(worker_session)
+                claimed = repository.claim_execution(
+                    trigger_log_id,
+                    owner_id="fast-worker",
+                    lease_duration=timedelta(minutes=5),
+                )
+                assert claimed is not None
+                assert claimed.celery_task_id == task_id
+                assert claimed.quota_sync_pending is True
+                worker_session.commit()
+            async_workflow_tasks.reconcile_async_workflow_dispatches.run()
+
+        mocks["sandbox_task"].apply_async.side_effect = claim_and_reconcile_before_broker_ack
+
+        AsyncWorkflowService.trigger_workflow_async(
+            session=sqlite_session,
+            user=AsyncWorkflowServiceTestDataFactory.create_end_user("user-123"),
+            trigger_data=AsyncWorkflowServiceTestDataFactory.create_trigger_data(),
+        )
+
+        sqlite_session.expire_all()
+        trigger_log = sqlite_session.scalar(select(WorkflowTriggerLog))
+        assert trigger_log is not None
+        assert trigger_log.status == WorkflowTriggerStatus.RUNNING
+        assert trigger_log.dispatch_published_at is not None
+        assert trigger_log.quota_settlement_status == "committed"
+        assert trigger_log.quota_sync_pending is False
+
+    def test_late_broker_success_cannot_revive_reaped_dispatch(
+        self,
+        async_workflow_trigger_mocks: dict[str, MagicMock],
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ) -> None:
+        sqlite_session.add(AsyncWorkflowServiceTestDataFactory.create_app())
+        sqlite_session.commit()
+        mocks = async_workflow_trigger_mocks
+        mocks["dispatcher"].get_queue_name.return_value = QueuePriority.SANDBOX
+        mocks["get_workflow"].return_value = AsyncWorkflowServiceTestDataFactory.create_workflow()
+
+        def reap_while_broker_call_is_blocked(*, args: tuple[dict[str, str]], task_id: str) -> None:
+            trigger_log_id = args[0]["workflow_trigger_log_id"]
+            with sqlite_session_factory.begin() as age_session:
+                trigger_log = age_session.get_one(WorkflowTriggerLog, trigger_log_id)
+                assert trigger_log.celery_task_id == task_id
+                trigger_log.dispatch_prepared_at = datetime(2000, 1, 1)
+            with sqlite_session_factory.begin() as reaper_session:
+                abandoned = SQLAlchemyWorkflowTriggerLogRepository(reaper_session).abandon_stale_unpublished_dispatches(
+                    dispatch_timeout=timedelta(minutes=5),
+                    error="broker publication deadline expired",
+                    limit=10,
+                )
+                assert abandoned == 1
+
+        mocks["sandbox_task"].apply_async.side_effect = reap_while_broker_call_is_blocked
+
+        with pytest.raises(RuntimeError, match="dispatch expired before broker confirmation"):
+            AsyncWorkflowService.trigger_workflow_async(
+                session=sqlite_session,
+                user=AsyncWorkflowServiceTestDataFactory.create_end_user("user-123"),
+                trigger_data=AsyncWorkflowServiceTestDataFactory.create_trigger_data(),
+            )
+
+        sqlite_session.expire_all()
+        trigger_log = sqlite_session.scalar(select(WorkflowTriggerLog))
+        assert trigger_log is not None
+        assert trigger_log.status == WorkflowTriggerStatus.FAILED
+        assert trigger_log.dispatch_published_at is None
+        assert trigger_log.dispatch_abandoned_at is not None
+        assert trigger_log.quota_settlement_status == "refunded"
+        assert trigger_log.quota_sync_pending is False
+
+    def test_hard_exit_after_queued_commit_is_reaped_and_refunded(
+        self,
+        async_workflow_trigger_mocks: dict[str, MagicMock],
+        monkeypatch: pytest.MonkeyPatch,
+        sqlite_session: Session,
+        sqlite_session_factory: sessionmaker[Session],
+    ) -> None:
+        sqlite_session.add(AsyncWorkflowServiceTestDataFactory.create_app())
+        sqlite_session.commit()
+        mocks = async_workflow_trigger_mocks
+        mocks["dispatcher"].get_queue_name.return_value = QueuePriority.SANDBOX
+        mocks["get_workflow"].return_value = AsyncWorkflowServiceTestDataFactory.create_workflow()
+        mocks["quota_service"].reserve.return_value.charge_id = "reservation-123"
+
+        class SimulatedHardExit(BaseException):
+            pass
+
+        def crash_before_broker_call_returns(*, args: tuple[dict[str, str]], task_id: str) -> None:
+            trigger_log_id = args[0]["workflow_trigger_log_id"]
+            with sqlite_session_factory() as checkpoint:
+                trigger_log = checkpoint.get_one(WorkflowTriggerLog, trigger_log_id)
+                assert trigger_log.status == WorkflowTriggerStatus.QUEUED
+                assert trigger_log.celery_task_id == task_id
+                assert trigger_log.dispatch_prepared_at is not None
+                assert trigger_log.dispatch_published_at is None
+                assert trigger_log.quota_reservation_id == "reservation-123"
+            assert trigger_log.quota_sync_pending is False
+            raise SimulatedHardExit
+
+        mocks["sandbox_task"].apply_async.side_effect = crash_before_broker_call_returns
+        with pytest.raises(SimulatedHardExit):
+            AsyncWorkflowService.trigger_workflow_async(
+                session=sqlite_session,
+                user=AsyncWorkflowServiceTestDataFactory.create_end_user("user-123"),
+                trigger_data=AsyncWorkflowServiceTestDataFactory.create_trigger_data(),
+            )
+
+        with sqlite_session_factory.begin() as age_session:
+            trigger_log = age_session.scalar(select(WorkflowTriggerLog))
+            assert trigger_log is not None
+            trigger_log.dispatch_prepared_at = datetime(2000, 1, 1)
+
+        settlements: list[WorkflowQuotaSettlementCandidate] = []
+
+        def settle(candidate: WorkflowQuotaSettlementCandidate) -> Literal["committed", "refunded"]:
+            settlements.append(candidate)
+            return candidate.outcome
+
+        monkeypatch.setattr(async_workflow_tasks.WorkflowTriggerQuotaService, "settle", staticmethod(settle))
+        async_workflow_tasks.reconcile_async_workflow_dispatches.run()
+
+        assert len(settlements) == 1
+        assert settlements[0].reservation_id == "reservation-123"
+        assert settlements[0].outcome == "refunded"
+        with sqlite_session_factory() as verification:
+            trigger_log = verification.scalar(select(WorkflowTriggerLog))
+            assert trigger_log is not None
+            assert trigger_log.status == WorkflowTriggerStatus.FAILED
+            assert trigger_log.dispatch_abandoned_at is not None
+            assert trigger_log.quota_settlement_status == "refunded"
+            assert trigger_log.quota_sync_pending is False
 
     def test_should_raise_when_reinvoke_target_log_does_not_exist(self, sqlite_session: Session):
         """Test reinvoke_trigger error path when original trigger log is missing."""

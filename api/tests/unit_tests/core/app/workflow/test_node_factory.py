@@ -1,10 +1,13 @@
 from collections.abc import Callable
 from types import SimpleNamespace
+from unittest.mock import create_autospec
 
 import pytest
 
 from core.app.entities.app_invoke_entities import InvokeFrom, UserFrom, build_dify_run_context
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from graphon.enums import BuiltinNodeTypes
 
 
@@ -75,6 +78,8 @@ class TestDifyNodeFactory:
         return DifyNodeFactory(
             init_params=SimpleNamespace(run_context=run_context),
             runtime_state=SimpleNamespace(),
+            external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+            knowledge_index_runtime=build_knowledge_index_runtime(),
         )
 
     def test_create_node_unknown_type(self):
@@ -154,7 +159,10 @@ class TestDifyNodeFactory:
         node = factory.create_node({"id": "node-1", "data": {"type": BuiltinNodeTypes.KNOWLEDGE_RETRIEVAL}})
 
         assert isinstance(node, DummyKnowledgeRetrievalNode)
-        assert node.kwargs == {}
+        assert node.kwargs == {
+            "external_retrieval": factory.external_retrieval,
+            "retrieval_finalizer": factory.knowledge_index_runtime.retrieval_finalizer,
+        }
 
     def test_create_node_document_extractor_branch(self, monkeypatch: pytest.MonkeyPatch):
         factory = self._factory()

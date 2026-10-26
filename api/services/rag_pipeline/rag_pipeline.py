@@ -4,8 +4,9 @@ import re
 import threading
 import time
 from collections.abc import Callable, Generator, Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
 from sqlalchemy import func, select
@@ -28,6 +29,7 @@ from core.datasource.entities.datasource_entities import (
 from core.datasource.online_document.online_document_plugin import OnlineDocumentDatasourcePlugin
 from core.datasource.online_drive.online_drive_plugin import OnlineDriveDatasourcePlugin
 from core.datasource.website_crawl.website_crawl_plugin import WebsiteCrawlDatasourcePlugin
+from core.db.session_factory import session_factory
 from core.helper import marketplace
 from core.rag.entities import DatasourceCompletedEvent, DatasourceErrorEvent, DatasourceProcessingEvent
 from core.repositories.factory import DifyCoreRepositoryFactory
@@ -44,6 +46,7 @@ from core.workflow.system_variables import (
 from core.workflow.variable_pool_initializer import add_variables_to_pool
 from core.workflow.workflow_entry import WorkflowEntry
 from enterprise.telemetry.draft_trace import enqueue_draft_node_execution_trace
+from enums import DeploymentEdition
 from extensions.ext_database import db
 from graphon.engine_events import NodeEvent, NodeRunFailedEvent, NodeRunSucceededEvent
 from graphon.entities import WorkflowNodeExecution
@@ -67,7 +70,7 @@ from models.dataset import (  # type: ignore
     PipelineRecommendedPlugin,
 )
 from models.enums import IndexingStatus, WorkflowRunTriggeredFrom
-from models.model import EndUser
+from models.model import DocumentIndexingOutbox, EndUser
 from models.workflow import (
     Workflow,
     WorkflowNodeExecutionModel,
@@ -77,6 +80,7 @@ from models.workflow import (
 )
 from repositories.factory import DifyAPIRepositoryFactory
 from repositories.knowledge.dataset_read_repository import get_pipeline_dataset
+from repositories.knowledge.document_repository import ClaimedIndexingRequest, SQLAlchemyDocumentRepository
 from services.credentials.query import CredentialQuery
 from services.data_source.provider_service import DatasourceProviderService
 from services.entities.knowledge_entities.rag_pipeline_entities import (
@@ -85,9 +89,15 @@ from services.entities.knowledge_entities.rag_pipeline_entities import (
 )
 from services.errors.app import IsDraftWorkflowError, WorkflowHashNotEqualError, WorkflowNotFoundError
 from services.errors.rag_pipeline import RagPipelineResourceNotFoundError
-from services.knowledge.resource_scope import DatasetRef
+from services.feature_service import FeatureService
+from services.knowledge.entities.resource_scope import DatasetRef
+from services.knowledge.indexing.execution import maintain_indexing_claim
 from services.rag_pipeline.pipeline_template.pipeline_template_factory import PipelineTemplateRetrievalFactory
 from services.rag_pipeline.rag_pipeline_dsl_service import RagPipelineDslService
+
+if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+
 from services.tools.builtin_tools_manage_service import BuiltinToolManageService
 from services.workflow_draft_variable_service import DraftVariableSaver, DraftVarLoader
 from services.workflow_node_execution_trace_service import (
@@ -101,6 +111,76 @@ from services.workflow_run_agg import WorkflowRunAgg
 logger = logging.getLogger(__name__)
 
 
+class PipelineIndexingSnapshotUnavailableError(ValueError):
+    """Raised when a durable pipeline request cannot prove its submitted source snapshot."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PipelineRetrySnapshot:
+    """Detached source state required to replay one pipeline attempt."""
+
+    pipeline: Pipeline
+    workflow: Workflow
+    target_document_id: str
+    args: Mapping[str, Any]
+    enforce_projected_capacity: bool
+
+
+def pipeline_indexing_admission_error(tenant_id: str) -> str | None:
+    """Resolve pipeline vector quota before an indexing claim opens its transaction."""
+    if dify_config.DEPLOYMENT_EDITION != DeploymentEdition.CLOUD:
+        return None
+    try:
+        vector_space = FeatureService.get_features(tenant_id).vector_space
+        assert vector_space is not None
+        if 0 < vector_space.limit <= vector_space.size:
+            return "Your total number of documents plus the number of uploads have over the limit of your subscription."
+    except Exception as error:
+        return str(error)
+    return None
+
+
+def run_durable_pipeline_indexing(
+    *,
+    documents: SQLAlchemyDocumentRepository,
+    claim: ClaimedIndexingRequest,
+    indexing_request_id: str,
+    user: Account,
+    pipeline_generator: PipelineGenerator,
+) -> None:
+    """Replay and finalize one pipeline document under its exact durable owner."""
+    dataset, document = documents.get_indexing_models(claim.ref, claim_id=claim.claim_id)
+    started_at = time.perf_counter()
+    with maintain_indexing_claim(documents, claim.ref, claim_id=claim.claim_id):
+        with session_factory.create_session() as rag_session:
+            RagPipelineService(rag_session).retry_error_document(
+                dataset,
+                document,
+                user,
+                generator=pipeline_generator,
+                indexing_request_id=indexing_request_id,
+                claim_id=claim.claim_id,
+                recovery_required=claim.recovery_required,
+            )
+
+        _, persisted = documents.get_indexing_models(claim.ref, claim_id=claim.claim_id)
+        if persisted.indexing_status == IndexingStatus.COMPLETED:
+            documents.complete_indexing(
+                claim.ref,
+                claim_id=claim.claim_id,
+                tokens=persisted.tokens or 0,
+                latency=persisted.indexing_latency or (time.perf_counter() - started_at),
+                dataset_generation_id=claim.dataset_generation_id,
+            )
+            return
+        documents.fail_indexing(
+            claim.ref,
+            persisted.error or "RAG pipeline retry did not complete document indexing.",
+            claim_id=claim.claim_id,
+            dataset_generation_id=claim.dataset_generation_id,
+        )
+
+
 def _build_seeded_variable_pool(variables: Sequence[Variable]) -> VariablePool:
     variable_pool = VariablePool()
     add_variables_to_pool(variable_pool, variables)
@@ -109,16 +189,24 @@ def _build_seeded_variable_pool(variables: Sequence[Variable]) -> VariablePool:
 
 class RagPipelineService:
     _session: Session
+    _session_maker: sessionmaker[Session]
 
-    def __init__(self, session: Session, session_maker: sessionmaker | None = None):
+    def __init__(self, session: Session, session_maker: sessionmaker[Session] | None = None):
         """Initialize RagPipelineService with repository dependencies."""
         self._session = session
         if session_maker is None:
             session_maker = sessionmaker(bind=db.engine, expire_on_commit=False)
+        self._session_maker = session_maker
         self._node_execution_service_repo = DifyAPIRepositoryFactory.create_api_workflow_node_execution_repository(
             session_maker
         )
         self._workflow_run_repo = DifyAPIRepositoryFactory.create_api_workflow_run_repository(session_maker)
+        self._pending_dataset_indexing_intent_ids: list[str] = []
+
+    @property
+    def pending_dataset_indexing_intent_ids(self) -> tuple[str, ...]:
+        """Rebuild intents flushed by publish and safe to dispatch after caller commit."""
+        return tuple(self._pending_dataset_indexing_intent_ids)
 
     @staticmethod
     def get_pipeline_by_id(pipeline_id: str, tenant_id: str, *, session: Session) -> Pipeline | None:
@@ -306,11 +394,7 @@ class RagPipelineService:
         return workflow
 
     def get_published_workflow_by_id(self, pipeline: Pipeline, workflow_id: str) -> Workflow | None:
-        """Fetch and lock a published Workflow snapshot for restoration.
-
-        The source lock is held until the service transaction ends, preventing
-        concurrent deletion while restore copies its Workflow snapshot fields.
-        """
+        """Lock a published Workflow while its fields are copied into the draft."""
         workflow = self._session.scalar(
             select(Workflow)
             .where(
@@ -462,6 +546,7 @@ class RagPipelineService:
         pipeline: Pipeline,
         account: Account,
     ) -> Workflow:
+        self._pending_dataset_indexing_intent_ids.clear()
         draft_workflow_stmt = select(Workflow).where(
             Workflow.tenant_id == pipeline.tenant_id,
             Workflow.app_id == pipeline.id,
@@ -508,12 +593,14 @@ class RagPipelineService:
                 dataset = get_pipeline_dataset(pipeline, session=session)
                 if not dataset:
                     raise ValueError("Dataset not found")
-                DatasetService.update_rag_pipeline_dataset_settings(
+                indexing_intent_ids = DatasetService.update_rag_pipeline_dataset_settings(
                     session=session,
                     dataset=dataset,
                     knowledge_configuration=knowledge_configuration,
                     has_published=pipeline.is_published,
+                    account=account,
                 )
+                self._pending_dataset_indexing_intent_ids.extend(indexing_intent_ids)
         # return new workflow
         return workflow
 
@@ -579,7 +666,13 @@ class RagPipelineService:
         return default_config
 
     def run_draft_workflow_node(
-        self, pipeline: Pipeline, node_id: str, user_inputs: dict[str, Any], account: Account
+        self,
+        pipeline: Pipeline,
+        node_id: str,
+        user_inputs: dict[str, Any],
+        account: Account,
+        *,
+        external_retrieval: "ExternalDatasetRetriever",
     ) -> WorkflowNodeExecutionModel | None:
         """
         Run draft workflow node
@@ -601,6 +694,7 @@ class RagPipelineService:
 
         workflow_node_execution = self._handle_node_run_result(
             getter=lambda: WorkflowEntry.single_step_run(
+                external_retrieval=external_retrieval,
                 execution_driver=WorkflowRunAgg.run,
                 workflow=draft_workflow,
                 node_id=node_id,
@@ -922,30 +1016,6 @@ class RagPipelineService:
         except Exception as e:
             logger.exception("Error in run_datasource_node_preview.")
             raise RuntimeError(str(e)) from e
-
-    def run_free_workflow_node(
-        self, node_data: dict, tenant_id: str, user_id: str, node_id: str, user_inputs: dict[str, Any]
-    ) -> WorkflowNodeExecution:
-        """
-        Run draft workflow node
-        """
-        # run draft workflow node
-        start_at = time.perf_counter()
-
-        workflow_node_execution = self._handle_node_run_result(
-            getter=lambda: WorkflowEntry.run_free_node(
-                node_id=node_id,
-                node_data=node_data,
-                tenant_id=tenant_id,
-                user_id=user_id,
-                user_inputs=user_inputs,
-            ),
-            start_at=start_at,
-            tenant_id=tenant_id,
-            node_id=node_id,
-        )
-
-        return workflow_node_execution
 
     def _handle_node_run_result(
         self,
@@ -1372,7 +1442,14 @@ class RagPipelineService:
         )
         return node_exec
 
-    def set_datasource_variables(self, pipeline: Pipeline, args: dict[str, Any], current_user: Account):
+    def set_datasource_variables(
+        self,
+        pipeline: Pipeline,
+        args: dict[str, Any],
+        current_user: Account,
+        *,
+        external_retrieval: "ExternalDatasetRetriever",
+    ):
         """
         Set datasource variables
         """
@@ -1402,6 +1479,7 @@ class RagPipelineService:
 
         workflow_node_execution = self._handle_node_run_result(
             getter=lambda: WorkflowEntry.single_step_run(
+                external_retrieval=external_retrieval,
                 execution_driver=WorkflowRunAgg.run,
                 workflow=draft_workflow,
                 node_id=node_id,
@@ -1512,41 +1590,161 @@ class RagPipelineService:
         }
 
     def retry_error_document(
-        self, dataset: Dataset, document: Document, user: Account | EndUser, *, generator: PipelineGenerator
-    ):
-        """
-        Retry error document
-        """
-        document_pipeline_execution_log = self._session.scalar(
-            select(DocumentPipelineExecutionLog).where(DocumentPipelineExecutionLog.document_id == document.id).limit(1)
-        )
-        if not document_pipeline_execution_log:
-            raise ValueError("Document pipeline execution log not found")
-        pipeline = self._session.get(Pipeline, document_pipeline_execution_log.pipeline_id)
-        if not pipeline:
-            raise ValueError("Pipeline not found")
-        # convert to app config
-        workflow = self.get_published_workflow(pipeline)
-        if not workflow:
-            raise ValueError("Workflow not found")
-        generator.generate(
-            session=self._session,
-            pipeline=pipeline,
-            workflow=workflow,
+        self,
+        dataset: Dataset,
+        document: Document,
+        user: Account | EndUser,
+        *,
+        generator: PipelineGenerator,
+        indexing_request_id: str | None = None,
+        claim_id: str | None = None,
+        recovery_required: bool = False,
+    ) -> None:
+        """Retry a document from the immutable source snapshot owned by its request."""
+        if document.tenant_id != dataset.tenant_id or document.dataset_id != dataset.id:
+            raise ValueError("Document not found")
+        if (indexing_request_id is None) != (claim_id is None):
+            raise ValueError("A durable pipeline retry requires both request and claim ids")
+        if self._session.in_transaction():
+            raise RuntimeError("Pipeline retry requires an execution session without an active transaction")
+
+        snapshot = self._load_pipeline_retry_snapshot(
+            dataset=dataset,
+            document=document,
             user=user,
-            args={
-                "inputs": document_pipeline_execution_log.input_data,
-                "start_node_id": document_pipeline_execution_log.datasource_node_id,
-                "datasource_type": document_pipeline_execution_log.datasource_type,
-                "datasource_info_list": [json.loads(document_pipeline_execution_log.datasource_info)],
-                "original_document_id": document.id,
-            },
-            invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
-            streaming=False,
-            call_depth=0,
-            workflow_thread_pool_id=None,
-            is_retry=True,
+            indexing_request_id=indexing_request_id,
+            recovery_required=recovery_required,
         )
+        if indexing_request_id is None or claim_id is None:
+            generator.generate(
+                session=self._session,
+                pipeline=snapshot.pipeline,
+                workflow=snapshot.workflow,
+                user=user,
+                args=snapshot.args,
+                invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
+                streaming=False,
+                call_depth=0,
+                is_retry=True,
+                target_document_id=snapshot.target_document_id,
+                enforce_projected_capacity=snapshot.enforce_projected_capacity,
+            )
+        else:
+            generator.generate(
+                session=self._session,
+                pipeline=snapshot.pipeline,
+                workflow=snapshot.workflow,
+                user=user,
+                args=snapshot.args,
+                invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
+                streaming=False,
+                call_depth=0,
+                is_retry=True,
+                indexing_request_id=indexing_request_id,
+                indexing_claim_id=claim_id,
+                target_document_id=snapshot.target_document_id,
+                enforce_projected_capacity=snapshot.enforce_projected_capacity,
+            )
+
+    def _load_pipeline_retry_snapshot(
+        self,
+        *,
+        dataset: Dataset,
+        document: Document,
+        user: Account | EndUser,
+        indexing_request_id: str | None,
+        recovery_required: bool,
+    ) -> _PipelineRetrySnapshot:
+        """Load and detach retry inputs in a bounded, nonlocking read transaction."""
+        with self._session_maker() as read_session:
+            if indexing_request_id is None:
+                execution_log = read_session.scalar(
+                    select(DocumentPipelineExecutionLog)
+                    .where(
+                        DocumentPipelineExecutionLog.document_id == document.id,
+                        DocumentPipelineExecutionLog.pipeline_id == dataset.pipeline_id,
+                    )
+                    .order_by(
+                        DocumentPipelineExecutionLog.created_at.desc(),
+                        DocumentPipelineExecutionLog.id.desc(),
+                    )
+                    .limit(1)
+                )
+            else:
+                request = read_session.scalar(
+                    select(DocumentIndexingOutbox).where(
+                        DocumentIndexingOutbox.id == indexing_request_id,
+                        DocumentIndexingOutbox.tenant_id == dataset.tenant_id,
+                        DocumentIndexingOutbox.dataset_id == dataset.id,
+                        DocumentIndexingOutbox.action == "retry",
+                        DocumentIndexingOutbox.actor_id == user.id,
+                    )
+                )
+                if request is None or json.loads(request.document_ids) != [document.id]:
+                    raise PipelineIndexingSnapshotUnavailableError("Pipeline indexing request source is unavailable")
+                if request.pipeline_execution_log_id is None:
+                    raise PipelineIndexingSnapshotUnavailableError("Pipeline indexing request source is unavailable")
+                execution_log = read_session.scalar(
+                    select(DocumentPipelineExecutionLog).where(
+                        DocumentPipelineExecutionLog.id == request.pipeline_execution_log_id,
+                        DocumentPipelineExecutionLog.document_id == document.id,
+                        DocumentPipelineExecutionLog.pipeline_id == dataset.pipeline_id,
+                    )
+                )
+
+            if execution_log is None:
+                raise PipelineIndexingSnapshotUnavailableError("Document pipeline execution log not found")
+            if execution_log.workflow_id is None:
+                raise PipelineIndexingSnapshotUnavailableError("Document pipeline workflow snapshot is unavailable")
+
+            pipeline = read_session.scalar(
+                select(Pipeline)
+                .where(
+                    Pipeline.id == execution_log.pipeline_id,
+                    Pipeline.tenant_id == dataset.tenant_id,
+                )
+                .limit(1)
+            )
+            if pipeline is None:
+                raise ValueError("Pipeline not found")
+            workflow = read_session.scalar(
+                select(Workflow)
+                .where(
+                    Workflow.tenant_id == pipeline.tenant_id,
+                    Workflow.app_id == pipeline.id,
+                    Workflow.id == execution_log.workflow_id,
+                )
+                .limit(1)
+            )
+            if workflow is None:
+                raise ValueError("Workflow not found")
+            if workflow.version == Workflow.VERSION_DRAFT:
+                raise IsDraftWorkflowError("source workflow must be published")
+
+            submitted_original_document_id = execution_log.original_document_id
+            cleanup_document_id = submitted_original_document_id
+            if cleanup_document_id is None and (recovery_required or indexing_request_id is None):
+                cleanup_document_id = document.id
+            retry_args = {
+                "inputs": dict(execution_log.input_data),
+                "start_node_id": execution_log.datasource_node_id,
+                "datasource_type": execution_log.datasource_type,
+                "datasource_info_list": [json.loads(execution_log.datasource_info)],
+                "original_document_id": cleanup_document_id,
+            }
+
+            # These immutable version records cross the read-transaction
+            # boundary. Expunge them before Session.close rolls the snapshot
+            # transaction back so later attribute access cannot lazily reopen it.
+            read_session.expunge(pipeline)
+            read_session.expunge(workflow)
+            return _PipelineRetrySnapshot(
+                pipeline=pipeline,
+                workflow=workflow,
+                target_document_id=execution_log.document_id,
+                args=retry_args,
+                enforce_projected_capacity=submitted_original_document_id is None,
+            )
 
     def get_datasource_plugins(
         self,

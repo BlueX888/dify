@@ -12,7 +12,7 @@ from core.file import remote_fetcher
 from extensions.ext_storage import storage
 from graphon.file import helpers as file_helpers
 from models.enums import CreatorUserRole
-from models.model import UploadFile
+from models.model import UploadFile, UploadFileCleanupOutbox
 from services.file_service import FileService, FileUploadActor, FileUploadResult
 from services.remote_file_service import RemoteFileService
 
@@ -28,6 +28,8 @@ class _UploadHarness:
     active_transactions: set[Connection]
     io_events: list[str]
     database_events: list[str]
+    boundary_events: list[str]
+    record_database_events: bool
 
 
 @pytest.fixture
@@ -42,24 +44,66 @@ def upload_harness(
         active_transactions=set(),
         io_events=[],
         database_events=[],
+        boundary_events=[],
+        record_database_events=True,
     )
 
     def begin(connection: Connection) -> None:
         harness.active_transactions.add(connection)
-        harness.database_events.append("begin")
+        if harness.record_database_events:
+            harness.database_events.append("begin")
+            harness.boundary_events.append("db-begin")
 
     def end(connection: Connection) -> None:
         harness.active_transactions.remove(connection)
-        harness.database_events.append("end")
+        if harness.record_database_events:
+            harness.database_events.append("end")
+            harness.boundary_events.append("db-end")
+
+    def observe_upload_state(key: str | None = None, *, upload_file_id: str | None = None) -> str:
+        harness.record_database_events = False
+        try:
+            with sqlite_session_factory() as session:
+                if upload_file_id is None:
+                    assert key is not None
+                    marker = session.scalar(
+                        select(UploadFileCleanupOutbox).where(
+                            UploadFileCleanupOutbox.key == key,
+                        )
+                    )
+                    assert marker is not None
+                    assert marker.writer_id is not None
+                    assert marker.writer_finished_at is None
+                    assert marker.cleanup_started_at is None
+                    assert session.get(UploadFile, marker.upload_file_id) is None
+                    return key
+                persisted = session.get(UploadFile, upload_file_id)
+                assert persisted is not None
+                marker = session.scalar(
+                    select(UploadFileCleanupOutbox).where(
+                        UploadFileCleanupOutbox.upload_file_id == upload_file_id,
+                    )
+                )
+                assert marker is None
+                return persisted.key
+        finally:
+            harness.record_database_events = True
 
     def save(key: str, content: bytes) -> None:
         assert not harness.active_transactions
+        observe_upload_state(key)
+        harness.boundary_events.append("marker-visible")
         harness.io_events.append("storage")
+        harness.boundary_events.append("storage")
         harness.stored[key] = content
 
     def signed_url(upload_file_id: str) -> str:
         assert not harness.active_transactions
+        key = observe_upload_state(upload_file_id=upload_file_id)
+        assert key in harness.stored
+        harness.boundary_events.append("publication-visible")
         harness.io_events.append("sign")
+        harness.boundary_events.append("sign")
         return f"https://files.example.com/{upload_file_id}?sign=test"
 
     event.listen(sqlite_engine, "begin", begin)
@@ -77,7 +121,7 @@ def upload_harness(
 
 @pytest.mark.parametrize("role", [CreatorUserRole.ACCOUNT, CreatorUserRole.END_USER])
 @pytest.mark.parametrize("source_url", ["", _REMOTE_URL])
-def test_actor_upload_preserves_owner_creator_and_source_url_without_extra_queries(
+def test_actor_upload_preserves_owner_creator_and_source_url_across_durable_publication(
     upload_harness: _UploadHarness,
     sqlite_session_factory: sessionmaker[Session],
     role: CreatorUserRole,
@@ -104,9 +148,18 @@ def test_actor_upload_preserves_owner_creator_and_source_url_without_extra_queri
     assert isinstance(result.created_at, datetime)
     assert result.tenant_id == _TENANT_ID
     assert result.source_url == (source_url or f"https://files.example.com/{result.id}?sign=test")
-    assert upload_harness.database_events == ["begin", "end"]
+    assert upload_harness.database_events == ["begin", "end", "begin", "end"]
     assert not upload_harness.active_transactions
     assert upload_harness.io_events == (["storage"] if source_url else ["storage", "sign"])
+    assert upload_harness.boundary_events == [
+        "db-begin",
+        "db-end",
+        "marker-visible",
+        "storage",
+        "db-begin",
+        "db-end",
+        *([] if source_url else ["publication-visible", "sign"]),
+    ]
 
     with sqlite_session_factory() as session:
         persisted = session.get(UploadFile, result.id)
@@ -117,6 +170,7 @@ def test_actor_upload_preserves_owner_creator_and_source_url_without_extra_queri
         assert persisted.source_url == source_url
         assert persisted.hash == hashlib.sha3_256(content).hexdigest()
         assert persisted.key.startswith(f"upload_files/{_TENANT_ID}/")
+        assert session.scalar(select(UploadFileCleanupOutbox)) is None
         assert upload_harness.stored == {persisted.key: content}
 
 
@@ -160,8 +214,18 @@ def test_remote_actor_upload_fetches_before_transaction_and_retains_original_url
         ("GET", {} if head_status == httpx.codes.OK else {"timeout": 3, "follow_redirects": True}),
     ]
     assert upload_harness.io_events == ["HEAD", "GET", "storage", "sign"]
-    assert upload_harness.database_events == ["begin", "end"]
+    assert upload_harness.database_events == ["begin", "end", "begin", "end"]
     assert not upload_harness.active_transactions
+    assert upload_harness.boundary_events == [
+        "db-begin",
+        "db-end",
+        "marker-visible",
+        "storage",
+        "db-begin",
+        "db-end",
+        "publication-visible",
+        "sign",
+    ]
 
     with sqlite_session_factory() as session:
         persisted = session.scalars(select(UploadFile)).one()
@@ -171,6 +235,7 @@ def test_remote_actor_upload_fetches_before_transaction_and_retains_original_url
         assert persisted.tenant_id == _TENANT_ID
         assert persisted.source_url == _REMOTE_URL
         assert persisted.key.startswith(f"upload_files/{_TENANT_ID}/")
+        assert session.scalar(select(UploadFileCleanupOutbox)) is None
         assert upload_harness.stored == {persisted.key: content}
 
 

@@ -247,6 +247,7 @@ class PluginInvokeToolApi(Resource):
             return PluginToolBackwardsInvocation.convert_to_event_stream(
                 PluginToolBackwardsInvocation.invoke_tool(
                     execution_driver=WorkflowRunAgg.run,
+                    external_retrieval=application_services().knowledge.external_retrieval,
                     session=session,
                     tenant_id=tenant_model.id,
                     user_id=user_model.id,
@@ -287,6 +288,7 @@ class PluginInvokeParameterExtractorNodeApi(Resource):
                         model_config=payload.model,
                         instruction=payload.instruction,
                         query=payload.query,
+                        external_retrieval=application_services().knowledge.external_retrieval,
                     )
                 )
             )
@@ -320,6 +322,7 @@ class PluginInvokeQuestionClassifierNodeApi(Resource):
                         model_config=payload.model,
                         classes=payload.classes,
                         instruction=payload.instruction,
+                        external_retrieval=application_services().knowledge.external_retrieval,
                     )
                 )
             )
@@ -356,6 +359,7 @@ class PluginInvokeAppApi(Resource):
             inputs=payload.inputs,
             files=payload.files,
             end_users=application_services().app_scoped_end_users.commands,
+            external_retrieval=application_services().knowledge.external_retrieval,
         )
 
         return length_prefixed_response(0xF, PluginAppBackwardsInvocation.convert_to_event_stream(response))

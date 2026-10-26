@@ -5,7 +5,7 @@ from uuid import UUID
 
 from flask import request
 from flask_restx import Resource
-from pydantic import BaseModel, Field, TypeAdapter, field_validator, model_validator
+from pydantic import BaseModel, Field, TypeAdapter, ValidationError, field_validator, model_validator
 from werkzeug.exceptions import BadRequest, Forbidden, NotFound
 
 from controllers.common.errors import InvalidArgumentError, NotFoundError
@@ -45,8 +45,8 @@ from models.account import TenantAccountRole
 from models.enums import CreatorUserRole, DatasetQuerySource
 from models.enums import PermissionEnum as DatasetPermissionEnum
 from models.model import AppMode, IconType
+from services.errors.dataset import DatasetAccessDeniedError, DatasetNotFoundError
 from services.errors.dataset import DatasetNameDuplicateError as DatasetNameDuplicateFailure
-from services.knowledge.dataset_access import DatasetAccessDeniedError, DatasetNotFoundError
 from services.knowledge.datasets.application import DatasetListFilter
 from services.knowledge.entities.indexing_estimate import (
     NewEstimateSource,
@@ -201,6 +201,7 @@ def _new_estimate_sources(info_list: dict[str, Any]) -> tuple[NewEstimateSource,
                 WebsiteEstimateSource(
                     provider=website.provider,
                     job_id=website.job_id,
+                    source_handle=website.source_handle,
                     url=url,
                     only_main_content=website.only_main_content,
                 )
@@ -626,13 +627,14 @@ class DatasetApiKeyApi(Resource):
         rbac_checks=(RBACCheck(RBACPermission.DATASET_API_KEY_MANAGE, Workspace()),),
     )
     def post(self, request_context: RequestContext):
-        # Preserve the optional scope and validation response of the workspace route.
-        payload = request.get_json(silent=True) or {}
-        dataset_ids = payload.get("dataset_ids") or []
-        if not isinstance(dataset_ids, list) or any(not isinstance(item, str) for item in dataset_ids):
-            raise BadRequest("dataset_ids must be a list of strings.")
+        try:
+            payload = DatasetApiKeyCreatePayload.model_validate(request.get_json() if request.get_data() else {})
+        except ValidationError as error:
+            raise BadRequest("dataset_ids must be a list of strings.") from error
         with api_key_create_errors():
-            key = application_services().dataset_api_keys.create_workspace_key(request_context, tuple(dataset_ids))
+            key = application_services().dataset_api_keys.create_workspace_key(
+                request_context, tuple(payload.dataset_ids)
+            )
         return dump_response(ApiKeyItem, key), 200
 
 

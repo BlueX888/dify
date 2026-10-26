@@ -14,6 +14,7 @@ from graphon.enums import WorkflowExecutionStatus
 from libs.datetime_utils import ensure_naive_utc, naive_utc_now
 from models.human_input import HumanInputForm
 from models.workflow import WorkflowPause, WorkflowRun
+from repositories.workflow_run_history import advance_workflow_run_history
 from services.human_input_service import HumanInputService
 
 logger = logging.getLogger(__name__)
@@ -30,27 +31,32 @@ def _is_global_timeout(form_model: HumanInputForm, global_timeout_seconds: int, 
 
 
 def _handle_global_timeout(*, form_id: str, workflow_run_id: str, node_id: str, session_factory: sessionmaker) -> None:
+    del form_id
     now = naive_utc_now()
+    state_object_key: str | None = None
     with session_factory() as session, session.begin():
-        workflow_run = session.get(WorkflowRun, workflow_run_id)
+        workflow_run = session.scalar(
+            select(WorkflowRun).where(WorkflowRun.id == workflow_run_id).with_for_update(of=WorkflowRun)
+        )
         if workflow_run is not None:
             workflow_run.status = WorkflowExecutionStatus.STOPPED
             workflow_run.error = f"Human input global timeout at node {node_id}"
             workflow_run.finished_at = now
+            workflow_run.stop_requested_at = workflow_run.stop_requested_at or now
+            advance_workflow_run_history(workflow_run)
             session.add(workflow_run)
 
         pause_model = session.scalar(select(WorkflowPause).where(WorkflowPause.workflow_run_id == workflow_run_id))
         if pause_model is not None:
-            try:
-                storage.delete(pause_model.state_object_key)
-            except Exception:
-                logger.exception(
-                    "Failed to delete pause state object for workflow_run_id=%s, pause_id=%s",
-                    workflow_run_id,
-                    pause_model.id,
-                )
+            state_object_key = pause_model.state_object_key
             pause_model.resumed_at = now
             session.add(pause_model)
+
+    if state_object_key is not None:
+        try:
+            storage.delete(state_object_key)
+        except Exception:
+            logger.exception("Failed to delete pause state object for workflow_run_id=%s", workflow_run_id)
 
 
 @shared_task(name="human_input_form_timeout.check_and_resume", queue="schedule_executor")

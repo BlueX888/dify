@@ -11,6 +11,41 @@ from pydantic import ValidationError
 
 from core.rag.models.document import Document
 from models.dataset import Dataset
+from services.knowledge.entities.vector_route import VectorRoute
+
+
+class _RecordingIndices:
+    def __init__(self) -> None:
+        self.deleted: list[tuple[str, dict[str, object]]] = []
+        self.refreshed: list[str] = []
+
+    def exists(self, *, index: str) -> bool:
+        _ = index
+        return True
+
+    def delete(self, *, index: str, params: dict[str, object]) -> None:
+        self.deleted.append((index, params))
+
+    def refresh(self, *, index: str) -> None:
+        self.refreshed.append(index)
+
+
+class _RecordingOpenSearch:
+    instances: list["_RecordingOpenSearch"] = []
+
+    def __init__(self, **kwargs: object) -> None:
+        self.kwargs = kwargs
+        self.indices = _RecordingIndices()
+        self.deleted_by_query: list[tuple[str, dict[str, object]]] = []
+        self.__class__.instances.append(self)
+
+    def delete_by_query(self, *, index: str, body: dict[str, object]) -> None:
+        self.deleted_by_query.append((index, body))
+
+
+class _UnusedEmbeddings:
+    def embed_query(self, _query: str) -> list[float]:
+        raise AssertionError("persisted Lindorm routes must not probe embeddings")
 
 
 def _build_fake_opensearch_modules():
@@ -405,3 +440,56 @@ def test_lindorm_factory_branches(lindorm_module, monkeypatch: pytest.MonkeyPatc
         factory.init_vector(dataset_new_plain, attributes=[], embeddings=embeddings, session=None)
     assert store_cls.call_args.args[0] == "auto_collection"
     assert store_cls.call_args.kwargs["routing_value"] is None
+
+
+def test_persisted_ugc_route_deletes_only_its_dataset_routing_partition(
+    lindorm_module, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    route = VectorRoute.capture(
+        tenant_id="tenant-1",
+        dataset_id="dataset-1",
+        vector_type="lindorm",
+        collection_name="ugc_index_1536_hnsw_l2",
+        routing_index_struct=json.dumps(
+            {
+                "type": "lindorm",
+                "vector_store": {"class_prefix": "DATASET_ROUTE"},
+                "using_ugc": True,
+                "dimension": 1536,
+                "index_type": "hnsw",
+                "distance_type": "l2",
+            }
+        ),
+        collection_binding_id=None,
+        indexing_technique="high_quality",
+        doc_form="text_model",
+    )
+    restored_route = VectorRoute.model_validate_json(route.serialized)
+    dataset = Dataset(id=restored_route.dataset_id, index_struct=restored_route.index_struct)
+
+    _RecordingOpenSearch.instances.clear()
+    monkeypatch.setattr(lindorm_module, "OpenSearch", _RecordingOpenSearch)
+    monkeypatch.setattr(lindorm_module.dify_config, "LINDORM_URL", "http://localhost:9200")
+    monkeypatch.setattr(lindorm_module.dify_config, "LINDORM_USERNAME", "user")
+    monkeypatch.setattr(lindorm_module.dify_config, "LINDORM_PASSWORD", "pass")
+    monkeypatch.setattr(lindorm_module.dify_config, "LINDORM_QUERY_TIMEOUT", 3.0)
+    monkeypatch.setattr(lindorm_module.dify_config, "LINDORM_USING_UGC", False)
+
+    vector = lindorm_module.LindormVectorStoreFactory().init_vector(
+        dataset,
+        attributes=[],
+        embeddings=_UnusedEmbeddings(),
+        session=None,
+    )
+    assert vector.collection_name == restored_route.collection_name
+    vector.delete()
+
+    client = _RecordingOpenSearch.instances[-1]
+    assert client.deleted_by_query == [
+        (
+            "ugc_index_1536_hnsw_l2",
+            {"query": {"bool": {"must": [{"term": {f"{lindorm_module.ROUTING_FIELD}.keyword": "dataset_route"}}]}}},
+        )
+    ]
+    assert client.indices.deleted == []
+    assert client.indices.refreshed == ["ugc_index_1536_hnsw_l2"]

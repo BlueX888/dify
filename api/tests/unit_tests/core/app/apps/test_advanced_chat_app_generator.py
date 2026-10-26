@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 
 import pytest
 from sqlalchemy.engine import Engine
@@ -14,11 +14,19 @@ from core.app.entities.app_invoke_entities import AdvancedChatAppGenerateEntity,
 from core.app.task_pipeline import message_cycle_manager
 from core.app.task_pipeline.message_cycle_manager import MessageCycleManager
 from core.ops.ops_trace_manager import TraceQueueManager
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from models import Account, Workflow
 from models.enums import ConversationFromSource
 from models.model import App, AppMode, Conversation
 from services.errors.conversation import ConversationNotExistsError
 from services.workflow_run_agg import WorkflowRunAgg
+
+
+def _generator() -> AdvancedChatAppGenerator:
+    return AdvancedChatAppGenerator(
+        execution_driver=WorkflowRunAgg.run,
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+    )
 
 
 def _make_app_config() -> WorkflowUIBasedAppConfig:
@@ -87,7 +95,7 @@ def test_init_generate_records_sets_conversation_metadata(sqlite_session: Sessio
     app_config = _make_app_config()
     entity = _make_generate_entity(app_config)
 
-    generator = AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run)
+    generator = _generator()
 
     conversation, _ = generator._init_generate_records(
         entity,
@@ -126,7 +134,7 @@ def test_init_generate_records_marks_existing_conversation(sqlite_session: Sessi
     sqlite_session.add(existing_conversation)
     sqlite_session.flush()
 
-    generator = AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run)
+    generator = _generator()
 
     conversation, _ = generator._init_generate_records(
         entity,
@@ -188,7 +196,7 @@ def test_generate_falls_back_to_new_conversation_when_conversation_missing(
 
     monkeypatch.setattr(AdvancedChatAppGenerator, "_generate", fake_generate)
 
-    result = AdvancedChatAppGenerator(execution_driver=WorkflowRunAgg.run).generate(
+    result = _generator().generate(
         app_model=app_model,
         workflow=workflow,
         user=user,

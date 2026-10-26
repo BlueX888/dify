@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import logging
 import os
 import posixpath
 import uuid
@@ -22,6 +23,7 @@ from constants import (
     IMAGE_EXTENSIONS,
     VIDEO_EXTENSIONS,
 )
+from core.rag.extractor.entity.extract_setting import CreatedUploadArtifact
 from core.rag.extractor.extract_processor import ExtractProcessor
 from enums import DeploymentEdition
 from extensions.ext_storage import storage
@@ -32,10 +34,19 @@ from libs.helper import extract_tenant_id
 from models import Account
 from models.enums import CreatorUserRole
 from models.model import EndUser, UploadFile
+from repositories.upload_file_repository import (
+    SQLAlchemyUploadFileCleanupRepository,
+    UploadFilePublicationLostError,
+)
+from services.knowledge.upload_file_cleanup import (
+    cleanup_created_upload_artifacts,
+    maintain_created_upload_artifact_writers,
+)
 
 from .errors.file import BlockedFileExtensionError, FileNotExistsError, FileTooLargeError, UnsupportedFileTypeError
 
 PREVIEW_WORDS_LIMIT = 3000
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +72,7 @@ class FileUploadResult:
 
 class FileService:
     _session_maker: sessionmaker[Session]
+    _upload_cleanup: SQLAlchemyUploadFileCleanupRepository
 
     def __init__(self, session_factory: sessionmaker | Engine | None = None):
         match session_factory:
@@ -70,6 +82,45 @@ class FileService:
                 self._session_maker = session_factory
             case _:
                 raise AssertionError("must be a sessionmaker or an Engine.")
+        self._upload_cleanup = SQLAlchemyUploadFileCleanupRepository(session_factory=self._session_maker)
+
+    def _cleanup_failed_upload(
+        self,
+        tenant_id: str,
+        artifact: CreatedUploadArtifact,
+        *,
+        writer_id: str,
+        storage_completed: bool,
+    ) -> None:
+        """Retain retryable cleanup evidence without trusting the writer commit outcome."""
+        if storage_completed:
+            try:
+                self._upload_cleanup.finish_created_upload_artifact_write(
+                    workspace_id=tenant_id,
+                    upload_file_id=artifact.id,
+                    writer_id=writer_id,
+                )
+            except UploadFilePublicationLostError:
+                # The publication transaction may have committed and consumed
+                # the marker, or cleanup may already have fenced it. The global
+                # liveness check below distinguishes those outcomes safely.
+                pass
+            except Exception:
+                logger.exception("Failed to finish upload writer marker, upload_file_id=%s", artifact.id)
+        try:
+            cleanup_created_upload_artifacts(
+                workspace_id=tenant_id,
+                artifacts=(artifact,),
+                files=self._upload_cleanup,
+                delete_blob=storage.delete,
+                logger=logger,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to record upload cleanup after file creation failed: upload_file_id=%s key=%s",
+                artifact.id,
+                artifact.key,
+            )
 
     def upload_file(
         self,
@@ -82,6 +133,7 @@ class FileService:
         source: Literal["datasets"] | None = None,
         source_url: str = "",
         default_file_size_limit: int | None = None,
+        temporary: bool = False,
     ) -> UploadFile:
         """Persist a file with the given creator and resource tenant.
 
@@ -93,6 +145,8 @@ class FileService:
         default_file_size_limit is the non-media limit in MiB; None uses
         dify_config.UPLOAD_FILE_SIZE_LIMIT, and 0 permits only empty files.
         Images, video and audio always use their dedicated configured limits.
+        Temporary uploads retain their durable writer marker until a later
+        owner transaction publishes a formal reference or cleanup takes over.
         """
         if isinstance(user, FileUploadActor) and tenant_id is None:
             raise TypeError("tenant_id is required when uploading with FileUploadActor")
@@ -138,10 +192,6 @@ class FileService:
 
         file_key = "upload_files/" + (resource_tenant_id or "") + "/" + file_uuid + "." + extension
 
-        # save file to storage
-        storage.save(file_key, content)
-
-        # save file to db
         upload_file = UploadFile(
             tenant_id=resource_tenant_id or "",
             storage_type=StorageType(dify_config.STORAGE_TYPE),
@@ -157,15 +207,51 @@ class FileService:
             hash=hashlib.sha3_256(content).hexdigest(),
             source_url=source_url,
         )
+        artifact = CreatedUploadArtifact(id=upload_file.id, key=file_key)
+        writer_id = self._upload_cleanup.begin_created_upload_artifact_write(
+            workspace_id=resource_tenant_id or "",
+            artifact=artifact,
+        )
+        storage_completed = False
+        try:
+            with maintain_created_upload_artifact_writers(
+                workspace_id=resource_tenant_id or "",
+                upload_file_ids=lambda: (artifact.id,),
+                files=self._upload_cleanup,
+                logger=logger,
+            ):
+                storage.save(file_key, content)
+                storage_completed = True
 
-        with self._session_maker(expire_on_commit=False) as session:
-            session.add(upload_file)
-            session.commit()
+                with self._session_maker(expire_on_commit=False) as session:
+                    session.add(upload_file)
+                    if temporary:
+                        self._upload_cleanup.finish_created_upload_artifact_writes_in_session(
+                            session,
+                            workspace_id=resource_tenant_id or "",
+                            writer_ids={artifact.id: writer_id},
+                        )
+                    else:
+                        self._upload_cleanup.publish_created_upload_file_in_session(
+                            session,
+                            workspace_id=resource_tenant_id or "",
+                            artifact=artifact,
+                            writer_id=writer_id,
+                        )
+                    session.commit()
 
-        if not upload_file.source_url:
-            upload_file.source_url = file_helpers.get_signed_file_url(upload_file_id=upload_file.id)
+            if not upload_file.source_url:
+                upload_file.source_url = file_helpers.get_signed_file_url(upload_file_id=upload_file.id)
 
-        return upload_file
+            return upload_file
+        except Exception:
+            self._cleanup_failed_upload(
+                resource_tenant_id or "",
+                artifact,
+                writer_id=writer_id,
+                storage_completed=storage_completed,
+            )
+            raise
 
     def upload_file_for_actor(
         self,
@@ -295,10 +381,6 @@ class FileService:
         file_key = "upload_files/" + tenant_id + "/" + file_uuid + ".txt"
         content = text.encode("utf-8")
 
-        # save file to storage
-        storage.save(file_key, content)
-
-        # save file to db
         upload_file = UploadFile(
             tenant_id=tenant_id,
             storage_type=StorageType(dify_config.STORAGE_TYPE),
@@ -314,12 +396,39 @@ class FileService:
             used_by=user_id,
             used_at=naive_utc_now(),
         )
-
-        with self._session_maker(expire_on_commit=False) as session:
-            session.add(upload_file)
-            session.commit()
-
-        return upload_file
+        artifact = CreatedUploadArtifact(id=upload_file.id, key=file_key)
+        writer_id = self._upload_cleanup.begin_created_upload_artifact_write(
+            workspace_id=tenant_id,
+            artifact=artifact,
+        )
+        storage_completed = False
+        try:
+            with maintain_created_upload_artifact_writers(
+                workspace_id=tenant_id,
+                upload_file_ids=lambda: (artifact.id,),
+                files=self._upload_cleanup,
+                logger=logger,
+            ):
+                storage.save(file_key, content)
+                storage_completed = True
+                with self._session_maker(expire_on_commit=False) as session:
+                    session.add(upload_file)
+                    self._upload_cleanup.publish_created_upload_file_in_session(
+                        session,
+                        workspace_id=tenant_id,
+                        artifact=artifact,
+                        writer_id=writer_id,
+                    )
+                    session.commit()
+            return upload_file
+        except Exception:
+            self._cleanup_failed_upload(
+                tenant_id,
+                artifact,
+                writer_id=writer_id,
+                storage_completed=storage_completed,
+            )
+            raise
 
     def get_file_preview(self, file_id: str, tenant_id: str) -> str:
         """
@@ -338,7 +447,7 @@ class FileService:
         if extension.lower() not in DOCUMENT_EXTENSIONS:
             raise UnsupportedFileTypeError()
 
-        text = ExtractProcessor.load_from_upload_file(upload_file, return_text=True)
+        text = ExtractProcessor.load_from_upload_file(upload_file, return_text=True, persist_images=False)
         return text[0:PREVIEW_WORDS_LIMIT] if text else ""
 
     def get_file_content(self, file_id: str) -> str:

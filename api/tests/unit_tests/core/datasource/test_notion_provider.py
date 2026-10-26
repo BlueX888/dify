@@ -13,14 +13,11 @@ All tests use mocking to avoid external dependencies and ensure fast, reliable e
 Tests follow the Arrange-Act-Assert pattern for clarity.
 """
 
-import json
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from unittest.mock import Mock, patch
-from uuid import uuid4
 
 import httpx
 import pytest
-from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.datasource.entities.datasource_entities import (
@@ -33,54 +30,11 @@ from core.datasource.entities.datasource_entities import (
 from core.datasource.online_document.online_document_provider import (
     OnlineDocumentDatasourcePluginProviderController,
 )
-from core.rag.extractor import notion_extractor as notion_extractor_module
 from core.rag.extractor.entity.extract_setting import StoredDocumentExtractionInput
 from core.rag.extractor.notion_extractor import NotionExtractor
 from core.rag.models.document import Document
 from core.tools.entities.common_entities import I18nObject
 from extensions.application_services.data_sources import build_data_source_credentials
-from models.base import TypeBase
-from models.dataset import Document as DocumentModel
-from models.enums import DataSourceType, DocumentCreatedFrom
-
-
-@pytest.fixture
-def database(sqlite_engine: Engine, monkeypatch: pytest.MonkeyPatch) -> Iterator[Session]:
-    """Bind a real session for Notion document metadata persistence."""
-
-    TypeBase.metadata.create_all(sqlite_engine, tables=[TypeBase.metadata.tables[DocumentModel.__tablename__]])
-    with Session(sqlite_engine, expire_on_commit=False) as session:
-        monkeypatch.setattr(notion_extractor_module.db, "session", session)
-        yield session
-
-
-@pytest.fixture
-def persisted_document(database: Session) -> DocumentModel:
-    document = DocumentModel(
-        id=str(uuid4()),
-        tenant_id=str(uuid4()),
-        dataset_id=str(uuid4()),
-        position=1,
-        data_source_type=DataSourceType.NOTION_IMPORT,
-        data_source_info=json.dumps({"last_edited_time": "2024-01-01T00:00:00.000Z"}),
-        batch="batch",
-        name="Notion page",
-        created_from=DocumentCreatedFrom.WEB,
-        created_by=str(uuid4()),
-    )
-    database.add(document)
-    database.commit()
-    return document
-
-
-def _extraction_input(document: DocumentModel) -> StoredDocumentExtractionInput:
-    """Detach the values the extractor needs, as the indexing source adapter does."""
-    return StoredDocumentExtractionInput(
-        id=document.id,
-        tenant_id=document.tenant_id,
-        dataset_id=document.dataset_id,
-        data_source_info_dict=document.data_source_info_dict,
-    )
 
 
 class TestNotionExtractorAuthentication:
@@ -856,34 +810,50 @@ class TestNotionExtractorLastEditedTime:
         assert "databases/database-789" in call_args[0][1]
 
     @patch("httpx.request")
-    def test_update_last_edited_time(
+    def test_extract_exposes_source_version_without_mutating_document_input(
         self,
         mock_request: Mock,
         extractor_page: NotionExtractor,
-        database: Session,
-        persisted_document: DocumentModel,
+        mock_document_model: StoredDocumentExtractionInput,
     ) -> None:
-        """Test updating document model with last edited time."""
+        """The extractor returns source version evidence without persisting it."""
         # Arrange
-        mock_response_data = {
-            "object": "page",
-            "id": "page-456",
-            "last_edited_time": "2024-11-27T18:00:00.000Z",
-        }
-        mock_response = httpx.Response(200, json=mock_response_data)
-        mock_request.return_value = mock_response
+        version = "2024-11-27T18:00:00.000Z"
+        mock_request.side_effect = [
+            httpx.Response(200, json={"object": "page", "id": "page-456", "last_edited_time": version}),
+            httpx.Response(200, json={"object": "list", "results": [], "next_cursor": None}),
+        ]
 
         # Act
-        extractor_page.update_last_edited_time(_extraction_input(persisted_document))
+        documents = extractor_page.extract()
 
         # Assert
-        database.expire(persisted_document)
-        assert persisted_document.data_source_info_dict["last_edited_time"] == "2024-11-27T18:00:00.000Z"
+        assert len(documents) == 1
+        assert extractor_page.last_edited_time == version
+        assert mock_document_model.data_source_info_dict == {"last_edited_time": "2024-01-01T00:00:00.000Z"}
 
-    def test_update_last_edited_time_no_document(self, extractor_page: NotionExtractor) -> None:
-        """Test update_last_edited_time with None document model."""
-        # Act & Assert - should not raise error
-        extractor_page.update_last_edited_time(None)
+    @patch.object(NotionExtractor, "_load_data_as_documents", side_effect=ValueError("content extraction failed"))
+    @patch("httpx.request")
+    def test_failed_extract_does_not_mutate_document_input(
+        self,
+        mock_request: Mock,
+        mock_load_data: Mock,
+        extractor_page: NotionExtractor,
+        mock_document_model: StoredDocumentExtractionInput,
+    ) -> None:
+        """A failed extraction may observe a version but must not persist it."""
+        version = "2024-11-27T18:00:00.000Z"
+        mock_request.return_value = httpx.Response(
+            200,
+            json={"object": "page", "id": "page-456", "last_edited_time": version},
+        )
+
+        with pytest.raises(ValueError, match="content extraction failed"):
+            extractor_page.extract()
+
+        assert extractor_page.last_edited_time == version
+        assert mock_document_model.data_source_info_dict == {"last_edited_time": "2024-01-01T00:00:00.000Z"}
+        mock_load_data.assert_called_once_with("page-456", "page")
 
 
 class TestNotionExtractorIntegration:
@@ -908,7 +878,9 @@ class TestNotionExtractorIntegration:
 
     @patch("httpx.request")
     def test_extract_page_complete_workflow(
-        self, mock_request: Mock, database: Session, persisted_document: DocumentModel
+        self,
+        mock_request: Mock,
+        mock_document_model: StoredDocumentExtractionInput,
     ) -> None:
         """Test complete page extraction workflow."""
         # Arrange
@@ -918,7 +890,7 @@ class TestNotionExtractorIntegration:
             notion_page_type="page",
             tenant_id="tenant-789",
             notion_access_token="test-token",
-            document_model=_extraction_input(persisted_document),
+            document_model=mock_document_model,
             notion_token_loader=lambda: "token",
         )
 
@@ -969,8 +941,8 @@ class TestNotionExtractorIntegration:
         assert isinstance(documents[0], Document)
         assert "# Test Page" in documents[0].page_content
         assert "Test content" in documents[0].page_content
-        database.expire(persisted_document)
-        assert persisted_document.data_source_info_dict["last_edited_time"] == "2024-11-27T20:00:00.000Z"
+        assert extractor.last_edited_time == "2024-11-27T20:00:00.000Z"
+        assert mock_document_model.data_source_info_dict == {"last_edited_time": "2024-01-01T00:00:00.000Z"}
 
     @patch("httpx.post")
     @patch("httpx.request")
@@ -978,8 +950,7 @@ class TestNotionExtractorIntegration:
         self,
         mock_request: Mock,
         mock_post: Mock,
-        database: Session,
-        persisted_document: DocumentModel,
+        mock_document_model: StoredDocumentExtractionInput,
     ) -> None:
         """Test complete database extraction workflow."""
         # Arrange
@@ -989,7 +960,7 @@ class TestNotionExtractorIntegration:
             notion_page_type="database",
             tenant_id="tenant-789",
             notion_access_token="test-token",
-            document_model=_extraction_input(persisted_document),
+            document_model=mock_document_model,
             notion_token_loader=lambda: "token",
         )
 
@@ -1029,10 +1000,11 @@ class TestNotionExtractorIntegration:
         assert isinstance(documents[0], Document)
         assert "Name:Item 1" in documents[0].page_content
         assert "Status:Active" in documents[0].page_content
-        database.expire(persisted_document)
-        assert persisted_document.data_source_info_dict["last_edited_time"] == "2024-11-27T20:00:00.000Z"
+        assert extractor.last_edited_time == "2024-11-27T20:00:00.000Z"
+        assert mock_document_model.data_source_info_dict == {"last_edited_time": "2024-01-01T00:00:00.000Z"}
 
-    def test_extract_invalid_page_type(self) -> None:
+    @patch.object(NotionExtractor, "get_notion_last_edited_time", return_value="2024-11-27T20:00:00.000Z")
+    def test_extract_invalid_page_type(self, mock_get_version: Mock) -> None:
         """Test extract with invalid page type."""
         # Arrange
         extractor = NotionExtractor(
@@ -1048,6 +1020,8 @@ class TestNotionExtractorIntegration:
         with pytest.raises(ValueError, match="notion page type not supported") as exc_info:
             extractor.extract()
         assert "notion page type not supported" in str(exc_info.value)
+        assert extractor.last_edited_time == "2024-11-27T20:00:00.000Z"
+        mock_get_version.assert_called_once_with()
 
 
 class TestNotionExtractorReadBlock:

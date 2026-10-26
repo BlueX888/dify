@@ -1,16 +1,21 @@
 """Focused tests for attachment-aware dataset retrieval entry behavior."""
 
-from unittest.mock import patch
+from unittest.mock import create_autospec, patch
 
 from sqlalchemy.orm import Session
 
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.rag.retrieval.dataset_retrieval import DatasetRetrieval
 from core.workflow.nodes.knowledge_retrieval.retrieval import KnowledgeRetrievalRequest
+from extensions.application_services.knowledge_index import build_retrieval_finalizer
 from models.dataset import Dataset
 
 
 def test_knowledge_retrieval_allows_attachment_only_requests(unbound_session: Session) -> None:
-    retrieval = DatasetRetrieval()
+    retrieval = DatasetRetrieval(
+        external_retrieval=create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True),
+        retrieval_finalizer=build_retrieval_finalizer(),
+    )
     available_dataset = Dataset(
         id="dataset-1",
         tenant_id="tenant-1",

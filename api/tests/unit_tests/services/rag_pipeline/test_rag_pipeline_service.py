@@ -9,12 +9,15 @@ from unittest.mock import create_autospec
 
 import pytest
 from pytest_mock import MockerFixture
+from sqlalchemy import event
+from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import ORMExecuteState, Session, sessionmaker
 
 from core.app.apps.pipeline.pipeline_generator import PipelineGenerator
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.rag.index_processor.constant.index_type import IndexStructureType
+from core.rag.retrieval.dataset_retrieval import ExternalDatasetRetriever
 from graphon.engine_events import NodeRunFailedEvent
 from graphon.enums import (
     BuiltinNodeTypes,
@@ -36,6 +39,7 @@ from models.dataset import (
     PipelineRecommendedPlugin,
 )
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
+from models.model import DocumentIndexingOutbox
 from models.workflow import Workflow, WorkflowRun
 from repositories.knowledge.dataset_read_repository import get_pipeline_dataset
 from services.credentials.query import CredentialQuery
@@ -48,8 +52,13 @@ from services.workflow_ref_service import WorkflowRef
 
 
 @pytest.fixture
-def pipeline_generator(mocker: MockerFixture):
+def pipeline_generator(mocker: MockerFixture) -> mock.Mock:
     return mocker.create_autospec(PipelineGenerator, instance=True, spec_set=True)
+
+
+@pytest.fixture
+def external_retrieval() -> ExternalDatasetRetriever:
+    return create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
 
 @dataclass
@@ -193,6 +202,29 @@ def _make_document(*, document_id: str = "doc-1", dataset_id: str = "d1", tenant
         indexing_status=IndexingStatus.WAITING,
         doc_form=IndexStructureType.PARAGRAPH_INDEX,
     )
+
+
+def _make_pipeline_execution_log(
+    *,
+    log_id: str,
+    created_at: datetime,
+    attempt: str,
+    pipeline_id: str = "p1",
+    document_id: str = "doc-1",
+) -> DocumentPipelineExecutionLog:
+    log = DocumentPipelineExecutionLog(
+        pipeline_id=pipeline_id,
+        document_id=document_id,
+        datasource_type=f"source-{attempt}",
+        datasource_info=json.dumps({"attempt": attempt}),
+        datasource_node_id=f"node-{attempt}",
+        input_data={"attempt": attempt},
+        created_by="u1",
+        workflow_id="wf-1",
+    )
+    log.id = log_id
+    log.created_at = created_at
+    return log
 
 
 def _rag_variable(variable: str, *, belong_to_node_id: str = "shared") -> dict[str, object]:
@@ -633,13 +665,15 @@ def test_publish_workflow_success(mocker: MockerFixture, rag_pipeline_service: R
     mocker.patch("services.rag_pipeline.rag_pipeline.KnowledgeConfiguration.model_validate", return_value=mocker.Mock())
     mock_dataset_service_class = mocker.patch("services.knowledge.dataset_service.DatasetService")
 
+    account = _make_account()
     result = rag_pipeline_service.service.publish_workflow(
-        session=rag_pipeline_service.session, pipeline=pipeline, account=_make_account()
+        session=rag_pipeline_service.session, pipeline=pipeline, account=account
     )
 
     assert result.app_id == pipeline.id
     assert result.graph_dict == graph
     mock_dataset_service_class.update_rag_pipeline_dataset_settings.assert_called_once()
+    assert mock_dataset_service_class.update_rag_pipeline_dataset_settings.call_args.kwargs["account"] is account
 
 
 def test_publish_workflow_rejects_missing_llm_environment_reference(
@@ -1014,44 +1048,234 @@ def test_get_datasource_plugins_success(
 
 
 def test_retry_error_document_success(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext, pipeline_generator
+    rag_pipeline_service: RagPipelineServiceTestContext, pipeline_generator: mock.Mock
 ) -> None:
     dataset = _make_dataset()
     document = _make_document()
 
     log = DocumentPipelineExecutionLog(
-        pipeline_id="p-1",
+        pipeline_id="p1",
         document_id="doc-1",
         datasource_type="upload_file",
         datasource_info="{}",
         datasource_node_id="node-id",
         input_data={},
         created_by="account-id",
+        workflow_id="wf-1",
     )
     # Ensure it's a string if it's used as JSON later
 
-    pipeline = Pipeline(tenant_id="tenant-id", name="Test Pipeline", workflow_id="wf-1")
-    pipeline.id = "p-1"
+    pipeline = _make_pipeline(workflow_id="wf-1")
 
-    workflow = _make_workflow(workflow_id="wf-1", tenant_id="tenant-id", app_id="p-1")
+    workflow = _make_workflow(workflow_id="wf-1", version="v1")
     _persist(rag_pipeline_service.session, log, pipeline, workflow)
 
     # Mock PipelineGenerator
     mock_gen_instance = pipeline_generator
 
     # 2. Run test
-    user = mocker.Mock()
-    rag_pipeline_service.service.retry_error_document(dataset, document, user, generator=pipeline_generator)
+    rag_pipeline_service.service.retry_error_document(
+        dataset,
+        document,
+        _make_account(),
+        generator=pipeline_generator,
+    )
 
     # 3. Assertions
     mock_gen_instance.generate.assert_called_once()
+
+
+@pytest.mark.parametrize(("recovery_required", "cleanup_document_id"), [(False, None), (True, "doc-1")])
+def test_durable_retry_uses_the_workflow_and_source_pinned_by_its_exact_request(
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    pipeline_generator: mock.Mock,
+    recovery_required: bool,
+    cleanup_document_id: str | None,
+) -> None:
+    dataset = _make_dataset()
+    document = _make_document()
+    pipeline = _make_pipeline(workflow_id="wf-v2")
+    workflow_v1 = _make_workflow(workflow_id="wf-v1", version="v1", graph={"nodes": [{"id": "source-v1"}]})
+    workflow_v2 = _make_workflow(workflow_id="wf-v2", version="v2", graph={"nodes": []})
+    source_log = DocumentPipelineExecutionLog(
+        pipeline_id=pipeline.id,
+        document_id=document.id,
+        datasource_type="local_file",
+        datasource_info=json.dumps({"name": "v1-file"}),
+        datasource_node_id="source-v1",
+        input_data={"content": "v1"},
+        created_by="u1",
+        workflow_id=workflow_v1.id,
+        original_document_id=None,
+    )
+    rag_pipeline_service.session.add_all([dataset, document, pipeline, workflow_v1, workflow_v2, source_log])
+    rag_pipeline_service.session.flush()
+    request = DocumentIndexingOutbox(
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+        action="retry",
+        document_ids=json.dumps([document.id]),
+        actor_id="u1",
+        pipeline_execution_log_id=source_log.id,
+    )
+    rag_pipeline_service.session.add(request)
+    rag_pipeline_service.session.commit()
+
+    # Exercise the snapshot reader with SQLAlchemy's default expiration
+    # behavior. Detached immutable rows must remain usable without reopening
+    # the execution Session before the external generator boundary.
+    snapshot_session_maker = sessionmaker(bind=rag_pipeline_service.session.get_bind())
+    service = RagPipelineService(rag_pipeline_service.session, session_maker=snapshot_session_maker)
+
+    def assert_closed_read_transaction(**kwargs: object) -> dict[str, object]:
+        assert not rag_pipeline_service.session.in_transaction()
+        assert isinstance(kwargs["pipeline"], Pipeline)
+        assert isinstance(kwargs["workflow"], Workflow)
+        assert sa_inspect(kwargs["pipeline"]).detached
+        assert sa_inspect(kwargs["workflow"]).detached
+        return {}
+
+    pipeline_generator.generate.side_effect = assert_closed_read_transaction
+
+    workflow_reads: list[str] = []
+
+    def capture_workflow_read(execute_state: ORMExecuteState) -> None:
+        sql = str(execute_state.statement.compile(dialect=postgresql.dialect()))
+        if "FROM workflows" in sql:
+            workflow_reads.append(sql)
+
+    event.listen(Session, "do_orm_execute", capture_workflow_read)
+    try:
+        service.retry_error_document(
+            dataset,
+            document,
+            _make_account(),
+            generator=pipeline_generator,
+            indexing_request_id=request.id,
+            claim_id="claim-1",
+            recovery_required=recovery_required,
+        )
+    finally:
+        event.remove(Session, "do_orm_execute", capture_workflow_read)
+
+    call = pipeline_generator.generate.call_args.kwargs
+    assert len(workflow_reads) == 1
+    assert "FOR UPDATE" not in workflow_reads[0]
+    assert call["workflow"].id == workflow_v1.id
+    assert call["target_document_id"] == document.id
+    assert call["args"] == {
+        "inputs": {"content": "v1"},
+        "start_node_id": "source-v1",
+        "datasource_type": "local_file",
+        "datasource_info_list": [{"name": "v1-file"}],
+        "original_document_id": cleanup_document_id,
+    }
+    assert call["enforce_projected_capacity"] is True
+
+
+def test_retry_error_document_uses_latest_attempt_source(
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    pipeline_generator: mock.Mock,
+) -> None:
+    dataset = _make_dataset()
+    document = _make_document()
+    document.indexing_status = IndexingStatus.PARSING
+    pipeline = _make_pipeline(workflow_id="wf-1")
+    workflow = _make_workflow(version="v1")
+    attempt_a = _make_pipeline_execution_log(
+        log_id="00000000-0000-0000-0000-000000000001",
+        created_at=datetime(2026, 1, 1),
+        attempt="A",
+    )
+    attempt_b = _make_pipeline_execution_log(
+        log_id="00000000-0000-0000-0000-000000000002",
+        created_at=datetime(2026, 1, 2),
+        attempt="B",
+    )
+    unrelated_pipeline_attempt = _make_pipeline_execution_log(
+        log_id="00000000-0000-0000-0000-000000000003",
+        created_at=datetime(2026, 1, 3),
+        attempt="unrelated",
+        pipeline_id="other-pipeline",
+    )
+    _persist(
+        rag_pipeline_service.session,
+        dataset,
+        document,
+        pipeline,
+        workflow,
+        attempt_a,
+        attempt_b,
+        unrelated_pipeline_attempt,
+    )
+
+    rag_pipeline_service.service.retry_error_document(
+        dataset,
+        document,
+        _make_account(),
+        generator=pipeline_generator,
+    )
+
+    args = pipeline_generator.generate.call_args.kwargs["args"]
+    assert pipeline_generator.generate.call_args.kwargs["target_document_id"] == document.id
+    assert args == {
+        "inputs": {"attempt": "B"},
+        "start_node_id": "node-B",
+        "datasource_type": "source-B",
+        "datasource_info_list": [{"attempt": "B"}],
+        "original_document_id": document.id,
+    }
+
+
+def test_retry_error_document_breaks_created_at_ties_by_latest_id(
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    pipeline_generator: mock.Mock,
+) -> None:
+    dataset = _make_dataset()
+    document = _make_document()
+    document.indexing_status = IndexingStatus.PARSING
+    pipeline = _make_pipeline(workflow_id="wf-1")
+    workflow = _make_workflow(version="v1")
+    created_at = datetime(2026, 1, 2)
+    lower_id_attempt = _make_pipeline_execution_log(
+        log_id="00000000-0000-0000-0000-000000000001",
+        created_at=created_at,
+        attempt="A",
+    )
+    higher_id_attempt = _make_pipeline_execution_log(
+        log_id="00000000-0000-0000-0000-000000000002",
+        created_at=created_at,
+        attempt="B",
+    )
+    _persist(
+        rag_pipeline_service.session,
+        dataset,
+        document,
+        pipeline,
+        workflow,
+        lower_id_attempt,
+        higher_id_attempt,
+    )
+
+    rag_pipeline_service.service.retry_error_document(
+        dataset,
+        document,
+        _make_account(),
+        generator=pipeline_generator,
+    )
+
+    args = pipeline_generator.generate.call_args.kwargs["args"]
+    assert args["inputs"] == {"attempt": "B"}
+    assert args["datasource_info_list"] == [{"attempt": "B"}]
 
 
 # --- set_datasource_variables ---
 
 
 def test_set_datasource_variables_success(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
+    mocker: MockerFixture,
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     from graphon.entities.workflow_node_execution import WorkflowNodeExecution
     from models.dataset import Pipeline
@@ -1110,7 +1334,12 @@ def test_set_datasource_variables_success(
     args = {"start_node_id": "node-1"}
     user = mocker.Mock()
     user.id = "user-1"
-    rag_pipeline_service.service.set_datasource_variables(pipeline, args, user)
+    rag_pipeline_service.service.set_datasource_variables(
+        pipeline,
+        args,
+        user,
+        external_retrieval=external_retrieval,
+    )
 
     # 3. Assertions
     mock_repo_instance.save.assert_called_once()
@@ -1200,18 +1429,28 @@ def test_get_default_block_config_injects_http_request_filter(
 
 
 def test_run_draft_workflow_node_raises_when_workflow_missing(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
+    mocker: MockerFixture,
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     pipeline = _make_pipeline()
     account = _make_account()
     mocker.patch.object(rag_pipeline_service.service, "get_draft_workflow", return_value=None)
 
     with pytest.raises(ValueError, match="Workflow not initialized"):
-        rag_pipeline_service.service.run_draft_workflow_node(pipeline, "node-1", {}, account)
+        rag_pipeline_service.service.run_draft_workflow_node(
+            pipeline,
+            "node-1",
+            {},
+            account,
+            external_retrieval=external_retrieval,
+        )
 
 
 def test_run_draft_workflow_node_seeds_llm_environment_variable(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
+    mocker: MockerFixture,
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     from factories import variable_factory
 
@@ -1251,11 +1490,18 @@ def test_run_draft_workflow_node_seeds_llm_environment_variable(
         get_execution_by_id=mocker.Mock(return_value="db")
     )
     mocker.patch("services.rag_pipeline.rag_pipeline.DraftVariableSaver", return_value=mocker.Mock())
-    rag_pipeline_service.service.run_draft_workflow_node(pipeline, "node-1", {}, account)
+    rag_pipeline_service.service.run_draft_workflow_node(
+        pipeline,
+        "node-1",
+        {},
+        account,
+        external_retrieval=external_retrieval,
+    )
 
     getter = handle_node_run_result.call_args.kwargs["getter"]
     getter()
     variable_pool = single_step_run.call_args.kwargs["variable_pool"]
+    assert single_step_run.call_args.kwargs["external_retrieval"] is external_retrieval
     llm_model = variable_pool.get(["env", "for_summarize"])
     assert llm_model is not None
     assert llm_model.value == {
@@ -1266,7 +1512,9 @@ def test_run_draft_workflow_node_seeds_llm_environment_variable(
 
 
 def test_run_draft_workflow_node_saves_execution_and_variables(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
+    mocker: MockerFixture,
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     pipeline = _make_pipeline()
     account = _make_account()
@@ -1289,7 +1537,13 @@ def test_run_draft_workflow_node_saves_execution_and_variables(
     saver = mocker.Mock()
     mocker.patch("services.rag_pipeline.rag_pipeline.DraftVariableSaver", return_value=saver)
 
-    result = rag_pipeline_service.service.run_draft_workflow_node(pipeline, "node-1", {"q": "x"}, account)
+    result = rag_pipeline_service.service.run_draft_workflow_node(
+        pipeline,
+        "node-1",
+        {"q": "x"},
+        account,
+        external_retrieval=external_retrieval,
+    )
 
     assert result == "db"
     assert execution.workflow_id == "wf-1"
@@ -1602,14 +1856,21 @@ def test_get_node_last_run_delegates_to_repository(
 
 
 def test_set_datasource_variables_raises_when_node_id_missing(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
+    mocker: MockerFixture,
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     pipeline = _make_pipeline()
     workflow = _make_workflow()
     mocker.patch.object(rag_pipeline_service.service, "get_draft_workflow", return_value=workflow)
 
     with pytest.raises(ValueError, match="Node id is required"):
-        rag_pipeline_service.service.set_datasource_variables(pipeline, {"start_node_id": ""}, _make_account())
+        rag_pipeline_service.service.set_datasource_variables(
+            pipeline,
+            {"start_node_id": ""},
+            _make_account(),
+            external_retrieval=external_retrieval,
+        )
 
 
 def test_get_default_block_configs_skips_empty_configs(
@@ -1821,7 +2082,7 @@ def test_get_second_step_parameters_filters_first_step_variables(
 
 def test_retry_error_document_raises_when_execution_log_not_found(
     rag_pipeline_service: RagPipelineServiceTestContext,
-    pipeline_generator,
+    pipeline_generator: mock.Mock,
 ) -> None:
     with pytest.raises(ValueError, match="Document pipeline execution log not found"):
         rag_pipeline_service.service.retry_error_document(
@@ -2242,24 +2503,6 @@ def test_run_datasource_node_preview_not_published_uses_draft(
     get_draft.assert_called_once()
 
 
-def test_run_free_workflow_node_delegates_to_handle_result(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
-) -> None:
-    expected = SimpleNamespace(id="exec-1")
-    handle = mocker.patch.object(rag_pipeline_service.service, "_handle_node_run_result", return_value=expected)
-
-    result = rag_pipeline_service.service.run_free_workflow_node(
-        node_data={"type": "start"},
-        tenant_id="t1",
-        user_id="u1",
-        node_id="n1",
-        user_inputs={},
-    )
-
-    assert result is expected
-    handle.assert_called_once()
-
-
 @pytest.mark.parametrize(("workflow_tenant_id", "workflow_app_id"), [("t2", "p1"), ("t1", "p2")])
 def test_publish_customized_pipeline_template_rejects_unowned_workflow_before_export(
     mocker: MockerFixture,
@@ -2340,7 +2583,7 @@ def test_get_recommended_plugins_skips_manifest_when_missing(
 
 def test_retry_error_document_raises_when_pipeline_missing(
     rag_pipeline_service: RagPipelineServiceTestContext,
-    pipeline_generator,
+    pipeline_generator: mock.Mock,
 ) -> None:
     exec_log = DocumentPipelineExecutionLog(
         pipeline_id="p1",
@@ -2350,8 +2593,10 @@ def test_retry_error_document_raises_when_pipeline_missing(
         datasource_node_id="node-1",
         input_data={},
         created_by="u1",
+        workflow_id="wf-1",
     )
-    _persist(rag_pipeline_service.session, exec_log)
+    foreign_pipeline = _make_pipeline(tenant_id="t2")
+    _persist(rag_pipeline_service.session, exec_log, foreign_pipeline)
 
     with pytest.raises(ValueError, match="Pipeline not found"):
         rag_pipeline_service.service.retry_error_document(
@@ -2361,7 +2606,7 @@ def test_retry_error_document_raises_when_pipeline_missing(
 
 def test_retry_error_document_raises_when_workflow_missing(
     rag_pipeline_service: RagPipelineServiceTestContext,
-    pipeline_generator,
+    pipeline_generator: mock.Mock,
 ) -> None:
     exec_log = DocumentPipelineExecutionLog(
         pipeline_id="p1",
@@ -2371,6 +2616,7 @@ def test_retry_error_document_raises_when_workflow_missing(
         datasource_node_id="node-1",
         input_data={},
         created_by="u1",
+        workflow_id="wf-1",
     )
     pipeline = _make_pipeline(workflow_id="wf-1")
     _persist(rag_pipeline_service.session, exec_log, pipeline)
@@ -2555,7 +2801,9 @@ def test_run_datasource_node_preview_ignores_non_variable_messages(
 
 
 def test_set_datasource_variables_raises_when_workflow_missing(
-    mocker: MockerFixture, rag_pipeline_service: RagPipelineServiceTestContext
+    mocker: MockerFixture,
+    rag_pipeline_service: RagPipelineServiceTestContext,
+    external_retrieval: ExternalDatasetRetriever,
 ) -> None:
     mocker.patch.object(rag_pipeline_service.service, "get_draft_workflow", return_value=None)
 
@@ -2564,6 +2812,7 @@ def test_set_datasource_variables_raises_when_workflow_missing(
             _make_pipeline(),
             {"start_node_id": "n1"},
             _make_account(),
+            external_retrieval=external_retrieval,
         )
 
 

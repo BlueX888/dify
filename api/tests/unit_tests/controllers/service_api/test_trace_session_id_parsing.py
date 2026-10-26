@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, create_autospec, patch
 
 import pytest
 from flask import Flask
@@ -7,6 +7,8 @@ from werkzeug.exceptions import BadRequest
 from controllers.service_api.app import completion as completion_module
 from controllers.service_api.app import workflow as workflow_module
 from core.helper.trace_id_helper import get_trace_session_id
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+from extensions.ext_application_services import ApplicationServices
 from models.enums import EndUserType
 from models.model import App, AppMode, EndUser
 from tests.unit_tests.model_factories import make_app, make_end_user
@@ -49,9 +51,24 @@ def _end_user() -> EndUser:
     return make_end_user(end_user_id="user-1", end_user_type=EndUserType.SERVICE_API)
 
 
-def _assert_generate_trace_session_id(mock_generate_service: MagicMock, expected: str) -> None:
+@pytest.fixture
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    application_services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    application_services.knowledge.external_retrieval = external_retrieval
+    monkeypatch.setattr(completion_module, "application_services", lambda: application_services)
+    monkeypatch.setattr(workflow_module, "application_services", lambda: application_services)
+    return external_retrieval
+
+
+def _assert_generate_trace_session_id(
+    mock_generate_service: MagicMock,
+    expected: str,
+    external_retrieval: MagicMock,
+) -> None:
     _, kwargs = mock_generate_service.generate.call_args
     assert kwargs["args"]["trace_session_id"] == expected
+    assert kwargs["external_retrieval"] is external_retrieval
 
 
 @patch("controllers.service_api.app.completion.AppGenerateService")
@@ -108,6 +125,7 @@ def test_completion_api_passes_header_trace_session_id_when_body_value_is_invali
     mock_generate_service: MagicMock,
     mock_compact: MagicMock,
     app: Flask,
+    external_retrieval: MagicMock,
 ):
     payload = {"inputs": {}, "trace_session_id": 123}
     mock_service_api_ns.payload = payload
@@ -126,7 +144,7 @@ def test_completion_api_passes_header_trace_session_id_when_body_value_is_invali
         )
 
     assert response == {"answer": "ok"}
-    _assert_generate_trace_session_id(mock_generate_service, "header-session")
+    _assert_generate_trace_session_id(mock_generate_service, "header-session", external_retrieval)
 
 
 @patch("controllers.service_api.app.completion.helper.compact_generate_response", return_value={"answer": "ok"})
@@ -137,6 +155,7 @@ def test_chat_api_passes_query_trace_session_id_when_body_value_is_invalid_lower
     mock_generate_service: MagicMock,
     mock_compact: MagicMock,
     app: Flask,
+    external_retrieval: MagicMock,
 ):
     payload = {"inputs": {}, "query": "hello", "trace_session_id": 123}
     mock_service_api_ns.payload = payload
@@ -154,7 +173,7 @@ def test_chat_api_passes_query_trace_session_id_when_body_value_is_invalid_lower
         )
 
     assert response == {"answer": "ok"}
-    _assert_generate_trace_session_id(mock_generate_service, "query-session")
+    _assert_generate_trace_session_id(mock_generate_service, "query-session", external_retrieval)
 
 
 @patch("controllers.service_api.app.workflow.helper.compact_generate_response", return_value={"result": "ok"})
@@ -165,6 +184,7 @@ def test_workflow_run_api_passes_body_trace_session_id(
     mock_generate_service: MagicMock,
     mock_compact: MagicMock,
     app: Flask,
+    external_retrieval: MagicMock,
 ):
     payload = {"inputs": {}, "trace_session_id": " body-session "}
     mock_service_api_ns.payload = payload
@@ -178,4 +198,4 @@ def test_workflow_run_api_passes_body_trace_session_id(
         )
 
     assert response == {"result": "ok"}
-    _assert_generate_trace_session_id(mock_generate_service, "body-session")
+    _assert_generate_trace_session_id(mock_generate_service, "body-session", external_retrieval)

@@ -581,26 +581,10 @@ class TestCleanNotionDocumentTask:
         mock_vector.delete_by_ids.assert_called_once()
         assert set(mock_vector.delete_by_ids.call_args.args[0]) == set(index_node_ids)
 
-    def test_clean_notion_document_task_continues_when_vector_cleanup_fails(
+    def test_clean_notion_document_task_preserves_documents_when_vector_cleanup_fails(
         self, db_session_with_containers: Session, mock_vector, mock_external_service_dependencies
     ):
-        """
-        Vector cleanup failure (e.g. transient billing API error propagated via
-        ``FeatureService`` when ``Vector(dataset)`` lazily resolves the embedding
-        model) must NOT abort the cleanup task. The Document rows have already
-        been hard-deleted in the first session block before vector cleanup runs,
-        so any uncaught exception escaping the task would strand
-        ``DocumentSegment`` rows in PG with no parent ``Document``.
-
-        Contract: the task swallows the vector cleanup exception, logs it, and
-        proceeds to delete the segments — leaving PG consistent. (Vector orphans,
-        if any, can be reaped later by an offline scanner.)
-
-        Regression guard for the production incident where ``clean_document_task``
-        / ``clean_notion_document_task`` failed with
-        ``ValueError("Unable to retrieve billing information...")`` and left
-        tens of thousands of orphan segments per affected tenant.
-        """
+        """Index cleanup failure must preserve the relational retry evidence."""
         fake = Faker()
 
         # Create test data
@@ -669,21 +653,14 @@ class TestCleanNotionDocumentTask:
             "Unable to retrieve billing information. Please try again later or contact support."
         )
 
-        # Execute cleanup task — must NOT raise even though vector deletion raises.
-        # Before the safety-net wrapper this would have re-raised the ValueError,
-        # aborting the task and leaving DocumentSegment stranded in PG.
-        clean_notion_document_task([document.id], dataset.id)
+        with pytest.raises(ValueError, match="Unable to retrieve billing information"):
+            clean_notion_document_task([document.id], dataset.id)
 
         # Vector cleanup was attempted exactly once.
         mock_vector.delete_by_ids.assert_called_once_with(["test_node"])
 
-        # The crucial assertion: despite the vector cleanup failure, the
-        # final session block (``DELETE FROM document_segments``)
-        # still ran and committed. This is what the wrapper buys us — without
-        # it the production incident left tens of thousands of orphan segments
-        # per affected tenant. Aligns with the assertion shape used by the
-        # happy-path test (``test_clean_notion_document_task_success``).
-        assert _count_segments(db_session_with_containers, DocumentSegment.document_id == document.id) == 0
+        assert _count_documents(db_session_with_containers, Document.id == document.id) == 1
+        assert _count_segments(db_session_with_containers, DocumentSegment.document_id == document.id) == 1
 
     def test_clean_notion_document_task_with_large_number_of_documents(
         self, db_session_with_containers: Session, mock_vector, mock_external_service_dependencies

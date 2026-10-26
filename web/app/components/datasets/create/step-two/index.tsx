@@ -57,6 +57,7 @@ const StepTwo: FC<StepTwoProps> = ({
   crawlOptions,
   websiteCrawlProvider = DataSourceProvider.jinaReader,
   websiteCrawlJobId = '',
+  websiteCrawlSourceHandle,
   canCreateDocument = true,
   onStepChange,
   updateIndexingTypeCache,
@@ -146,6 +147,7 @@ const StepTwo: FC<StepTwoProps> = ({
     crawlOptions,
     websiteCrawlProvider,
     websiteCrawlJobId,
+    websiteCrawlSourceHandle,
     canCreateDocument,
     onStepChange,
     updateIndexingTypeCache,
@@ -167,6 +169,7 @@ const StepTwo: FC<StepTwoProps> = ({
     crawlOptions,
     websiteCrawlProvider,
     websiteCrawlJobId,
+    websiteCrawlSourceHandle,
     indexingTechnique: indexing.getIndexingTechnique() as IndexingType,
     processRule: segmentation.getProcessRule(currentDocForm),
   })

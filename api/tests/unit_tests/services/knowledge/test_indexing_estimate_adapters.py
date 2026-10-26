@@ -1,22 +1,31 @@
 from collections.abc import Callable
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import create_autospec, patch
 
 import pytest
+from sqlalchemy import event, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from core.entities.knowledge_entities import PreviewDetail
 from core.errors.error import LLMBadRequestError, ProviderTokenNotInitError
 from core.plugin.impl.exc import PluginDaemonClientSideError
 from core.rag.extractor.entity.datasource_type import DatasourceType
-from core.rag.extractor.entity.extract_setting import ExtractSetting, NotionInfo
+from core.rag.extractor.entity.extract_setting import (
+    CreatedUploadArtifact,
+    ExtractionResult,
+    ExtractSetting,
+    NotionInfo,
+)
 from core.rag.index_processor.constant.index_type import IndexTechniqueType
+from core.rag.index_processor.index_processor_base import BaseIndexProcessor
 from core.rag.models.document import ChildDocument, Document
 from enums import DeploymentEdition
 from extensions.storage.storage_type import StorageType
 from models.dataset import Dataset, DatasetProcessRule
 from models.enums import CreatorUserRole, ProcessRuleMode
-from models.model import UploadFile
+from models.model import UploadFile, UploadFileCleanupOutbox
+from repositories.knowledge.upload_file_repository import SQLAlchemyKnowledgeUploadRepository
+from services.knowledge.entities.resource_scope import DatasetRef
 from services.knowledge.indexing.adapters.estimate import (
     IndexingEstimateAdapter,
     SQLAlchemyProcessRuleReader,
@@ -25,7 +34,6 @@ from services.knowledge.indexing.estimate import (
     IndexingEstimateExecutionError,
     IndexingEstimateProviderUnavailableError,
 )
-from services.knowledge.resource_scope import DatasetRef
 
 
 def _dataset(dataset_id: str, workspace_id: str) -> Dataset:
@@ -83,8 +91,8 @@ def test_estimates_segments_and_limits_previews(
     sqlite_session_factory: sessionmaker[Session], doc_form: str, config_overrides: Callable[..., None]
 ) -> None:
     config_overrides(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
-    processor = MagicMock()
-    processor.extract.return_value = [Document(page_content="source")]
+    processor = create_autospec(BaseIndexProcessor, instance=True, spec_set=True)
+    processor.extract.return_value = ExtractionResult(documents=[Document(page_content="source")])
     processor.transform.return_value = [
         Document(
             page_content=f"question-{i}",
@@ -140,8 +148,14 @@ def test_preview_cleanup_commits_before_summary_and_excludes_foreign_files(
             )
             image_ids.append(upload.id)
             session.add(upload)
-    processor = MagicMock()
-    processor.transform.return_value = [Document(page_content="preview")]
+    processor = create_autospec(BaseIndexProcessor, instance=True, spec_set=True)
+    processor.extract.return_value = ExtractionResult(
+        documents=[Document(page_content="source")],
+        created_upload_artifacts=(CreatedUploadArtifact(image_ids[0], "workspace-1/image.png"),),
+    )
+    processor.transform.return_value = [
+        Document(page_content=f"preview ![foreign](/files/{image_ids[1]}/file-preview)")
+    ]
 
     def summary(
         _tenant, previews: list[PreviewDetail], _settings, _language, *, session: Session
@@ -150,12 +164,15 @@ def test_preview_cleanup_commits_before_summary_and_excludes_foreign_files(
         with sqlite_session_factory() as observer:
             assert observer.get(UploadFile, image_ids[0]) is None
             assert observer.get(UploadFile, image_ids[1]) is not None
+            pending = observer.scalar(
+                select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == image_ids[0])
+            )
+            assert (pending is not None) is storage_fails
         return [PreviewDetail(content=previews[0].content, summary="summary")]
 
     processor.generate_summary_preview.side_effect = summary
     with (
         patch("services.knowledge.indexing.adapters.estimate.IndexProcessorFactory") as factory,
-        patch("services.knowledge.indexing.adapters.estimate.get_image_upload_file_ids", return_value=image_ids),
         patch("services.knowledge.indexing.adapters.estimate.storage") as storage,
     ):
         factory.return_value.init_index_processor.return_value = processor
@@ -169,6 +186,175 @@ def test_preview_cleanup_commits_before_summary_and_excludes_foreign_files(
         )
         storage.delete.assert_called_once_with("workspace-1/image.png")
     assert result.preview[0].summary == "summary"
+
+
+def test_preview_cleanup_runs_when_transform_fails(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    temporary_file_ids: list[str] = []
+
+    def extract(_setting: ExtractSetting, *, session: Session, **_kwargs: object) -> ExtractionResult:
+        upload = UploadFile(
+            tenant_id="workspace-1",
+            storage_type=StorageType.LOCAL,
+            key="workspace-1/temp.png",
+            name="temp.png",
+            size=10,
+            extension="png",
+            mime_type="image/png",
+            created_by_role=CreatorUserRole.ACCOUNT,
+            created_by="user",
+            created_at=datetime.now(UTC),
+            used=True,
+        )
+        session.add(upload)
+        temporary_file_ids.append(upload.id)
+        return ExtractionResult(
+            documents=[Document(page_content="source")],
+            created_upload_artifacts=(CreatedUploadArtifact(upload.id, upload.key),),
+        )
+
+    processor = create_autospec(BaseIndexProcessor, instance=True, spec_set=True)
+    processor.extract.side_effect = extract
+    processor.transform.side_effect = RuntimeError("transform failed")
+
+    with (
+        patch("services.knowledge.indexing.adapters.estimate.IndexProcessorFactory") as factory,
+        patch("services.knowledge.indexing.adapters.estimate.storage") as storage,
+    ):
+        factory.return_value.init_index_processor.return_value = processor
+        with pytest.raises(IndexingEstimateExecutionError, match="transform failed"):
+            IndexingEstimateAdapter(session_factory=sqlite_session_factory).run(
+                "workspace-1",
+                [ExtractSetting(datasource_type=DatasourceType.WEBSITE)],
+                {"mode": "automatic"},
+            )
+
+    storage.delete.assert_called_once_with("workspace-1/temp.png")
+    assert len(temporary_file_ids) == 1
+    with sqlite_session_factory() as session:
+        assert session.get(UploadFile, temporary_file_ids[0]) is None
+
+
+def test_preview_owns_and_cleans_files_created_during_transform(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    uploads = SQLAlchemyKnowledgeUploadRepository(session_factory=sqlite_session_factory)
+    upload = UploadFile(
+        tenant_id="workspace-1",
+        storage_type=StorageType.LOCAL,
+        key="workspace-1/transform-temp.png",
+        name="transform-temp.png",
+        size=10,
+        extension="png",
+        mime_type="image/png",
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by="user",
+        created_at=datetime.now(UTC),
+        used=True,
+    )
+    artifact = CreatedUploadArtifact(upload.id, upload.key)
+    writer_id = uploads.begin_created_upload_artifact_write(workspace_id="workspace-1", artifact=artifact)
+    with sqlite_session_factory.begin() as session:
+        session.add(upload)
+        uploads.finish_created_upload_artifact_writes_in_session(
+            session,
+            workspace_id="workspace-1",
+            writer_ids={upload.id: writer_id},
+        )
+    processor = create_autospec(BaseIndexProcessor, instance=True, spec_set=True)
+    processor.extract.return_value = ExtractionResult(documents=[Document(page_content="source")])
+
+    def transform(*_args: object, **kwargs: object) -> list[Document]:
+        callback = kwargs["on_upload_file_created"]
+        assert callable(callback)
+        callback(upload.id)
+        return [Document(page_content="preview")]
+
+    processor.transform.side_effect = transform
+    with (
+        patch("services.knowledge.indexing.adapters.estimate.IndexProcessorFactory") as factory,
+        patch("services.knowledge.indexing.adapters.estimate.storage") as storage,
+    ):
+        factory.return_value.init_index_processor.return_value = processor
+        IndexingEstimateAdapter(session_factory=sqlite_session_factory).run(
+            "workspace-1",
+            [ExtractSetting(datasource_type=DatasourceType.WEBSITE)],
+            {"mode": "automatic"},
+        )
+
+    storage.delete.assert_called_once_with(upload.key)
+    with sqlite_session_factory() as session:
+        assert session.get(UploadFile, upload.id) is None
+        assert session.scalar(select(UploadFileCleanupOutbox)) is None
+
+
+def test_preview_commit_failure_keeps_exact_blob_key_for_retry(
+    sqlite_session_factory: sessionmaker[Session],
+) -> None:
+    artifact_id: list[str] = []
+
+    def extract(_setting: ExtractSetting, *, session: Session, **kwargs: object) -> ExtractionResult:
+        upload = UploadFile(
+            tenant_id="workspace-1",
+            storage_type=StorageType.LOCAL,
+            key="workspace-1/commit-unknown.png",
+            name="temp.png",
+            size=10,
+            extension="png",
+            mime_type="image/png",
+            created_by_role=CreatorUserRole.ACCOUNT,
+            created_by="user",
+            created_at=datetime.now(UTC),
+            used=True,
+        )
+        session.add(upload)
+        artifact = CreatedUploadArtifact(upload.id, upload.key)
+        callback = kwargs["on_upload_artifact_created"]
+        assert callable(callback)
+        callback(artifact)
+        artifact_id.append(upload.id)
+        return ExtractionResult(
+            documents=[Document(page_content="source")],
+            created_upload_artifacts=(artifact,),
+        )
+
+    commit_attempts = 0
+
+    def fail_first_commit(_session: Session) -> None:
+        nonlocal commit_attempts
+        commit_attempts += 1
+        # The writer marker commits before storage I/O; fail the following
+        # UploadFile publication commit instead.
+        if commit_attempts == 2:
+            raise RuntimeError("commit result unknown")
+
+    processor = create_autospec(BaseIndexProcessor, instance=True, spec_set=True)
+    processor.extract.side_effect = extract
+    event.listen(sqlite_session_factory.class_, "before_commit", fail_first_commit)
+    try:
+        with (
+            patch("services.knowledge.indexing.adapters.estimate.IndexProcessorFactory") as factory,
+            patch("services.knowledge.indexing.adapters.estimate.storage") as storage,
+        ):
+            factory.return_value.init_index_processor.return_value = processor
+            storage.delete.side_effect = OSError("storage unavailable")
+            with pytest.raises(IndexingEstimateExecutionError, match="commit result unknown"):
+                IndexingEstimateAdapter(session_factory=sqlite_session_factory).run(
+                    "workspace-1",
+                    [ExtractSetting(datasource_type=DatasourceType.WEBSITE)],
+                    {"mode": "automatic"},
+                )
+    finally:
+        event.remove(sqlite_session_factory.class_, "before_commit", fail_first_commit)
+
+    with sqlite_session_factory() as session:
+        assert session.get(UploadFile, artifact_id[0]) is None
+        pending = session.scalar(
+            select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == artifact_id[0])
+        )
+        assert pending is not None
+        assert pending.key == "workspace-1/commit-unknown.png"
 
 
 @pytest.mark.parametrize("provider", [None, "embedding-provider"])

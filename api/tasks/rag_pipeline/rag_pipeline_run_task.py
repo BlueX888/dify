@@ -1,40 +1,160 @@
-import contextvars
 import logging
 import time
-import uuid
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
+from dataclasses import dataclass
 from itertools import islice
 from typing import Any
 
 import click
 from celery import group, shared_task
-from flask import current_app, g
+from flask import current_app
 from pydantic import TypeAdapter
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
 from configs import dify_config
 from core.app.apps.pipeline.pipeline_generator import PipelineGenerator
-from core.app.entities.app_invoke_entities import InvokeFrom, RagPipelineGenerateEntity
+from core.app.entities.app_invoke_entities import RagPipelineGenerateEntity
 from core.app.entities.rag_pipeline_invoke_entities import RagPipelineInvokeEntity
-from core.db.session_factory import get_session_maker
+from core.db.session_factory import session_factory
 from core.rag.pipeline.queue import TenantIsolatedTaskQueue
-from core.repositories.factory import DifyCoreRepositoryFactory
-from extensions.application_services.data_sources import build_data_source_credentials
 from extensions.ext_database import db
+from libs.datetime_utils import naive_utc_now
 from models import Account, Tenant
-from models.dataset import Pipeline
-from models.enums import WorkflowRunTriggeredFrom
-from models.workflow import Workflow, WorkflowNodeExecutionTriggeredFrom
-from repositories.knowledge.document_repository import SQLAlchemyDocumentRepository
+from repositories.knowledge.document_indexing_outbox_repository import (
+    DocumentIndexingAction,
+    DocumentIndexingIntent,
+    SQLAlchemyDocumentIndexingOutboxRepository,
+)
+from repositories.knowledge.document_repository import ClaimedIndexingRequest, SQLAlchemyDocumentRepository
 from services.file_service import FileService
-from services.workflow_run_agg import WorkflowRunAgg
+from services.knowledge.indexing.errors import (
+    DatasetIndexingGenerationLostError,
+    DocumentIndexingClaimLostError,
+    DocumentIsPausedError,
+)
+from services.rag_pipeline.rag_pipeline import (
+    PipelineIndexingSnapshotUnavailableError,
+    pipeline_indexing_admission_error,
+    run_durable_pipeline_indexing,
+)
 
 logger = logging.getLogger(__name__)
 
 # Each entry is validated into RagPipelineInvokeEntity inside the worker.
 _INVOKE_ENTITIES_ADAPTER = TypeAdapter(list[dict[str, Any]])
+
+
+@dataclass(frozen=True, slots=True)
+class _OwnedPipelineEntity:
+    request_id: str
+    claim: ClaimedIndexingRequest
+    documents: SQLAlchemyDocumentRepository
+
+
+def _claim_pipeline_entity(
+    invoke_entity: RagPipelineInvokeEntity,
+    entity: RagPipelineGenerateEntity,
+) -> _OwnedPipelineEntity | None:
+    """Resolve a trusted single-document RETRY intent and acquire its lease."""
+    if entity.indexing_claim_id is not None:
+        raise ValueError("Async pipeline payload must not carry a pre-issued claim")
+    document_id = entity.document_id
+    if document_id is None:
+        raise ValueError("Published pipeline document is required")
+    if entity.start_node_id is None:
+        raise ValueError("Published pipeline start node is required")
+    database_client = session_factory.get_session_maker()
+    outbox = SQLAlchemyDocumentIndexingOutboxRepository(session_factory=database_client)
+    request_id = entity.indexing_request_id
+    intent: DocumentIndexingIntent | None
+    if request_id is None:
+        intent = outbox.get_or_create_legacy_pipeline_intent(
+            tenant_id=invoke_entity.tenant_id,
+            dataset_id=entity.dataset_id,
+            pipeline_id=invoke_entity.pipeline_id,
+            document_id=document_id,
+            actor_id=invoke_entity.user_id,
+            datasource_type=str(entity.datasource_type),
+            datasource_info=dict(entity.datasource_info),
+            datasource_node_id=entity.start_node_id,
+            batch=entity.batch,
+            workflow_id=invoke_entity.workflow_id,
+            original_document_id=entity.original_document_id,
+        )
+        if intent is None:
+            logger.info("Skipped an unowned legacy pipeline delivery: document_id=%s", document_id)
+            return None
+        request_id = intent.id
+    else:
+        intent = outbox.get_pipeline_intent(
+            request_id,
+            tenant_id=invoke_entity.tenant_id,
+            dataset_id=entity.dataset_id,
+            pipeline_id=invoke_entity.pipeline_id,
+            document_id=document_id,
+            actor_id=invoke_entity.user_id,
+            workflow_id=invoke_entity.workflow_id,
+            datasource_type=str(entity.datasource_type),
+            datasource_info=dict(entity.datasource_info),
+            datasource_node_id=entity.start_node_id,
+            batch=entity.batch,
+            original_document_id=entity.original_document_id,
+        )
+    if (
+        intent is None
+        or intent.action != DocumentIndexingAction.RETRY
+        or intent.tenant_id != invoke_entity.tenant_id
+        or intent.dataset_id != entity.dataset_id
+        or intent.document_ids != (document_id,)
+        or intent.actor_id != invoke_entity.user_id
+    ):
+        raise ValueError("Pipeline indexing request does not own this delivery")
+
+    documents = SQLAlchemyDocumentRepository(session_factory=database_client)
+    admission_error = pipeline_indexing_admission_error(invoke_entity.tenant_id)
+    claims = documents.claim_indexing_request(
+        request_id,
+        expected_action=DocumentIndexingAction.RETRY.value,
+        processing_started_at=naive_utc_now(),
+        admission_error=lambda _count: admission_error,
+    )
+    if not claims:
+        return None
+    (claim,) = claims
+    if (
+        claim.ref.dataset.tenant_id != invoke_entity.tenant_id
+        or claim.ref.dataset.dataset_id != entity.dataset_id
+        or claim.ref.document_id != document_id
+    ):
+        raise DocumentIndexingClaimLostError()
+    return _OwnedPipelineEntity(request_id=request_id, claim=claim, documents=documents)
+
+
+def _release_pipeline_entity(owner: _OwnedPipelineEntity) -> None:
+    with suppress(DocumentIndexingClaimLostError):
+        owner.documents.release_dataset_generation_owner(
+            owner.claim.ref,
+            indexing_request_id=owner.request_id,
+            claim_id=owner.claim.claim_id,
+            dataset_generation_id=owner.claim.dataset_generation_id,
+        )
+
+
+def _fail_pipeline_entity(owner: _OwnedPipelineEntity, error: Exception) -> None:
+    try:
+        owner.documents.fail_indexing(
+            owner.claim.ref,
+            str(error),
+            claim_id=owner.claim.claim_id,
+            dataset_generation_id=owner.claim.dataset_generation_id,
+        )
+    except DatasetIndexingGenerationLostError:
+        _release_pipeline_entity(owner)
+    except DocumentIndexingClaimLostError:
+        pass
 
 
 def chunked(iterable: Sequence, size: int):
@@ -53,9 +173,12 @@ def rag_pipeline_run_task(
     :param rag_pipeline_invoke_entities_file_id: File ID containing serialized RAG pipeline invoke entities
     :param tenant_id: Tenant ID for the pipeline execution
     """
+    from extensions.ext_application_services import application_services
+
     # run with threading, thread pool size is 10
 
     try:
+        pipeline_generator = application_services().knowledge.pipeline_generator
         start_at = time.perf_counter()
         rag_pipeline_invoke_entities_content = FileService(db.engine).get_file_content(
             rag_pipeline_invoke_entities_file_id
@@ -71,7 +194,12 @@ def rag_pipeline_run_task(
             futures = []
             for rag_pipeline_invoke_entity in rag_pipeline_invoke_entities:
                 # Submit task to thread pool with Flask app
-                future = executor.submit(run_single_rag_pipeline_task, rag_pipeline_invoke_entity, flask_app)
+                future = executor.submit(
+                    run_single_rag_pipeline_task,
+                    rag_pipeline_invoke_entity,
+                    flask_app,
+                    pipeline_generator=pipeline_generator,
+                )
                 futures.append(future)
 
             # Wait for all tasks to complete
@@ -124,95 +252,49 @@ def rag_pipeline_run_task(
         db.session.close()
 
 
-def run_single_rag_pipeline_task(rag_pipeline_invoke_entity: Mapping[str, Any], flask_app):
-    """Run a single RAG pipeline task within Flask app context."""
-    # Create Flask application context for this thread
+def run_single_rag_pipeline_task(
+    rag_pipeline_invoke_entity: Mapping[str, Any], flask_app, *, pipeline_generator: PipelineGenerator
+):
+    """Claim and replay one persisted pipeline source through its durable owner."""
     with flask_app.app_context():
+        owner: _OwnedPipelineEntity | None = None
         try:
-            rag_pipeline_invoke_entity_model = RagPipelineInvokeEntity.model_validate(rag_pipeline_invoke_entity)
-            user_id = rag_pipeline_invoke_entity_model.user_id
-            tenant_id = rag_pipeline_invoke_entity_model.tenant_id
-            pipeline_id = rag_pipeline_invoke_entity_model.pipeline_id
-            workflow_id = rag_pipeline_invoke_entity_model.workflow_id
-            streaming = rag_pipeline_invoke_entity_model.streaming
-            workflow_execution_id = rag_pipeline_invoke_entity_model.workflow_execution_id
-            workflow_thread_pool_id = rag_pipeline_invoke_entity_model.workflow_thread_pool_id
-            application_generate_entity = rag_pipeline_invoke_entity_model.application_generate_entity
-
+            invoke_entity = RagPipelineInvokeEntity.model_validate(rag_pipeline_invoke_entity)
+            entity = RagPipelineGenerateEntity.model_validate(invoke_entity.application_generate_entity)
+            owner = _claim_pipeline_entity(invoke_entity, entity)
+            if owner is None:
+                return
             with sessionmaker(db.engine, expire_on_commit=False).begin() as session:
-                # Load required entities
-                account = session.scalar(select(Account).where(Account.id == user_id).limit(1))
-                if not account:
-                    raise ValueError(f"Account {user_id} not found")
-
-                tenant = session.scalar(select(Tenant).where(Tenant.id == tenant_id).limit(1))
-                if not tenant:
-                    raise ValueError(f"Tenant {tenant_id} not found")
+                account = session.scalar(select(Account).where(Account.id == invoke_entity.user_id).limit(1))
+                tenant = session.scalar(select(Tenant).where(Tenant.id == invoke_entity.tenant_id).limit(1))
+                if account is None:
+                    raise ValueError(f"Account {invoke_entity.user_id} not found")
+                if tenant is None:
+                    raise ValueError(f"Tenant {invoke_entity.tenant_id} not found")
                 account.set_current_tenant_with_session(tenant, session=session)
 
-                pipeline = session.scalar(select(Pipeline).where(Pipeline.id == pipeline_id).limit(1))
-                if not pipeline:
-                    raise ValueError(f"Pipeline {pipeline_id} not found")
-
-                workflow = session.scalar(select(Workflow).where(Workflow.id == pipeline.workflow_id).limit(1))
-                if not workflow:
-                    raise ValueError(f"Workflow {pipeline.workflow_id} not found")
-
-                if workflow_execution_id is None:
-                    workflow_execution_id = str(uuid.uuid4())
-
-                # Create application generate entity from dict
-                entity = RagPipelineGenerateEntity.model_validate(application_generate_entity)
-
-                # Create workflow repositories
-                session_factory = sessionmaker(bind=db.engine, expire_on_commit=False)
-                workflow_execution_repository = DifyCoreRepositoryFactory.create_workflow_execution_repository(
-                    session_factory=session_factory,
-                    tenant_id=pipeline.tenant_id,
-                    user=account,
-                    app_id=entity.app_config.app_id,
-                    triggered_from=WorkflowRunTriggeredFrom.RAG_PIPELINE_RUN,
-                )
-
-                workflow_node_execution_repository = (
-                    DifyCoreRepositoryFactory.create_workflow_node_execution_repository(
-                        session_factory=session_factory,
-                        tenant_id=pipeline.tenant_id,
-                        user=account,
-                        app_id=entity.app_config.app_id,
-                        triggered_from=WorkflowNodeExecutionTriggeredFrom.RAG_PIPELINE_RUN,
-                    )
-                )
-
-                # Set the user directly in g for preserve_flask_contexts
-                g._login_user = account
-
-                # Copy context for passing to pipeline generator
-                context = contextvars.copy_context()
-
-                # Direct execution without creating another thread
-                # Since we're already in a thread pool, no need for nested threading
-
-                pipeline_generator = PipelineGenerator(
-                    execution_driver=WorkflowRunAgg.run,
-                    documents=SQLAlchemyDocumentRepository(session_factory=session_factory),
-                    datasource_providers=build_data_source_credentials(database_client=get_session_maker()).providers,
-                )
-                # Using protected method intentionally for async execution
-                pipeline_generator._generate(  # type: ignore[attr-defined]
-                    session=session,
-                    flask_app=flask_app,
-                    context=context,
-                    pipeline=pipeline,
-                    workflow_id=workflow_id,
-                    user=account,
-                    application_generate_entity=entity,
-                    invoke_from=InvokeFrom.PUBLISHED_PIPELINE,
-                    workflow_execution_repository=workflow_execution_repository,
-                    workflow_node_execution_repository=workflow_node_execution_repository,
-                    streaming=streaming,
-                    workflow_thread_pool_id=workflow_thread_pool_id,
-                )
-        except Exception:
+            run_durable_pipeline_indexing(
+                documents=owner.documents,
+                claim=owner.claim,
+                indexing_request_id=owner.request_id,
+                user=account,
+                pipeline_generator=pipeline_generator,
+            )
+        except DatasetIndexingGenerationLostError:
+            assert owner is not None
+            _release_pipeline_entity(owner)
+        except DocumentIndexingClaimLostError:
+            logger.info("Pipeline indexing claim was superseded: %s", owner.claim.ref if owner else "unclaimed")
+        except DocumentIsPausedError:
+            assert owner is not None
+            with suppress(DocumentIndexingClaimLostError):
+                owner.documents.release_indexing_claim_for_pause(owner.claim.ref, claim_id=owner.claim.claim_id)
+        except PipelineIndexingSnapshotUnavailableError:
+            assert owner is not None
+            _release_pipeline_entity(owner)
+            logger.warning("Pipeline indexing snapshot is unavailable: %s", owner.claim.ref)
+        except Exception as error:
+            if owner is not None:
+                _fail_pipeline_entity(owner, error)
             logging.exception("Error in pipeline task")
             raise

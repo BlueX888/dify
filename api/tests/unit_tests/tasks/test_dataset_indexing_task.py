@@ -16,11 +16,12 @@ from sqlalchemy.orm import Session
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
 from enums import CloudPlan, DeploymentEdition
 from extensions.ext_redis import redis_client
+from models.account import Tenant
 from models.dataset import Dataset, Document
 from models.enums import DataSourceType, DocumentCreatedFrom, IndexingStatus
 from services.document_indexing_proxy.document_indexing_task_proxy import DocumentIndexingTaskProxy
+from services.knowledge.entities.resource_scope import DocumentRef
 from services.knowledge.indexing.errors import DocumentIsPausedError
-from services.knowledge.resource_scope import DocumentRef
 from tasks.document_indexing_task import (
     _document_indexing,
     _document_indexing_with_tenant_queue,
@@ -37,7 +38,7 @@ from tests.unit_tests.config_override import apply_config_overrides, config_over
     [
         ("waiting", "run"),
         ("parsing", "run"),
-        ("cleaning", "run"),
+        ("cleaning", "run_in_splitting_status"),
         ("splitting", "run_in_splitting_status"),
         ("indexing", "run_in_indexing_status"),
         ("completed", None),
@@ -139,6 +140,8 @@ def _persist_indexing_rows(
 ) -> tuple[Dataset, list[Document]]:
     """Persist one tenant-owned dataset and the requested document rows."""
     created_by = str(uuid.uuid4())
+    tenant = Tenant(name="Indexing workspace")
+    tenant.id = tenant_id
     dataset = Dataset(
         id=dataset_id,
         tenant_id=tenant_id,
@@ -167,7 +170,7 @@ def _persist_indexing_rows(
         )
         for position, document_id in enumerate(document_ids, start=1)
     ]
-    session.add_all([dataset, *documents])
+    session.add_all([tenant, dataset, *documents])
     session.commit()
     return dataset, documents
 
@@ -296,7 +299,7 @@ class TestDocumentIndexing:
         assert {ref.document_id for ref in processed} == set(existing_ids)
         assert sqlite_session.get(Document, document_ids[1]) is None
 
-    def test_empty_batch_still_reaches_runner(
+    def test_empty_batch_skips_runner(
         self,
         sqlite_session: Session,
         tenant_id: str,
@@ -314,8 +317,8 @@ class TestDocumentIndexing:
 
         _document_indexing(dataset_id, [])
 
-        assert indexing_runner.run.call_args.args[0] == []
-        assert len(indexing_runner.run.call_args.args) == 1
+        indexing_runner._constructor_mock.assert_not_called()
+        indexing_runner.run.assert_not_called()
 
     def test_missing_dataset_returns_before_feature_lookup(
         self, dataset_id: str, document_ids: list[str], monkeypatch: pytest.MonkeyPatch
@@ -445,7 +448,7 @@ class TestSummaryDispatch:
 
         _document_indexing(dataset_id, document_ids)
 
-        summary_delay.assert_called_once_with(dataset_id, document_ids[0], None)
+        summary_delay.assert_called_once_with(dataset_id, document_ids[0], None, None)
 
     def test_summary_queue_failure_does_not_fail_indexing(
         self,
@@ -476,7 +479,7 @@ class TestSummaryDispatch:
 
         _document_indexing(dataset_id, [document_id])
 
-        summary_delay.assert_called_once_with(dataset_id, document_id, None)
+        summary_delay.assert_called_once_with(dataset_id, document_id, None, None)
         persisted = _persisted_documents(sqlite_session, [document_id])[0]
         assert persisted.indexing_status == IndexingStatus.COMPLETED
 

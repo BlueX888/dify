@@ -1,6 +1,16 @@
+from collections.abc import Mapping
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, WithJsonSchema, field_validator
+from pydantic import (
+    BaseModel,
+    Field,
+    StrictFloat,
+    StrictInt,
+    StrictStr,
+    WithJsonSchema,
+    field_validator,
+    model_validator,
+)
 
 from core.rag.entities import MetadataFilteringCondition, Rule
 from core.rag.index_processor.constant.index_type import IndexStructureType
@@ -105,6 +115,7 @@ class NotionInfo(BaseModel):
 class WebsiteInfo(BaseModel):
     provider: str
     job_id: str
+    source_handle: str | None = None
     urls: list[str]
     only_main_content: bool = True
 
@@ -132,6 +143,22 @@ class ProcessRule(BaseModel):
         )
     )
     rules: Rule | None = Field(default=None, description="Custom processing rules.")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _ignore_automatic_rules(cls, value: object) -> object:
+        """Automatic mode always uses the built-in rule and ignores caller rules."""
+
+        if not isinstance(value, Mapping) or value.get("mode") not in {
+            "automatic",
+            ProcessRuleMode.AUTOMATIC,
+        }:
+            return value
+        if "rules" not in value:
+            return value
+        normalized = dict(value)
+        normalized["rules"] = None
+        return normalized
 
 
 class WeightVectorSetting(BaseModel):
@@ -267,7 +294,7 @@ class MetadataUpdateArgs(BaseModel):
 class MetadataDetail(BaseModel):
     id: UUIDStr = Field(description="Metadata field ID.")
     name: str = Field(description="Metadata field name.")
-    value: str | int | float | None = Field(
+    value: StrictStr | StrictInt | StrictFloat | None = Field(
         default=None,
         description="Metadata value. Can be a string, number, or `null`.",
     )

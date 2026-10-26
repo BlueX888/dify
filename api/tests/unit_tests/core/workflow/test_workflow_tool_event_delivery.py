@@ -17,6 +17,7 @@ from core.workflow.node_execution_process_data import (
     WORKFLOW_TOOL_INVOCATION_ID_KEY,
 )
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.nodes.agent_v2.binding_resolver import WorkflowAgentBindingResolver
 from core.workflow.workflow_tool_container_handler import (
     WorkflowToolContainerHandler,
@@ -45,6 +46,7 @@ from models.model import AppMode
 from models.workflow import WorkflowNodeExecutionModel, WorkflowNodeExecutionTriggeredFrom
 from services.workflow_persistence import PersistenceWorkflowInfo, WorkflowPersistenceLayer
 from services.workflow_run_index import WorkflowRunIndex
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.unit_tests.core.workflow.test_workflow_tool_container import (
     _container_handler,
     _outer_graph,
@@ -140,6 +142,8 @@ def test_workflow_tool_loop_break_does_not_escape_into_enclosing_loop(monkeypatc
         node_factory=DifyNodeFactory(
             init_params=build_test_graph_init_params(workflow_id="outer-workflow", graph_config=outer_graph),
             runtime_state=state,
+            external_retrieval=make_external_dataset_retriever(),
+            knowledge_index_runtime=build_knowledge_index_runtime(),
         ),
         root_node_id="start",
     )
@@ -195,7 +199,9 @@ def test_workflow_tool_persists_loop_outputs_after_graphon_normalizes_them() -> 
     )
     persisted: list[NodeEvent] = []
     handler = WorkflowToolContainerHandler(
-        frames, sources=repository, event_listener_factory=lambda *_: persisted.append
+        frames,
+        sources=repository,
+        event_listener_factory=lambda *_: persisted.append,
     )
     handler.handle_request(invocation_id="invocation", request=request)
     frame = frames["invocation:workflow-tool"]
@@ -259,7 +265,7 @@ def test_workflow_tool_delivers_source_events_to_persistence_without_exposing_th
 
     events = list(
         Engine(
-            graph=_outer_graph(node),
+            graph=_outer_graph(node, external_retrieval=make_external_dataset_retriever()),
             runtime_state=node.runtime_state,
             command_channel=InMemoryChannel(),
             workers=1,
@@ -396,7 +402,7 @@ def test_workflow_tool_agent_finds_its_persisted_caller_before_resolving_binding
     layer.set_node_run_indices(index.indices)
     node.runtime_state.variable_pool.add(("sys", "workflow_run_id"), "outer-run")
     engine = Engine(
-        graph=_outer_graph(node),
+        graph=_outer_graph(node, external_retrieval=make_external_dataset_retriever()),
         runtime_state=node.runtime_state,
         command_channel=InMemoryChannel(),
         workers=1,

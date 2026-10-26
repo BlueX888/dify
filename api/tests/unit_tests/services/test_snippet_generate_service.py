@@ -9,6 +9,7 @@ from controllers.console.app.workflow import LoopNodeRunPayload
 from core.app.app_config.features.file_upload.manager import FileUploadConfigManager
 from core.app.apps.workflow.app_generator import WorkflowAppGenerator
 from core.workflow.node_factory import DifyNodeFactory
+from core.workflow.node_runtime import build_knowledge_index_runtime
 from core.workflow.snippet_start import SNIPPET_VIRTUAL_START_NODE_ID
 from graphon.file import FileUploadConfig
 from graphon.file.models import File
@@ -20,6 +21,7 @@ from models.workflow import Workflow, WorkflowKind, WorkflowNodeExecutionModel
 from services.snippet_generate_service import SnippetGenerateService
 from services.snippet_service import SnippetService
 from services.workflow_service import WorkflowService
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.unit_tests.model_factories import make_account, make_workflow
 from tests.workflow_test_utils import build_test_graph_init_params
 
@@ -53,13 +55,6 @@ def _set_draft_workflow(
         return workflow
 
     monkeypatch.setattr(SnippetService, "get_draft_workflow", get_draft_workflow)
-
-
-def _set_published_workflow(
-    monkeypatch: pytest.MonkeyPatch,
-    workflow: Workflow | None,
-) -> None:
-    monkeypatch.setattr(SnippetService, "get_published_workflow", lambda _self, _snippet: workflow)
 
 
 def test_filter_virtual_start_events_keeps_blocking_response_unchanged():
@@ -188,6 +183,8 @@ def test_virtual_start_preserves_nested_container_graphs(ownership: str, outer_t
     factory = DifyNodeFactory(
         init_params=build_test_graph_init_params(graph_config=injected),
         runtime_state=RuntimeState(workflow_id="workflow", variable_pool=VariablePool(), start_at=0.0),
+        external_retrieval=make_external_dataset_retriever(),
+        knowledge_index_runtime=build_knowledge_index_runtime(),
     )
     graph = Graph.init(graph_config=injected, node_factory=factory, root_node_id=SNIPPET_VIRTUAL_START_NODE_ID)
     assert set(graph.nodes) == {SNIPPET_VIRTUAL_START_NODE_ID, "outer", "output"}
@@ -244,6 +241,8 @@ def test_virtual_start_keeps_missing_container_ownership_invalid() -> None:
     factory = DifyNodeFactory(
         init_params=build_test_graph_init_params(graph_config=injected),
         runtime_state=RuntimeState(workflow_id="workflow", variable_pool=VariablePool(), start_at=0.0),
+        external_retrieval=make_external_dataset_retriever(),
+        knowledge_index_runtime=build_knowledge_index_runtime(),
     )
     with pytest.raises(ValueError, match="unknown or cyclic containers"):
         Graph.init(graph_config=injected, node_factory=factory, root_node_id=SNIPPET_VIRTUAL_START_NODE_ID)
@@ -310,6 +309,7 @@ def test_generate_raises_when_draft_workflow_missing(
             args={"inputs": {}},
             invoke_from="debugger",
             session_maker=unbound_session_factory,
+            external_retrieval=make_external_dataset_retriever(),
         )
 
 
@@ -353,6 +353,7 @@ def test_generate_delegates_to_workflow_generator_and_filters_stream(
         args={"inputs": {"query": "hello"}},
         invoke_from="debugger",
         session_maker=unbound_session_factory,
+        external_retrieval=make_external_dataset_retriever(),
     )
 
     assert list(result) == [{"event": "node_finished", "data": {"node_id": "llm-1"}}]
@@ -364,44 +365,6 @@ def test_generate_delegates_to_workflow_generator_and_filters_stream(
     assert kwargs["streaming"] is True
     assert kwargs["call_depth"] == 0
     assert len(converted) == 1
-
-
-def test_run_published_delegates_to_workflow_generator_non_streaming(
-    monkeypatch: pytest.MonkeyPatch,
-    unbound_session_factory: sessionmaker[Session],
-):
-    workflow = _workflow({"nodes": [{"id": "llm-1", "data": {"type": "llm"}}], "edges": []})
-    snippet = _snippet()
-    user = _account()
-    generate_kwargs: dict[str, object] = {}
-    ensure_calls: list[tuple[Workflow, CustomizedSnippet]] = []
-
-    def generate(_self, **kwargs):
-        generate_kwargs.update(kwargs)
-        return {"data": {"outputs": {"answer": "ok"}}}
-
-    def ensure_start_node(_cls, current_workflow, current_snippet):
-        ensure_calls.append((current_workflow, current_snippet))
-        return current_workflow
-
-    _set_published_workflow(monkeypatch, workflow)
-    monkeypatch.setattr(WorkflowAppGenerator, "generate", generate)
-    monkeypatch.setattr(SnippetGenerateService, "_ensure_start_node", classmethod(ensure_start_node))
-
-    result = SnippetGenerateService.run_published(
-        snippet=snippet,
-        user=user,
-        args={"inputs": {"query": "hello"}},
-        invoke_from="service-api",
-        session_maker=unbound_session_factory,
-    )
-
-    assert result == {"data": {"outputs": {"answer": "ok"}}}
-    assert ensure_calls == [(workflow, snippet)]
-    kwargs = generate_kwargs
-    assert kwargs["app_model"].id == "snippet-1"
-    assert kwargs["streaming"] is False
-    assert kwargs["call_depth"] == 0
 
 
 def test_ensure_start_node_for_worker_delegates(monkeypatch: pytest.MonkeyPatch):
@@ -448,6 +411,7 @@ def test_run_draft_node_delegates_to_workflow_service(
         query="question",
         files=[],
         session_maker=unbound_session_factory,
+        external_retrieval=make_external_dataset_retriever(),
     )
 
     assert result is execution
@@ -474,6 +438,7 @@ def test_run_draft_node_raises_when_draft_workflow_missing(
             user_inputs={},
             account=_account("account-1"),
             session_maker=unbound_session_factory,
+            external_retrieval=make_external_dataset_retriever(),
         )
 
 
@@ -506,6 +471,7 @@ def test_generate_single_iteration_delegates_to_workflow_generator(
         node_id="iteration-1",
         args={"inputs": {"items": [1]}},
         session_maker=sqlite_session_factory,
+        external_retrieval=make_external_dataset_retriever(),
     )
 
     assert list(result) == ["event"]
@@ -531,6 +497,7 @@ def test_generate_single_iteration_raises_when_draft_workflow_missing(
             node_id="iteration-1",
             args={"inputs": {}},
             session_maker=unbound_session_factory,
+            external_retrieval=make_external_dataset_retriever(),
         )
 
 
@@ -563,6 +530,7 @@ def test_generate_single_loop_delegates_to_workflow_generator(
         node_id="loop-1",
         args=LoopNodeRunPayload(inputs={"items": [1]}),
         session_maker=sqlite_session_factory,
+        external_retrieval=make_external_dataset_retriever(),
     )
 
     assert list(result) == ["event"]
@@ -588,20 +556,5 @@ def test_generate_single_loop_raises_when_draft_workflow_missing(
             node_id="loop-1",
             args=LoopNodeRunPayload(inputs={}),
             session_maker=unbound_session_factory,
-        )
-
-
-def test_run_published_raises_when_published_workflow_missing(
-    monkeypatch: pytest.MonkeyPatch,
-    unbound_session_factory: sessionmaker[Session],
-):
-    _set_published_workflow(monkeypatch, None)
-
-    with pytest.raises(ValueError, match="No published workflow found"):
-        SnippetGenerateService.run_published(
-            snippet=_snippet(),
-            user=_account(),
-            args={"inputs": {}},
-            invoke_from="service-api",
-            session_maker=unbound_session_factory,
+            external_retrieval=make_external_dataset_retriever(),
         )

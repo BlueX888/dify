@@ -176,6 +176,21 @@ def init_app(app: DifyApp) -> Celery:
         "tasks.trigger_processing_tasks",  # async trigger processing
         "tasks.generate_summary_index_task",  # summary index generation
         "tasks.regenerate_summary_index_task",  # summary index regeneration
+        "tasks.dataset_indexing_outbox_task",  # durable dataset configuration index rebuilds
+        "tasks.document_indexing_outbox_task",  # durable document-indexing publication
+        "tasks.keyword_file_cleanup_task",  # durable obsolete keyword-file cleanup
+        "tasks.resource_cleanup_task",  # durable knowledge-resource cleanup
+        "tasks.segment_state_outbox_task",  # durable segment index-state reconciliation
+        # Keep queued legacy segment messages consumable independently of the
+        # application composition root; new requests use the durable outbox.
+        "tasks.enable_segment_to_index_task",
+        "tasks.enable_segments_to_index_task",
+        "tasks.disable_segment_from_index_task",
+        "tasks.disable_segments_from_index_task",
+        "tasks.delete_segment_from_index_task",
+        "tasks.summary_vector_cleanup_task",  # durable unpublished summary-vector cleanup
+        "tasks.child_vector_cleanup_task",  # durable unpublished child-vector cleanup
+        "tasks.attachment_vector_cleanup_task",  # durable shared attachment-vector cleanup
         "tasks.rag_pipeline.rag_pipeline_run_task",  # regular RAG pipeline execution
         "tasks.rag_pipeline.priority_rag_pipeline_run_task",  # priority RAG pipeline execution
         "tasks.initialize_created_app_rbac_access_task",  # app access initialization
@@ -183,11 +198,70 @@ def init_app(app: DifyApp) -> Celery:
         "tasks.refresh_billing_vector_space_task",  # billing vector-space cache refresh
         "tasks.workflow_run_archive_download_tasks",  # workflow-run archive download preparation
         "tasks.workflow_run_archive_deletion_tasks",  # permanent monthly archive deletion
+        "tasks.upload_file_cleanup_task",  # durable upload blob deletion
+        "tasks.workflow_run_history_sync_task",  # durable LogStore workflow history
     ]
     day = dify_config.CELERY_BEAT_SCHEDULER_TIME
 
-    # if you add a new task, please add the switch to CeleryScheduleTasksConfig
+    # Optional scheduled tasks need a switch in CeleryScheduleTasksConfig.
     beat_schedule: dict[str, CeleryBeatScheduleEntry] = {}
+    beat_schedule["dataset-indexing-outbox"] = {
+        "task": "tasks.dataset_indexing_outbox_task.drain_dataset_indexing_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["document-indexing-outbox"] = {
+        "task": "tasks.document_indexing_outbox_task.drain_document_indexing_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["keyword-file-cleanup-outbox"] = {
+        "task": "tasks.keyword_file_cleanup_task.drain_keyword_file_cleanup_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["resource-cleanup-outbox"] = {
+        "task": "tasks.resource_cleanup_task.drain_resource_cleanup_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["segment-state-outbox"] = {
+        "task": "tasks.segment_state_outbox_task.drain_segment_state_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["summary-vector-cleanup-outbox"] = {
+        "task": "tasks.summary_vector_cleanup_task.drain_summary_vector_cleanup_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["child-vector-cleanup-outbox"] = {
+        "task": "tasks.child_vector_cleanup_task.drain_child_vector_cleanup_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["attachment-vector-cleanup-outbox"] = {
+        "task": "tasks.attachment_vector_cleanup_task.drain_attachment_vector_cleanup_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["upload-file-cleanup-outbox"] = {
+        "task": "tasks.upload_file_cleanup_task.drain_upload_file_cleanup_outbox_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "dataset"},
+    }
+    beat_schedule["async-workflow-dispatch-reconciliation"] = {
+        "task": "tasks.async_workflow_tasks.reconcile_async_workflow_dispatches",
+        "schedule": timedelta(minutes=1),
+        "options": {
+            "queue": "workflow_sandbox" if dify_config.DEPLOYMENT_EDITION == DeploymentEdition.CLOUD else "workflow"
+        },
+    }
+    beat_schedule["workflow-run-history-sync"] = {
+        "task": "tasks.workflow_run_history_sync_task.drain_workflow_run_history_task",
+        "schedule": timedelta(minutes=1),
+        "options": {"queue": "workflow_storage"},
+    }
     if dify_config.AGENT_SANDBOX_METERING_ENABLED:
         try:
             interval = int(dify_config.AGENT_SANDBOX_METERING_INTERVAL_SECONDS)

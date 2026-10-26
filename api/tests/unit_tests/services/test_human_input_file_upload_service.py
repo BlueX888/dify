@@ -26,8 +26,10 @@ from models.human_input import (
     HumanInputFormUploadToken,
     RecipientType,
 )
-from models.model import App, AppMode, EndUser, UploadFile
+from models.model import App, AppMode, EndUser, UploadFile, UploadFileCleanupOutbox
 from repositories.human_input_file_upload_repository import SQLAlchemyHumanInputFileUploadRepository
+from repositories.upload_file_repository import UploadFileReferenceNotFoundError
+from services.file_service import FileService
 from services.human_input_file_upload_service import (
     HITL_UPLOAD_TOKEN_PREFIX,
     HumanInputFileUploadRepository,
@@ -156,6 +158,24 @@ def _assert_file_link(session_factory: sessionmaker[Session]) -> None:
             "form-1",
             "token-1",
             "file-1",
+        )
+        assert session.scalar(select(UploadFileCleanupOutbox)) is None
+
+
+def _persist_temporary_upload(
+    session_factory: sessionmaker[Session],
+    upload_file: UploadFile,
+) -> None:
+    with session_factory.begin() as session:
+        session.add(upload_file)
+        session.add(
+            UploadFileCleanupOutbox(
+                tenant_id=upload_file.tenant_id,
+                upload_file_id=upload_file.id,
+                key=upload_file.key,
+                writer_id="writer-1",
+                writer_finished_at=naive_utc_now(),
+            )
         )
 
 
@@ -304,6 +324,7 @@ def test_upload_local_file_records_the_form_file_link(
     )
     upload_file.id = "file-1"
     files.upload_file.return_value = upload_file
+    _persist_temporary_upload(sqlite_session_factory, upload_file)
     context = _upload_context()
 
     result = _create_service(uploads=uploads, files=files).upload_local_file(
@@ -320,6 +341,7 @@ def test_upload_local_file_records_the_form_file_link(
         mimetype="text/plain",
         user=context.owner,
         source=None,
+        temporary=True,
     )
     cast(MagicMock, uploads.add_file).assert_called_once_with(
         tenant_id="tenant-1",
@@ -347,6 +369,21 @@ def test_upload_remote_file_records_the_form_file_link(
         created_at=naive_utc_now(),
     )
     remote_files.upload_from_url.return_value = upload_file
+    persisted_upload = UploadFile(
+        tenant_id="tenant-1",
+        storage_type=StorageType.LOCAL,
+        key="sample.txt",
+        name="sample.txt",
+        size=7,
+        extension="txt",
+        mime_type="text/plain",
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by="owner-1",
+        created_at=upload_file.created_at,
+        used=False,
+    )
+    persisted_upload.id = upload_file.id
+    _persist_temporary_upload(sqlite_session_factory, persisted_upload)
     context = _upload_context()
 
     result = _create_service(uploads=uploads, remote_files=remote_files).upload_remote_file(
@@ -358,6 +395,7 @@ def test_upload_remote_file_records_the_form_file_link(
     remote_files.upload_from_url.assert_called_once_with(
         url="https://example.com/sample.txt",
         user=context.owner,
+        temporary=True,
     )
     cast(MagicMock, uploads.add_file).assert_called_once_with(
         tenant_id="tenant-1",
@@ -367,3 +405,55 @@ def test_upload_remote_file_records_the_form_file_link(
         file_id="file-1",
     )
     _assert_file_link(sqlite_session_factory)
+
+
+def test_failed_form_link_preserves_temporary_upload_cleanup_intent(
+    upload_repository: UploadRepositoryFactory,
+    sqlite_session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    uploads = upload_repository(_active_form())
+    upload_file = UploadFile(
+        tenant_id="tenant-1",
+        storage_type=StorageType.LOCAL,
+        key="orphan.txt",
+        name="orphan.txt",
+        size=7,
+        extension="txt",
+        mime_type="text/plain",
+        created_by_role=CreatorUserRole.ACCOUNT,
+        created_by="owner-1",
+        created_at=naive_utc_now(),
+        used=False,
+    )
+    upload_file.id = "file-1"
+    upload_calls: list[dict[str, object]] = []
+
+    def return_temporary_upload(**kwargs: object) -> UploadFile:
+        upload_calls.append(kwargs)
+        return upload_file
+
+    files = FileService(sqlite_session_factory)
+    monkeypatch.setattr(files, "upload_file", return_temporary_upload)
+    _persist_temporary_upload(sqlite_session_factory, upload_file)
+    with sqlite_session_factory.begin() as session:
+        session.delete(session.get_one(UploadFile, upload_file.id))
+
+    with pytest.raises(UploadFileReferenceNotFoundError):
+        _create_service(uploads=uploads, files=files).upload_local_file(
+            context=_upload_context(),
+            filename="orphan.txt",
+            content=b"content",
+            mimetype="text/plain",
+        )
+
+    assert len(upload_calls) == 1
+    assert upload_calls[0]["temporary"] is True
+
+    with sqlite_session_factory() as session:
+        cleanup = session.scalar(
+            select(UploadFileCleanupOutbox).where(UploadFileCleanupOutbox.upload_file_id == upload_file.id)
+        )
+        assert cleanup is not None
+        assert cleanup.key == upload_file.key
+        assert session.scalar(select(HumanInputFormUploadFile)) is None

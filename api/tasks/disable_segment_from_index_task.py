@@ -1,93 +1,10 @@
-import logging
-import time
+"""Compatibility entrypoint for disable tasks queued before the durable outbox."""
 
-import click
 from celery import shared_task
-from sqlalchemy import select
 
-from core.db.session_factory import session_factory
-from core.rag.index_processor.index_processor import IndexProcessorFactory
-from extensions.ext_redis import redis_client
-from models.dataset import DocumentSegment
-from models.enums import SegmentStatus
-from repositories.knowledge.dataset_read_repository import get_segment_dataset, get_segment_document
-
-logger = logging.getLogger(__name__)
+from tasks.segment_state_legacy import enqueue_legacy_segment_state
 
 
 @shared_task(queue="dataset")
-def disable_segment_from_index_task(segment_id: str):
-    """
-    Async disable segment from index
-    :param segment_id:
-
-    Usage: disable_segment_from_index_task.delay(segment_id)
-    """
-    logger.info(click.style(f"Start disable segment from index: {segment_id}", fg="green"))
-    start_at = time.perf_counter()
-
-    with session_factory.create_session() as session:
-        segment = session.scalar(select(DocumentSegment).where(DocumentSegment.id == segment_id).limit(1))
-        if not segment:
-            logger.info(click.style(f"Segment not found: {segment_id}", fg="red"))
-            return
-
-        if segment.status != SegmentStatus.COMPLETED:
-            logger.info(click.style(f"Segment is not completed, disable is not allowed: {segment_id}", fg="red"))
-            return
-
-        indexing_cache_key = f"segment_{segment.id}_indexing"
-
-        try:
-            dataset = get_segment_dataset(segment, session=session)
-
-            if not dataset:
-                logger.info(click.style(f"Segment {segment.id} has no dataset, pass.", fg="cyan"))
-                return
-
-            dataset_document = get_segment_document(segment, session=session)
-
-            if not dataset_document:
-                logger.info(click.style(f"Segment {segment.id} has no document, pass.", fg="cyan"))
-                return
-
-            if (
-                not dataset_document.enabled
-                or dataset_document.archived
-                or dataset_document.indexing_status != "completed"
-            ):
-                logger.info(click.style(f"Segment {segment.id} document status is invalid, pass.", fg="cyan"))
-                return
-
-            index_type = dataset_document.doc_form
-            index_processor = IndexProcessorFactory(index_type).init_index_processor()
-            assert segment.index_node_id
-            index_processor.clean(dataset, [segment.index_node_id], session=session)
-            session.commit()
-
-            # Disable summary index for this segment
-            from services.knowledge.summaries.adapters import SummaryIndexAdapter
-
-            try:
-                SummaryIndexAdapter.disable_summaries_for_segments(
-                    dataset=dataset,
-                    segment_ids=[segment.id],
-                    disabled_by=segment.disabled_by,
-                )
-            except Exception:
-                logger.warning("Failed to disable summary for segment %s", segment.id, exc_info=True)
-
-            end_at = time.perf_counter()
-            logger.info(
-                click.style(
-                    f"Segment removed from index: {segment.id} latency: {end_at - start_at}",
-                    fg="green",
-                )
-            )
-        except Exception:
-            logger.exception("remove segment from index failed")
-            session.rollback()
-            segment.enabled = True
-            session.commit()
-        finally:
-            redis_client.delete(indexing_cache_key)
+def disable_segment_from_index_task(segment_id: str) -> None:
+    enqueue_legacy_segment_state(action="disable", segment_ids=[segment_id])

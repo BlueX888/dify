@@ -3,6 +3,8 @@
 import json
 import logging
 import uuid
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from typing import Any, TypedDict, override
 
 from sqlalchemy import delete, select
@@ -17,11 +19,15 @@ from core.rag.datasource.vdb.vector_factory import Vector
 from core.rag.docstore.dataset_docstore import DatasetDocumentStore
 from core.rag.embedding.token_counter import calculate_segment_token_counts
 from core.rag.entities import ParentMode, Rule
-from core.rag.extractor.entity.extract_setting import ExtractSetting
+from core.rag.extractor.entity.extract_setting import ExtractionResult, ExtractSetting
 from core.rag.extractor.extract_processor import ExtractProcessor
 from core.rag.index_processor.constant.doc_type import DocType
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
-from core.rag.index_processor.index_processor_base import BaseIndexProcessor, SummaryIndexSettingDict
+from core.rag.index_processor.index_processor_base import (
+    BaseIndexProcessor,
+    IndexingMutationGuard,
+    SummaryIndexSettingDict,
+)
 from core.rag.models.document import AttachmentDocument, ChildDocument, Document, ParentChildStructureChunk
 from extensions.ext_login import load_account
 from libs import helper
@@ -42,17 +48,41 @@ class ParentChildFormatPreviewDict(TypedDict):
 
 
 class ParentChildIndexProcessor(BaseIndexProcessor):
+    def _persist_child_vector_route(
+        self,
+        dataset: Dataset,
+        vector: Vector,
+        child_documents: Sequence[Document | ChildDocument],
+        *,
+        session: Session,
+    ) -> None:
+        if not child_documents:
+            return
+        node_ids = tuple(str(document.metadata["doc_id"]) for document in child_documents)
+        vector_type, collection_name = vector.get_routing_target()
+        self.child_vector_routes.persist(
+            session,
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            collection_binding_id=dataset.collection_binding_id,
+            indexing_technique=str(dataset.indexing_technique),
+            doc_form=IndexStructureType.PARENT_CHILD_INDEX,
+            node_ids=node_ids,
+            vector_type=vector_type,
+            collection_name=collection_name,
+            routing_index_struct=dataset.index_struct,
+        )
+
     @override
-    def extract(self, extract_setting: ExtractSetting, *, session: Session, **kwargs) -> list[Document]:
-        text_docs = ExtractProcessor.extract(
+    def extract(self, extract_setting: ExtractSetting, *, session: Session, **kwargs) -> ExtractionResult:
+        return ExtractProcessor.extract(
             extract_setting=extract_setting,
             is_automatic=(
                 kwargs.get("process_rule_mode") == "automatic" or kwargs.get("process_rule_mode") == "hierarchical"
             ),
             session=session,
+            on_upload_artifact_created=kwargs.get("on_upload_artifact_created"),
         )
-
-        return text_docs
 
     @override
     def transform(
@@ -104,6 +134,7 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
                                 current_user,
                                 tenant_id=kwargs["tenant_id"],
                                 session=session,
+                                on_upload_file_created=kwargs.get("on_upload_file_created"),
                             )
                             if multimodel_documents:
                                 document_node.attachments = multimodel_documents
@@ -121,6 +152,7 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
                 document,
                 tenant_id=kwargs["tenant_id"],
                 session=session,
+                on_upload_file_created=kwargs.get("on_upload_file_created"),
             )
             if multimodel_documents:
                 document.attachments = multimodel_documents
@@ -154,15 +186,63 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
     ) -> None:
         if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
             vector = Vector(dataset, session=session)
-            for document in documents:
-                child_documents = document.children
-                if child_documents:
-                    formatted_child_documents = [
-                        Document.model_validate(child_document.model_dump()) for child_document in child_documents
-                    ]
+            attachment_refs = [
+                (str(item.metadata["document_id"]), str(item.metadata["doc_id"]))
+                for item in multimodal_documents or ()
+                if item.metadata.get("document_id") and item.metadata.get("doc_id")
+            ]
+
+            def publish_children_and_attachments(
+                bound_refs: frozenset[tuple[str, str]],
+                before_write: Callable[[Sequence[str]], None],
+                after_write: Callable[[Sequence[str]], None],
+            ) -> None:
+                formatted_child_documents: list[Document] = []
+                for document in documents:
+                    child_documents = document.children
+                    if child_documents:
+                        formatted_child_documents.extend(
+                            Document.model_validate(child_document.model_dump()) for child_document in child_documents
+                        )
+                if formatted_child_documents:
                     vector.create(formatted_child_documents)
-            if multimodal_documents and dataset.is_multimodal:
-                vector.create_multimodal(multimodal_documents)
+                    self._persist_child_vector_route(
+                        dataset,
+                        vector,
+                        formatted_child_documents,
+                        session=session,
+                    )
+                if multimodal_documents and dataset.is_multimodal:
+                    bound_documents = [
+                        item
+                        for item in multimodal_documents
+                        if (str(item.metadata.get("document_id")), str(item.metadata.get("doc_id"))) in bound_refs
+                    ]
+                    if bound_documents:
+                        vector.create_multimodal(
+                            bound_documents,
+                            before_write=before_write,
+                            after_write=after_write,
+                        )
+
+            if multimodal_documents and dataset.is_multimodal and attachment_refs:
+                vector_type, collection_name = vector.get_routing_target()
+                self.attachment_vectors.publish_bound(
+                    session,
+                    tenant_id=dataset.tenant_id,
+                    dataset_id=dataset.id,
+                    collection_binding_id=dataset.collection_binding_id,
+                    indexing_technique=str(dataset.indexing_technique),
+                    attachment_refs=attachment_refs,
+                    vector_type=vector_type,
+                    collection_name=collection_name,
+                    routing_index_struct=dataset.index_struct,
+                    publish=publish_children_and_attachments,
+                )
+            else:
+                publish_children_and_attachments(
+                    frozenset(), lambda _attachment_ids: None, lambda _attachment_ids: None
+                )
 
     @override
     def clean(
@@ -273,7 +353,15 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
         return child_nodes
 
     @override
-    def index(self, dataset: Dataset, document: DatasetDocument, chunks: Any, session: Session) -> None:
+    def index(
+        self,
+        dataset: Dataset,
+        document: DatasetDocument,
+        chunks: Any,
+        session: Session,
+        *,
+        mutation_guard: IndexingMutationGuard | None = None,
+    ) -> None:
         parent_childs = ParentChildStructureChunk.model_validate(chunks)
         documents = []
         for parent_child in parent_childs.parent_child_chunks:
@@ -330,18 +418,19 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
                 ),
                 created_by=document.created_by,
             )
-            session.add(dataset_process_rule)
-            session.flush()
-            document.dataset_process_rule_id = dataset_process_rule.id
-            # save node to document segment
-            doc_store = DatasetDocumentStore(dataset=dataset, user_id=document.created_by, document_id=document.id)
-            # add document segments
-            doc_store.add_documents(
-                session=session,
-                docs=documents,
-                token_counts=token_counts,
-                save_child=True,
-            )
+            with mutation_guard(session) if mutation_guard is not None else nullcontext():
+                session.add(dataset_process_rule)
+                session.flush()
+                document.dataset_process_rule_id = dataset_process_rule.id
+                # save node to document segment
+                doc_store = DatasetDocumentStore(dataset=dataset, user_id=document.created_by, document_id=document.id)
+                # add document segments
+                doc_store.add_documents(
+                    session=session,
+                    docs=documents,
+                    token_counts=token_counts,
+                    save_child=True,
+                )
             session.commit()
             if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
                 all_child_documents = []
@@ -351,11 +440,57 @@ class ParentChildIndexProcessor(BaseIndexProcessor):
                         all_child_documents.extend(doc.children)
                     if doc.attachments:
                         all_multimodal_documents.extend(doc.attachments)
+                attachment_refs = [
+                    (str(item.metadata["document_id"]), str(item.metadata["doc_id"]))
+                    for item in all_multimodal_documents
+                    if item.metadata.get("document_id") and item.metadata.get("doc_id")
+                ]
+
                 vector = Vector(dataset, session=session)
-                if all_child_documents:
-                    vector.create(all_child_documents)
-                if all_multimodal_documents and dataset.is_multimodal:
-                    vector.create_multimodal(all_multimodal_documents)
+                vector_type, collection_name = vector.get_routing_target()
+
+                def publish(
+                    bound_refs: frozenset[tuple[str, str]],
+                    before_write: Callable[[Sequence[str]], None],
+                    after_write: Callable[[Sequence[str]], None],
+                ) -> None:
+                    if all_child_documents:
+                        vector.create(all_child_documents)
+                        self._persist_child_vector_route(
+                            dataset,
+                            vector,
+                            all_child_documents,
+                            session=session,
+                        )
+                    bound_documents = [
+                        item
+                        for item in all_multimodal_documents
+                        if (str(item.metadata.get("document_id")), str(item.metadata.get("doc_id"))) in bound_refs
+                    ]
+                    if bound_documents and dataset.is_multimodal:
+                        vector.create_multimodal(
+                            bound_documents,
+                            before_write=before_write,
+                            after_write=after_write,
+                        )
+
+                if all_multimodal_documents and dataset.is_multimodal and attachment_refs:
+                    self.attachment_vectors.publish_bound(
+                        session,
+                        tenant_id=dataset.tenant_id,
+                        dataset_id=dataset.id,
+                        collection_binding_id=dataset.collection_binding_id,
+                        indexing_technique=str(dataset.indexing_technique),
+                        attachment_refs=attachment_refs,
+                        vector_type=vector_type,
+                        collection_name=collection_name,
+                        routing_index_struct=dataset.index_struct,
+                        publish=publish,
+                        mutation_guard=mutation_guard,
+                    )
+                else:
+                    with mutation_guard(session) if mutation_guard is not None else nullcontext():
+                        publish(frozenset(), lambda _attachment_ids: None, lambda _attachment_ids: None)
 
     @override
     def format_preview(self, chunks: Any) -> ParentChildFormatPreviewDict:

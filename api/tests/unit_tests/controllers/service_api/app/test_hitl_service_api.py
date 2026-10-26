@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 from inspect import unwrap
 from types import SimpleNamespace
 from typing import override
-from unittest.mock import ANY, MagicMock, Mock
+from unittest.mock import ANY, MagicMock, Mock, create_autospec
 
 import pytest
 from flask import Flask
@@ -32,6 +32,7 @@ from core.app.entities.task_entities import (
     WorkflowPauseStreamResponse,
 )
 from core.app.layers.pause_state_persist_layer import WorkflowResumptionContext, _WorkflowGenerateEntityWrapper
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from core.workflow.human_input_policy import FormDisposition, HumanInputSurface
 from core.workflow.nodes.human_input.entities import ParagraphInputConfig, UserActionConfig
 from core.workflow.nodes.human_input.enums import FormInputType, HumanInputFormKind, HumanInputFormStatus
@@ -429,13 +430,21 @@ class TestHitlServiceApi:
         generator_instance = MagicMock()
         generator_instance.generate.return_value = {"result": "advanced-blocking"}
         generator_instance.convert_to_event_stream.side_effect = lambda payload: payload
-        monkeypatch.setattr(ags_module, "AdvancedChatAppGenerator", lambda **_kwargs: generator_instance)
+        generator_init_kwargs: dict[str, object] = {}
+
+        def make_generator(**kwargs: object) -> MagicMock:
+            generator_init_kwargs.update(kwargs)
+            return generator_instance
+
+        monkeypatch.setattr(ags_module, "AdvancedChatAppGenerator", make_generator)
 
         app_model = _app(app_id="app-id", tenant_id="tenant-id", mode=AppMode.ADVANCED_CHAT)
         user = _end_user(user_id="user-id", app_id="app-id", tenant_id="tenant-id")
+        external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
 
         with sqlite_session_maker() as session:
             result = AppGenerateService.generate(
+                external_retrieval=external_retrieval,
                 session=session,
                 app_model=app_model,
                 user=user,
@@ -445,6 +454,7 @@ class TestHitlServiceApi:
             )
 
         assert result == {"result": "advanced-blocking"}
+        assert generator_init_kwargs["external_retrieval"] is external_retrieval
         call_kwargs = generator_instance.generate.call_args.kwargs
         assert call_kwargs["streaming"] is False
         assert call_kwargs["pause_state_config"] is not None

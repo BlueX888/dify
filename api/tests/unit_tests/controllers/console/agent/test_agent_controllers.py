@@ -3,7 +3,7 @@ from datetime import datetime
 from inspect import getsource, unwrap
 from types import SimpleNamespace
 from typing import Any, Self, cast
-from unittest.mock import MagicMock, Mock
+from unittest.mock import MagicMock, Mock, create_autospec
 
 import pytest
 from flask import Flask
@@ -61,7 +61,9 @@ from controllers.console.app.message import (
     AgentMessageFeedbackApi,
 )
 from core.app.entities.app_invoke_entities import InvokeFrom
+from core.rag.retrieval.dataset_retrieval import ExternalDatasetRetriever
 from enums import CloudPlan, DeploymentEdition
+from extensions.ext_application_services import ApplicationServices
 from libs.infinite_scroll_pagination import InfiniteScrollPagination
 from models.account import Account, TenantAccountRole
 from models.agent import Agent, AgentConfigDraftType, AgentScope, AgentSource, AgentStatus
@@ -85,6 +87,15 @@ from tests.unit_tests.rbac_fakes import RBACDomain
 @pytest.fixture(autouse=True)
 def rbac_services(monkeypatch: pytest.MonkeyPatch, rbac_domain: RBACDomain) -> None:
     monkeypatch.setattr(roster_controller, "application_services", lambda: rbac_domain)
+
+
+@pytest.fixture
+def external_retrieval(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    retriever = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
+    services = create_autospec(ApplicationServices, instance=True, spec_set=True)
+    services.knowledge.external_retrieval = retriever
+    monkeypatch.setattr(completion_controller, "application_services", lambda: services)
+    return retriever
 
 
 def _persist_conversation_message(
@@ -1801,7 +1812,11 @@ def test_agent_build_chat_finalize_route_resolves_app_from_agent_id(
 
 
 def test_build_chat_finalization_helper_forces_debug_build_and_push_prompt(
-    app: Flask, monkeypatch: pytest.MonkeyPatch, account_id: str, unbound_session: Session
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: str,
+    unbound_session: Session,
+    external_retrieval: MagicMock,
 ) -> None:
     app_model = _app_detail_obj(id="app-1", tenant_id="tenant-1", mode=AppMode.AGENT)
     captured: dict[str, object] = {}
@@ -1841,6 +1856,7 @@ def test_build_chat_finalization_helper_forces_debug_build_and_push_prompt(
     generate_call = cast(dict[str, object], captured["generate"])
     assert generate_call["app_model"] is app_model
     assert generate_call["streaming"] is True
+    assert generate_call["external_retrieval"] is external_retrieval
     args = cast(dict[str, object], generate_call["args"])
     assert args["draft_type"] == "debug_build"
     assert args["response_mode"] == "streaming"
@@ -1910,6 +1926,7 @@ def test_agent_chat_helper_resolves_scoped_conversation_and_forces_streaming(
     expected_draft_type: AgentConfigDraftType,
     expected_start_new: bool,
     unbound_session: Session,
+    external_retrieval: MagicMock,
 ) -> None:
     app_model = _app_detail_obj(id="app-1", tenant_id="tenant-1", mode=AppMode.AGENT)
     current_user = _account(account_id=account_id)
@@ -1943,6 +1960,7 @@ def test_agent_chat_helper_resolves_scoped_conversation_and_forces_streaming(
     assert captured["app_model"] is app_model
     assert captured["user"] is current_user
     assert captured["streaming"] is True
+    assert captured["external_retrieval"] is external_retrieval
     args = cast(dict[str, object], captured["args"])
     assert args["response_mode"] == "streaming"
     assert args["conversation_id"] == "00000000-0000-0000-0000-000000000001"
@@ -1954,7 +1972,11 @@ def test_agent_chat_helper_resolves_scoped_conversation_and_forces_streaming(
 
 
 def test_agent_chat_helper_ignores_private_exit_intent_payload_key(
-    app: Flask, monkeypatch: pytest.MonkeyPatch, account_id: str, unbound_session: Session
+    app: Flask,
+    monkeypatch: pytest.MonkeyPatch,
+    account_id: str,
+    unbound_session: Session,
+    external_retrieval: MagicMock,
 ) -> None:
     app_model = _app_detail_obj(id="app-1", tenant_id="tenant-1", mode=AppMode.AGENT)
     current_user = _account(account_id=account_id)
@@ -1992,6 +2014,7 @@ def test_agent_chat_helper_ignores_private_exit_intent_payload_key(
 
     assert result == {"response": {"answer": "ok"}}
     assert captured["streaming"] is True
+    assert captured["external_retrieval"] is external_retrieval
     args = cast(dict[str, object], captured["args"])
     assert args["response_mode"] == "streaming"
     assert args["conversation_id"] == "debug-conversation-1"
@@ -2175,6 +2198,7 @@ def test_agent_chat_helper_maps_generation_errors(
     error: Exception,
     expected: type[Exception],
     unbound_session: Session,
+    external_retrieval: MagicMock,
 ) -> None:
     app_model = _app_detail_obj(id="app-1", mode=AppMode.CHAT)
     monkeypatch.setattr(completion_controller.AppGenerateService, "generate", lambda **_: (_ for _ in ()).throw(error))

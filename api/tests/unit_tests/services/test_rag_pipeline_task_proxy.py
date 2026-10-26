@@ -35,7 +35,6 @@ class RagPipelineTaskProxyTestDataFactory:
         workflow_id: str = "workflow-101",
         streaming: bool = True,
         workflow_execution_id: str | None = None,
-        workflow_thread_pool_id: str | None = None,
     ) -> RagPipelineInvokeEntity:
         """Create RagPipelineInvokeEntity instance for testing."""
         return RagPipelineInvokeEntity(
@@ -46,7 +45,6 @@ class RagPipelineTaskProxyTestDataFactory:
             workflow_id=workflow_id,
             streaming=streaming,
             workflow_execution_id=workflow_execution_id,
-            workflow_thread_pool_id=workflow_thread_pool_id,
         )
 
     @staticmethod

@@ -1,152 +1,98 @@
 import logging
-import time
 
 import click
 from celery import shared_task
-from sqlalchemy import delete, select, update
+from sqlalchemy import select
 
 from core.db.session_factory import session_factory
-from core.rag.index_processor.constant.doc_type import DocType
-from core.rag.index_processor.constant.index_type import IndexStructureType
-from core.rag.index_processor.index_processor import IndexProcessorFactory
-from core.rag.models.document import AttachmentDocument, ChildDocument, Document
 from extensions.ext_redis import redis_client
-from libs.datetime_utils import naive_utc_now
-from models.dataset import DatasetAutoDisableLog, DocumentSegment
+from models.dataset import Dataset, DocumentSegment
 from models.dataset import Document as DatasetDocument
 from models.enums import IndexingStatus, SegmentStatus
-from repositories.knowledge.dataset_read_repository import (
-    get_dataset_doc_form,
-    get_document_dataset,
-    get_segment_child_chunks,
-)
-from repositories.knowledge.segment_read_adapter import get_segment_attachments
+from models.model import SegmentStateOutbox
+from tasks.segment_state_outbox_task import publish_segment_state_intents
 
 logger = logging.getLogger(__name__)
 
 
 @shared_task(queue="dataset")
-def add_document_to_index_task(dataset_document_id: str):
+def add_document_to_index_task(dataset_document_id: str) -> bool:
+    """Forward a durable document-enable reconciliation without reauthorizing it.
+
+    The document status transaction owns creation of exact SegmentStateOutbox
+    rows. This rolling-deploy bridge publishes only intents still referenced by
+    the current enabled segments; a later segment/document disable therefore
+    wins without relying on queue ordering.
     """
-    Async Add document to index
-    :param dataset_document_id:
 
-    Usage: add_document_to_index_task.delay(dataset_document_id)
-    """
-    logger.info(click.style(f"Start add document to index: {dataset_document_id}", fg="green"))
-    start_at = time.perf_counter()
-
-    with session_factory.create_session() as session:
-        dataset_document = session.scalar(
-            select(DatasetDocument).where(DatasetDocument.id == dataset_document_id).limit(1)
-        )
-        if not dataset_document:
-            logger.info(click.style(f"Document not found: {dataset_document_id}", fg="red"))
-            return
-
-        if dataset_document.indexing_status != IndexingStatus.COMPLETED:
-            return
-
-        indexing_cache_key = f"document_{dataset_document.id}_indexing"
-
-        try:
-            dataset = get_document_dataset(dataset_document, session=session)
-            if not dataset:
-                raise Exception(f"Document {dataset_document.id} dataset {dataset_document.dataset_id} doesn't exist.")
-
-            segments = session.scalars(
-                select(DocumentSegment)
+    logger.info(click.style(f"Forward document enable intents: {dataset_document_id}", fg="green"))
+    indexing_cache_key = f"document_{dataset_document_id}_indexing"
+    try:
+        with session_factory.create_session() as session:
+            dataset_document = session.scalar(
+                select(DatasetDocument).where(DatasetDocument.id == dataset_document_id).limit(1)
+            )
+            if dataset_document is None:
+                return False
+            dataset = session.scalar(
+                select(Dataset)
+                .where(Dataset.id == dataset_document.dataset_id, Dataset.tenant_id == dataset_document.tenant_id)
+                .with_for_update(read=True)
+                .execution_options(populate_existing=True)
+            )
+            if dataset is None:
+                return False
+            dataset_document = session.scalar(
+                select(DatasetDocument)
                 .where(
-                    DocumentSegment.document_id == dataset_document.id,
-                    DocumentSegment.status == SegmentStatus.COMPLETED,
+                    DatasetDocument.id == dataset_document_id,
+                    DatasetDocument.dataset_id == dataset.id,
+                    DatasetDocument.tenant_id == dataset.tenant_id,
                 )
-                .order_by(DocumentSegment.position.asc())
-            ).all()
-
-            documents = []
-            multimodal_documents = []
-            for segment in segments:
-                document = Document(
-                    page_content=segment.content,
-                    metadata={
-                        "doc_id": segment.index_node_id,
-                        "doc_hash": segment.index_node_hash,
-                        "document_id": segment.document_id,
-                        "dataset_id": segment.dataset_id,
-                    },
-                )
-                if dataset_document.doc_form == IndexStructureType.PARENT_CHILD_INDEX:
-                    child_chunks = get_segment_child_chunks(segment, session=session)
-                    if child_chunks:
-                        child_documents = []
-                        for child_chunk in child_chunks:
-                            child_document = ChildDocument(
-                                page_content=child_chunk.content,
-                                metadata={
-                                    "doc_id": child_chunk.index_node_id,
-                                    "doc_hash": child_chunk.index_node_hash,
-                                    "document_id": segment.document_id,
-                                    "dataset_id": segment.dataset_id,
-                                },
-                            )
-                            child_documents.append(child_document)
-                        document.children = child_documents
-                if dataset.is_multimodal:
-                    for attachment in get_segment_attachments(segment, session=session):
-                        multimodal_documents.append(
-                            AttachmentDocument(
-                                page_content=attachment["name"],
-                                metadata={
-                                    "doc_id": attachment["id"],
-                                    "doc_hash": "",
-                                    "document_id": segment.document_id,
-                                    "dataset_id": segment.dataset_id,
-                                    "doc_type": DocType.IMAGE,
-                                },
-                            )
-                        )
-                documents.append(document)
-
-            index_type = get_dataset_doc_form(dataset, session=session)
-            index_processor = IndexProcessorFactory(index_type).init_index_processor()
-            index_processor.load(dataset, documents, multimodal_documents=multimodal_documents, session=session)
-
-            # delete auto disable log
-            session.execute(
-                delete(DatasetAutoDisableLog).where(DatasetAutoDisableLog.document_id == dataset_document.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
             )
-
-            # update segment to enable
-            session.execute(
-                update(DocumentSegment)
-                .where(DocumentSegment.document_id == dataset_document.id)
-                .values(enabled=True, disabled_at=None, disabled_by=None, updated_at=naive_utc_now())
-            )
-            session.commit()
-
-            # Enable summary indexes for all segments in this document
-            from services.knowledge.summaries.adapters import SummaryIndexAdapter
-
-            segment_ids_list = [segment.id for segment in segments]
-            if segment_ids_list:
-                try:
-                    SummaryIndexAdapter.enable_summaries_for_segments(
-                        dataset=dataset,
-                        segment_ids=segment_ids_list,
+            if (
+                dataset_document is None
+                or dataset_document.indexing_status != IndexingStatus.COMPLETED
+                or not dataset_document.enabled
+                or dataset_document.archived
+                or dataset_document.indexing_request_id is not None
+                or dataset_document.indexing_claim_id is not None
+            ):
+                return False
+            intent_ids = tuple(
+                session.scalars(
+                    select(SegmentStateOutbox.id)
+                    .join(DocumentSegment, DocumentSegment.indexing_request_id == SegmentStateOutbox.id)
+                    .where(
+                        DocumentSegment.tenant_id == dataset.tenant_id,
+                        DocumentSegment.dataset_id == dataset.id,
+                        DocumentSegment.document_id == dataset_document.id,
+                        DocumentSegment.status == SegmentStatus.COMPLETED,
+                        DocumentSegment.enabled.is_(True),
+                        SegmentStateOutbox.tenant_id == dataset.tenant_id,
+                        SegmentStateOutbox.dataset_id == dataset.id,
+                        SegmentStateOutbox.document_id == dataset_document.id,
+                        SegmentStateOutbox.action == "enable",
                     )
-                except Exception:
-                    logger.warning("Failed to enable summaries for document %s", dataset_document.id, exc_info=True)
-
-            end_at = time.perf_counter()
-            logger.info(
-                click.style(f"Document added to index: {dataset_document.id} latency: {end_at - start_at}", fg="green")
+                    .order_by(SegmentStateOutbox.id)
+                ).all()
             )
-        except Exception as e:
-            logger.exception("add document to index failed")
-            dataset_document.enabled = False
-            dataset_document.disabled_at = naive_utc_now()
-            dataset_document.indexing_status = IndexingStatus.ERROR
-            dataset_document.error = str(e)
-            session.commit()
-        finally:
-            redis_client.delete(indexing_cache_key)
+        if not intent_ids:
+            logger.info("No current document enable intents to forward, document_id=%s", dataset_document_id)
+            return False
+        try:
+            publish_segment_state_intents(intent_ids)
+        except Exception:
+            # The committed outbox rows remain discoverable by the periodic
+            # drainer, so a broker outage cannot lose the enable request.
+            logger.exception("Failed to publish document enable intents for %s", dataset_document_id)
+        logger.info(
+            "Document enable remains pending durable reconciliation, document_id=%s, intents=%s",
+            dataset_document_id,
+            len(intent_ids),
+        )
+        return False
+    finally:
+        redis_client.delete(indexing_cache_key)

@@ -2386,6 +2386,379 @@ class UploadFile(TypeBase):
         self.source_url = source_url
 
 
+class UploadFileCleanupOutbox(TypeBase):
+    __tablename__ = "upload_file_cleanup_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="upload_file_cleanup_outbox_pkey"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "upload_file_id",
+            name="upload_file_cleanup_outbox_tenant_upload_unique",
+        ),
+        sa.Index(
+            "upload_file_cleanup_outbox_retry_idx",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        StringUUID,
+        init=False,
+        default_factory=lambda: str(uuid4()),
+    )
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    upload_file_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    key: Mapped[str] = mapped_column(String(255), nullable=False)
+    writer_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    writer_finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    writer_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    cleanup_started_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class KeywordFileCleanupOutbox(TypeBase):
+    """Durable deletion intent for one immutable keyword-table object."""
+
+    __tablename__ = "keyword_file_cleanup_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="keyword_file_cleanup_outbox_pkey"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "dataset_id",
+            "key",
+            name="keyword_file_cleanup_outbox_owner_key_unique",
+        ),
+        sa.Index(
+            "keyword_file_cleanup_outbox_retry_idx",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    key: Mapped[str] = mapped_column(String(255), nullable=False)
+    writer_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    writer_finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    cleanup_started_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class ResourceCleanupOutbox(TypeBase):
+    """Durable cleanup work created in the resource deletion transaction."""
+
+    __tablename__ = "resource_cleanup_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="resource_cleanup_outbox_pkey"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "dataset_id",
+            "resource_type",
+            "resource_id",
+            name="resource_cleanup_outbox_owner_resource_unique",
+        ),
+        sa.Index(
+            "resource_cleanup_outbox_retry_idx",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+        sa.Index("resource_cleanup_outbox_claim_idx", "claim_expires_at"),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    resource_type: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    resource_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    doc_form: Mapped[str | None] = mapped_column(sa.String(255), nullable=True, default=None)
+    source_file_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    indexing_technique: Mapped[str | None] = mapped_column(sa.String(255), nullable=True, default=None)
+    index_struct: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
+    collection_binding_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    pipeline_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class AttachmentVectorCleanupOutbox(TypeBase):
+    """One durable attempt to publish or remove a shared attachment vector."""
+
+    __tablename__ = "attachment_vector_cleanup_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="attachment_vector_cleanup_outbox_pkey"),
+        sa.Index(
+            "attachment_vector_cleanup_outbox_node_route_idx",
+            "tenant_id",
+            "dataset_id",
+            "attachment_id",
+            "vector_route_hash",
+        ),
+        sa.Index(
+            "attachment_vector_cleanup_outbox_retry_idx",
+            "claim_expires_at",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+        sa.Index(
+            "attachment_vector_cleanup_outbox_dataset_writer_idx",
+            "tenant_id",
+            "dataset_id",
+            "writer_finished_at",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    attachment_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    writer_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    vector_route: Mapped[str] = mapped_column(LongText, nullable=False)
+    vector_route_hash: Mapped[str] = mapped_column(sa.String(64), nullable=False)
+    writer_finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    cleanup_started_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class SummaryVectorCleanupOutbox(TypeBase):
+    """Durable ownership for a summary vector until publication or deletion is reconciled."""
+
+    __tablename__ = "summary_vector_cleanup_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="summary_vector_cleanup_outbox_pkey"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "node_id",
+            "vector_route_hash",
+            name="summary_vector_cleanup_outbox_tenant_node_route_unique",
+        ),
+        sa.Index(
+            "summary_vector_cleanup_outbox_retry_idx",
+            "claim_expires_at",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    document_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    segment_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    summary_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    summary_version: Mapped[int] = mapped_column(sa.Integer, nullable=False)
+    node_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    writer_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    vector_route: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
+    vector_route_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True, default=None)
+    writer_finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    cleanup_started_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class ChildVectorCleanupOutbox(TypeBase):
+    """Durable ownership for a child vector until its row publication is known."""
+
+    __tablename__ = "child_vector_cleanup_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="child_vector_cleanup_outbox_pkey"),
+        sa.UniqueConstraint(
+            "tenant_id",
+            "node_id",
+            "vector_route_hash",
+            name="child_vector_cleanup_outbox_tenant_node_route_unique",
+        ),
+        sa.Index(
+            "child_vector_cleanup_outbox_retry_idx",
+            "claim_expires_at",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    document_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    segment_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    child_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    node_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    writer_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    vector_route: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
+    vector_route_hash: Mapped[str | None] = mapped_column(sa.String(64), nullable=True, default=None)
+    writer_finished_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    cleanup_started_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class DocumentIndexingOutbox(TypeBase):
+    """Durable indexing publication created with document writes."""
+
+    __tablename__ = "document_indexing_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="document_indexing_outbox_pkey"),
+        sa.Index(
+            "document_indexing_outbox_retry_idx",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    action: Mapped[str] = mapped_column(sa.String(32), nullable=False)
+    document_ids: Mapped[str] = mapped_column(LongText, nullable=False)
+    actor_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    pipeline_execution_log_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class DatasetIndexingOutbox(TypeBase):
+    """Durable execution for one generation-fenced dataset index rebuild."""
+
+    __tablename__ = "dataset_indexing_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="dataset_indexing_outbox_pkey"),
+        sa.UniqueConstraint(
+            "generation_id",
+            "operation",
+            name="dataset_indexing_outbox_generation_operation_unique",
+        ),
+        sa.Index(
+            "dataset_indexing_outbox_retry_idx",
+            "claim_expires_at",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+        sa.Index(
+            "dataset_indexing_outbox_owner_idx",
+            "tenant_id",
+            "dataset_id",
+            "generation_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    generation_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    operation: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    source_representation: Mapped[str] = mapped_column(LongText, nullable=False)
+    target_representation: Mapped[str] = mapped_column(LongText, nullable=False)
+    action: Mapped[str | None] = mapped_column(sa.String(16), nullable=True, default=None)
+    claim_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    claim_expires_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    vector_completed_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
+class SegmentStateOutbox(TypeBase):
+    """Durable, generation-fenced request to reconcile one segment index state."""
+
+    __tablename__ = "segment_state_outbox"
+    __table_args__ = (
+        sa.PrimaryKeyConstraint("id", name="segment_state_outbox_pkey"),
+        sa.Index(
+            "segment_state_outbox_retry_idx",
+            "last_attempted_at",
+            "created_at",
+            "id",
+        ),
+        sa.Index(
+            "segment_state_outbox_owner_idx",
+            "tenant_id",
+            "dataset_id",
+            "document_id",
+            "segment_id",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(StringUUID, init=False, default_factory=lambda: str(uuid4()))
+    tenant_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    dataset_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    document_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    segment_id: Mapped[str] = mapped_column(StringUUID, nullable=False)
+    action: Mapped[str] = mapped_column(sa.String(16), nullable=False)
+    actor_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    index_node_id: Mapped[str | None] = mapped_column(sa.String(255), nullable=True, default=None)
+    child_node_ids: Mapped[str | None] = mapped_column(LongText, nullable=True, default=None)
+    doc_form: Mapped[str | None] = mapped_column(sa.String(255), nullable=True, default=None)
+    summary_id: Mapped[str | None] = mapped_column(StringUUID, nullable=True, default=None)
+    summary_version: Mapped[int | None] = mapped_column(sa.Integer, nullable=True, default=None)
+    last_attempted_at: Mapped[datetime | None] = mapped_column(sa.DateTime, nullable=True, default=None)
+    created_at: Mapped[datetime] = mapped_column(
+        sa.DateTime,
+        nullable=False,
+        server_default=func.current_timestamp(),
+        init=False,
+    )
+
+
 class ApiRequest(TypeBase):
     __tablename__ = "api_requests"
     __table_args__ = (

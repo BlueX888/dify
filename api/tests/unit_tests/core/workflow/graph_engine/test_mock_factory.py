@@ -30,6 +30,8 @@ from .test_mock_nodes import (
 )
 
 if TYPE_CHECKING:
+    from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
+    from core.rag.index_processor.index_processor_base import KnowledgeIndexRuntime
     from graphon.runtime import InitParams, RuntimeState
 
     from .test_mock_config import MockConfig
@@ -48,6 +50,8 @@ class MockNodeFactory(DifyNodeFactory):
         self,
         init_params: "InitParams",
         runtime_state: "RuntimeState",
+        external_retrieval: "ExternalDatasetRetriever",
+        knowledge_index_runtime: "KnowledgeIndexRuntime",
         mock_config: "MockConfig | None" = None,
     ) -> None:
         """
@@ -57,7 +61,12 @@ class MockNodeFactory(DifyNodeFactory):
         :param runtime_state: Graph runtime state
         :param mock_config: Optional mock configuration for customizing mock behavior
         """
-        super().__init__(init_params, runtime_state)
+        super().__init__(
+            init_params,
+            runtime_state,
+            external_retrieval=external_retrieval,
+            knowledge_index_runtime=knowledge_index_runtime,
+        )
         self.mock_config = mock_config
 
         # Map of node types that should be mocked
@@ -81,6 +90,8 @@ class MockNodeFactory(DifyNodeFactory):
         return MockNodeFactory(
             init_params=self.init_params,
             runtime_state=runtime_state,
+            external_retrieval=self.external_retrieval,
+            knowledge_index_runtime=self.knowledge_index_runtime,
             mock_config=self.mock_config,
         )
 

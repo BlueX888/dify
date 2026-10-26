@@ -383,6 +383,9 @@ class RagPipelineGenerateEntity(WorkflowAppGenerateEntity):
     batch: str
     document_id: str | None = None
     original_document_id: str | None = None
+    enforce_projected_capacity: bool | None = None
+    indexing_request_id: str | None = None
+    indexing_claim_id: str | None = None
     start_node_id: str | None = None
 
 

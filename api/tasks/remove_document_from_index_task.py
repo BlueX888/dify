@@ -3,64 +3,122 @@ import time
 
 import click
 from celery import shared_task
-from sqlalchemy import select, update
+from sqlalchemy import select
 
 from core.db.session_factory import session_factory
 from core.rag.index_processor.index_processor import IndexProcessorFactory
 from extensions.ext_redis import redis_client
 from libs.datetime_utils import naive_utc_now
-from models.dataset import Document, DocumentSegment
-from repositories.knowledge.dataset_read_repository import get_document_dataset
+from models.dataset import Dataset, Document, DocumentSegment, DocumentSegmentSummary
+from models.enums import IndexingStatus
+from repositories.knowledge.document_repository import has_active_indexing_claim
+from repositories.knowledge.summary_vector_cleanup_repository import SQLAlchemySummaryVectorCleanupRepository
 
 logger = logging.getLogger(__name__)
 
 
-@shared_task(queue="dataset")
-def remove_document_from_index_task(document_id: str):
-    """
-    Async Remove document from index
-    :param document_id: document id
+def _clear_indexing_hint(document_id: str) -> None:
+    try:
+        redis_client.delete(f"document_{document_id}_indexing")
+    except Exception:
+        # Redis is only a dispatch hint; it must not decide whether the durable
+        # database/vector transition commits.
+        logger.warning("Failed to clear document indexing hint for %s", document_id, exc_info=True)
 
-    Usage: remove_document_from_index.delay(document_id)
+
+@shared_task(queue="dataset")
+def remove_document_from_index_task(document_id: str) -> bool:
+    """Remove only a still-current disabled or archived document generation.
+
+    The queue payload is not ownership. A non-locking lookup supplies only a
+    candidate owner scope; Dataset SHARE and Document UPDATE current reads then
+    rebuild that scope and serialize this cleanup with enable/index writers.
+    Those locks remain held across summary handoff, body-vector cleanup, segment
+    state changes, and commit. A stale queued disable therefore cannot clean a
+    document that a newer operation has already enabled.
     """
     logger.info(click.style(f"Start remove document segments from index: {document_id}", fg="green"))
     start_at = time.perf_counter()
 
     with session_factory.create_session() as session:
-        document = session.scalar(select(Document).where(Document.id == document_id).limit(1))
-        if not document:
+        candidate_scope = session.execute(
+            select(Document.tenant_id, Document.dataset_id).where(Document.id == document_id).limit(1)
+        ).one_or_none()
+        if candidate_scope is None:
             logger.info(click.style(f"Document not found: {document_id}", fg="red"))
-            return
+            return False
 
-        if document.indexing_status != "completed":
-            logger.info(click.style(f"Document is not completed, remove is not allowed: {document_id}", fg="red"))
-            return
-
-        indexing_cache_key = f"document_{document.id}_indexing"
+        tenant_id, dataset_id = candidate_scope
+        dataset = session.scalar(
+            select(Dataset)
+            .where(Dataset.id == dataset_id, Dataset.tenant_id == tenant_id)
+            .with_for_update(read=True)
+            .execution_options(populate_existing=True)
+        )
+        document = session.scalar(
+            select(Document)
+            .where(
+                Document.id == document_id,
+                Document.tenant_id == tenant_id,
+                Document.dataset_id == dataset_id,
+            )
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        now = naive_utc_now()
+        active_claim = bool(
+            document is not None
+            and document.indexing_claim_id is not None
+            and (document.indexing_claim_expires_at is None or has_active_indexing_claim(session, document))
+        )
+        if (
+            dataset is None
+            or document is None
+            or document.indexing_status != IndexingStatus.COMPLETED
+            or (document.enabled and not document.archived)
+            or active_claim
+        ):
+            logger.info("Skipped stale or ineligible document removal, document_id=%s", document_id)
+            return False
 
         try:
-            dataset = get_document_dataset(document, session=session)
-
-            if not dataset:
-                raise Exception("Document has no dataset")
-
             index_processor = IndexProcessorFactory(document.doc_form).init_index_processor()
-
-            segments = session.scalars(select(DocumentSegment).where(DocumentSegment.document_id == document.id)).all()
+            segments = session.scalars(
+                select(DocumentSegment)
+                .where(
+                    DocumentSegment.tenant_id == dataset.tenant_id,
+                    DocumentSegment.dataset_id == dataset.id,
+                    DocumentSegment.document_id == document.id,
+                )
+                .order_by(DocumentSegment.id)
+                .with_for_update()
+                .execution_options(populate_existing=True)
+            ).all()
 
             # Disable summary indexes for all segments in this document
-            from services.knowledge.summaries.adapters import SummaryIndexAdapter
-
             segment_ids_list = [segment.id for segment in segments]
             if segment_ids_list:
-                try:
-                    SummaryIndexAdapter.disable_summaries_for_segments(
-                        dataset=dataset,
-                        segment_ids=segment_ids_list,
-                        disabled_by=document.disabled_by,
+                summaries = session.scalars(
+                    select(DocumentSegmentSummary)
+                    .where(
+                        DocumentSegmentSummary.dataset_id == dataset.id,
+                        DocumentSegmentSummary.document_id == document.id,
+                        DocumentSegmentSummary.chunk_id.in_(segment_ids_list),
                     )
-                except Exception:
-                    logger.warning("Failed to disable summaries for document %s", document.id, exc_info=True)
+                    .order_by(DocumentSegmentSummary.id)
+                    .with_for_update()
+                    .execution_options(populate_existing=True)
+                ).all()
+                SQLAlchemySummaryVectorCleanupRepository.add_terminal_cleanups(
+                    session,
+                    tenant_id=dataset.tenant_id,
+                    summaries=summaries,
+                )
+                for summary in summaries:
+                    summary.version += 1
+                    summary.enabled = False
+                    summary.disabled_at = now
+                    summary.disabled_by = document.disabled_by
 
             index_node_ids = [segment.index_node_id for segment in segments if segment.index_node_id]
             if index_node_ids:
@@ -74,17 +132,15 @@ def remove_document_from_index_task(document_id: str):
                     )
                 except Exception:
                     logger.exception("clean dataset %s from index failed", dataset.id)
-            # update segment to disable
-            session.execute(
-                update(DocumentSegment)
-                .where(DocumentSegment.document_id == document.id)
-                .values(
-                    enabled=False,
-                    disabled_at=naive_utc_now(),
-                    disabled_by=document.disabled_by,
-                    updated_at=naive_utc_now(),
-                )
-            )
+            for segment in segments:
+                segment.enabled = False
+                segment.disabled_at = now
+                segment.disabled_by = document.disabled_by
+                segment.updated_at = now
+            # Clear the old task's hint before releasing Document ownership, so
+            # a newer enable cannot publish its hint and then have it deleted by
+            # this worker after commit.
+            _clear_indexing_hint(document.id)
             session.commit()
 
             end_at = time.perf_counter()
@@ -94,10 +150,9 @@ def remove_document_from_index_task(document_id: str):
                     fg="green",
                 )
             )
+            return True
         except Exception:
             logger.exception("remove document from index failed")
-            if not document.archived:
-                document.enabled = True
-                session.commit()
-        finally:
-            redis_client.delete(indexing_cache_key)
+            _clear_indexing_hint(document.id)
+            session.rollback()
+            return False

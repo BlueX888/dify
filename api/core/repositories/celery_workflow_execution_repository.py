@@ -107,6 +107,19 @@ class CeleryWorkflowExecutionRepository(WorkflowExecutionRepository):
         self._sql_repository.save(execution)
 
     @override
+    def publish_committed_pause(
+        self,
+        execution: WorkflowExecution,
+        *,
+        history_revision: int,
+        history_claim_id: str,
+    ) -> None:
+        # This backend's asynchronous task writes SQL history/control. The
+        # atomic pause transaction already wrote that row, so do not enqueue a
+        # delayed second control update.
+        del execution, history_revision, history_claim_id
+
+    @override
     def save(self, execution: WorkflowExecution):
         """
         Save or update a WorkflowExecution instance asynchronously using Celery.

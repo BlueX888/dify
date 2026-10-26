@@ -10,10 +10,11 @@ from core.app.entities.app_invoke_entities import DIFY_RUN_CONTEXT_KEY, DifyRunC
 from core.plugin.impl.model import PluginModelClient
 from core.plugin.impl.model_runtime import PluginModelRuntime
 from core.plugin.plugin_service import PluginService
+from core.rag.index_processor.index_processor_base import KnowledgeIndexRuntime
 from core.workflow import node_factory
 from core.workflow import template_rendering as workflow_template_rendering
 from core.workflow.llm_node import DifyLLMNode
-from core.workflow.node_runtime import DifyPreparedLLM
+from core.workflow.node_runtime import DifyPreparedLLM, build_knowledge_index_runtime
 from core.workflow.nodes.knowledge_index import KNOWLEDGE_INDEX_NODE_TYPE
 from graphon.entities.base_node_data import BaseNodeData
 from graphon.enums import BuiltinNodeTypes, NodeExecutionType, NodeType
@@ -32,6 +33,7 @@ from graphon.variables.segments import ArrayObjectSegment, ObjectSegment, String
 from models.base import TypeBase
 from models.model import AppMode, Conversation, ConversationFromSource
 from tests.unit_tests.core.model_fixtures import make_model_instance
+from tests.unit_tests.core.workflow.external_retrieval_test_utils import make_external_dataset_retriever
 from tests.workflow_test_utils import build_test_graph_init_params
 
 
@@ -236,11 +238,14 @@ class TestDifyGraphInitContext:
             "extra": "value",
         }
         graph_config = {"nodes": [], "edges": []}
+        external_retrieval = make_external_dataset_retriever()
         graph_init_context = node_factory.DifyGraphInitContext(
             workflow_id="workflow-id",
             graph_config=graph_config,
             run_context=run_context,
             call_depth=2,
+            external_retrieval=external_retrieval,
+            knowledge_index_runtime=build_knowledge_index_runtime(),
         )
 
         result = graph_init_context.to_graph_init_params()
@@ -249,6 +254,7 @@ class TestDifyGraphInitContext:
         assert result.graph_config == graph_config
         assert result.run_context == run_context
         assert result.call_depth == 2
+        assert graph_init_context.external_retrieval is external_retrieval
 
 
 @pytest.mark.parametrize(
@@ -288,6 +294,8 @@ def test_graph_validation_with_dify_node_factory(invalid_kind, monkeypatch):
     factory = node_factory.DifyNodeFactory(
         build_test_graph_init_params(graph_config=graph_config),
         RuntimeState(variable_pool=VariablePool(), start_at=0, workflow_id="workflow"),
+        external_retrieval=make_external_dataset_retriever(),
+        knowledge_index_runtime=build_knowledge_index_runtime(),
     )
     if invalid_kind is None:
         graph = Graph.init(graph_config=graph_config, node_factory=factory, root_node_id="start")
@@ -414,6 +422,7 @@ class TestDifyNodeFactoryCreateNode:
             app_type=None,
             created_by=None,
         )
+        factory._external_retrieval = make_external_dataset_retriever()
         factory._use_workflow_tool_containers = True
         factory._code_executor = sentinel.code_executor
         factory._code_limits = sentinel.code_limits
@@ -427,6 +436,14 @@ class TestDifyNodeFactoryCreateNode:
         factory._retriever_attachment_loader = sentinel.retriever_attachment_loader
         factory._llm_file_saver = sentinel.llm_file_saver
         factory._human_input_runtime = sentinel.human_input_runtime
+        runtime = build_knowledge_index_runtime()
+        factory._knowledge_index_runtime = KnowledgeIndexRuntime(
+            attachment_vectors=sentinel.attachment_vectors,
+            child_vector_routes=sentinel.child_vector_routes,
+            indexing_guard_factory=sentinel.indexing_guard_factory,
+            indexing_route_recorder_factory=sentinel.indexing_route_recorder_factory,
+            retrieval_finalizer=runtime.retrieval_finalizer,
+        )
         factory._tool_runtime = sentinel.tool_runtime
         factory._http_request_file_manager = sentinel.file_manager
         factory._document_extractor_unstructured_api_config = sentinel.unstructured_api_config
@@ -603,6 +620,12 @@ class TestDifyNodeFactoryCreateNode:
             assert kwargs["tool_file_manager"] is sentinel.tool_file_manager
             assert kwargs["runtime"] is sentinel.tool_runtime
             factory._bound_tool_file_manager_factory.assert_called_once_with()
+        elif constructor_name == "KnowledgeIndexNode":
+            assert kwargs["attachment_vectors"] is sentinel.attachment_vectors
+            assert kwargs["child_vector_routes"] is sentinel.child_vector_routes
+            assert kwargs["indexing_guard_factory"] is sentinel.indexing_guard_factory
+        elif constructor_name == "KnowledgeRetrievalNode":
+            assert kwargs["external_retrieval"] is factory._external_retrieval
         elif constructor_name == "DocumentExtractorNode":
             assert kwargs["unstructured_api_config"] is sentinel.unstructured_api_config
             assert kwargs["http_client"] is sentinel.remote_file_http_client

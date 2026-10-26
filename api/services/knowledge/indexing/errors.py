@@ -1,5 +1,19 @@
 """Application failures raised while preparing or executing indexing."""
 
+from core.entities.document_task import (
+    DocumentIndexingClaimLostError,
+    DocumentIsDeletedPausedError,
+    DocumentIsPausedError,
+)
+from services.knowledge.entities.datasets import DatasetIndexingGenerationLostError
+
+__all__ = [
+    "DatasetIndexingGenerationLostError",
+    "DocumentIndexingClaimLostError",
+    "DocumentIsDeletedPausedError",
+    "DocumentIsPausedError",
+]
+
 
 class IndexingInputError(Exception):
     """Base class for failures while resolving stored extraction inputs."""
@@ -18,10 +32,4 @@ class UnsupportedStoredSourceError(IndexingInputSourceError):
 class SourceCredentialUnavailableError(IndexingInputSourceError):
     """Raised when a datasource cannot resolve its required credential policy."""
 
-
-class DocumentIsPausedError(Exception):
-    """Indexing stopped because the owned document was paused."""
-
-
-class DocumentIsDeletedPausedError(Exception):
-    """Indexing stopped because its document owner chain no longer exists."""
+    pass

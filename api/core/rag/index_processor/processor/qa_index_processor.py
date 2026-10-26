@@ -4,6 +4,8 @@ import logging
 import re
 import threading
 import uuid
+from collections.abc import Callable, Sequence
+from contextlib import nullcontext
 from typing import Any, TypedDict, override
 
 import pandas as pd
@@ -19,10 +21,14 @@ from core.rag.datasource.vdb.vector_factory import Vector
 from core.rag.docstore.dataset_docstore import DatasetDocumentStore
 from core.rag.embedding.token_counter import calculate_segment_token_counts
 from core.rag.entities import Rule
-from core.rag.extractor.entity.extract_setting import ExtractSetting
+from core.rag.extractor.entity.extract_setting import ExtractionResult, ExtractSetting
 from core.rag.extractor.extract_processor import ExtractProcessor
 from core.rag.index_processor.constant.index_type import IndexStructureType, IndexTechniqueType
-from core.rag.index_processor.index_processor_base import BaseIndexProcessor, SummaryIndexSettingDict
+from core.rag.index_processor.index_processor_base import (
+    BaseIndexProcessor,
+    IndexingMutationGuard,
+    SummaryIndexSettingDict,
+)
 from core.rag.models.document import AttachmentDocument, Document, QAStructureChunk
 from core.tools.utils.text_processing_utils import remove_leading_symbols
 from libs import helper
@@ -42,15 +48,15 @@ class QAFormatPreviewDict(TypedDict):
 
 class QAIndexProcessor(BaseIndexProcessor):
     @override
-    def extract(self, extract_setting: ExtractSetting, *, session: Session, **kwargs) -> list[Document]:
-        text_docs = ExtractProcessor.extract(
+    def extract(self, extract_setting: ExtractSetting, *, session: Session, **kwargs) -> ExtractionResult:
+        return ExtractProcessor.extract(
             extract_setting=extract_setting,
             is_automatic=(
                 kwargs.get("process_rule_mode") == "automatic" or kwargs.get("process_rule_mode") == "hierarchical"
             ),
             session=session,
+            on_upload_artifact_created=kwargs.get("on_upload_artifact_created"),
         )
-        return text_docs
 
     @override
     def transform(
@@ -155,9 +161,47 @@ class QAIndexProcessor(BaseIndexProcessor):
     ) -> None:
         if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
             vector = Vector(dataset, session=session)
-            vector.create(documents)
-            if multimodal_documents and dataset.is_multimodal:
-                vector.create_multimodal(multimodal_documents)
+            attachment_documents = multimodal_documents or []
+            attachment_refs = [
+                (str(item.metadata["document_id"]), str(item.metadata["doc_id"]))
+                for item in attachment_documents
+                if item.metadata.get("document_id") and item.metadata.get("doc_id")
+            ]
+            if attachment_documents and dataset.is_multimodal and attachment_refs:
+                vector_type, collection_name = vector.get_routing_target()
+
+                def publish(
+                    bound_refs: frozenset[tuple[str, str]],
+                    before_write: Callable[[Sequence[str]], None],
+                    after_write: Callable[[Sequence[str]], None],
+                ) -> None:
+                    vector.create(documents)
+                    bound_documents = [
+                        item
+                        for item in attachment_documents
+                        if (str(item.metadata.get("document_id")), str(item.metadata.get("doc_id"))) in bound_refs
+                    ]
+                    if bound_documents:
+                        vector.create_multimodal(
+                            bound_documents,
+                            before_write=before_write,
+                            after_write=after_write,
+                        )
+
+                self.attachment_vectors.publish_bound(
+                    session,
+                    tenant_id=dataset.tenant_id,
+                    dataset_id=dataset.id,
+                    collection_binding_id=dataset.collection_binding_id,
+                    indexing_technique=str(dataset.indexing_technique),
+                    attachment_refs=attachment_refs,
+                    vector_type=vector_type,
+                    collection_name=collection_name,
+                    routing_index_struct=dataset.index_struct,
+                    publish=publish,
+                )
+            else:
+                vector.create(documents)
 
     @override
     def clean(
@@ -192,7 +236,15 @@ class QAIndexProcessor(BaseIndexProcessor):
             vector.delete()
 
     @override
-    def index(self, dataset: Dataset, document: DatasetDocument, chunks: Any, session: Session) -> None:
+    def index(
+        self,
+        dataset: Dataset,
+        document: DatasetDocument,
+        chunks: Any,
+        session: Session,
+        *,
+        mutation_guard: IndexingMutationGuard | None = None,
+    ) -> None:
         qa_chunks = QAStructureChunk.model_validate(chunks)
         documents = []
         for qa_chunk in qa_chunks.qa_chunks:
@@ -209,18 +261,20 @@ class QAIndexProcessor(BaseIndexProcessor):
             token_counts = calculate_segment_token_counts(dataset=dataset, documents=documents)
             # save node to document segment
             doc_store = DatasetDocumentStore(dataset=dataset, user_id=document.created_by, document_id=document.id)
-            doc_store.add_documents(
-                session=session,
-                docs=documents,
-                token_counts=token_counts,
-                save_child=False,
-            )
+            with mutation_guard(session) if mutation_guard is not None else nullcontext():
+                doc_store.add_documents(
+                    session=session,
+                    docs=documents,
+                    token_counts=token_counts,
+                    save_child=False,
+                )
             session.commit()
-            if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
-                vector = Vector(dataset, session=session)
-                vector.create(documents)
-            else:
-                raise ValueError("Indexing technique must be high quality.")
+            with mutation_guard(session) if mutation_guard is not None else nullcontext():
+                if dataset.indexing_technique == IndexTechniqueType.HIGH_QUALITY:
+                    vector = Vector(dataset, session=session)
+                    vector.create(documents)
+                else:
+                    raise ValueError("Indexing technique must be high quality.")
 
     @override
     def format_preview(self, chunks: Any) -> QAFormatPreviewDict:

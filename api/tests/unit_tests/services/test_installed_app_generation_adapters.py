@@ -3,7 +3,7 @@ from collections.abc import Callable, Generator, Mapping
 from dataclasses import dataclass, field
 from inspect import GEN_CLOSED, getgeneratorstate
 from typing import cast, override
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, create_autospec
 from uuid import uuid4
 
 import pytest
@@ -16,6 +16,7 @@ import services.app_generate_service as generation_module
 from core.app.apps import message_based_app_generator
 from core.app.entities.app_invoke_entities import InvokeFrom
 from core.app.features.rate_limiting.rate_limit import RateLimit, RateLimitGenerator
+from core.rag.entities.retrieval_settings import ExternalDatasetRetriever
 from enums import DeploymentEdition
 from extensions.ext_database import db
 from extensions.ext_redis import RedisClientWrapper
@@ -43,6 +44,7 @@ _MESSAGE_ID = str(uuid4())
 @dataclass
 class _RuntimeHarness:
     runtime: AppGenerateServiceRuntime
+    external_retrieval: ExternalDatasetRetriever
     app_id: str
     account_id: str
     closed_sessions: list[Session]
@@ -78,12 +80,17 @@ def harness(sqlite_session_factory: sessionmaker[Session]) -> _RuntimeHarness:
     def record_commit(session: Session) -> None:
         committed_sessions.append(session)
 
+    external_retrieval = create_autospec(ExternalDatasetRetriever, instance=True, spec_set=True)
     return _RuntimeHarness(
-        AppGenerateServiceRuntime(session_factory=cast(sessionmaker[Session], factory)),
-        app.id,
-        account.id,
-        closed_sessions,
-        committed_sessions,
+        runtime=AppGenerateServiceRuntime(
+            session_factory=cast(sessionmaker[Session], factory),
+            external_retrieval=external_retrieval,
+        ),
+        external_retrieval=external_retrieval,
+        app_id=app.id,
+        account_id=account.id,
+        closed_sessions=closed_sessions,
+        committed_sessions=committed_sessions,
     )
 
 
@@ -119,6 +126,7 @@ def _patch_generation(
 
     def legacy_generate(
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session: Session,
         app_model: App,
         user: Account,
@@ -127,12 +135,14 @@ def _patch_generation(
         streaming: bool,
     ) -> GenerationResponse | Generator[Mapping[str, object] | str]:
         assert args == _ARGS
+        assert external_retrieval is harness.external_retrieval
         return assert_context(
             session=session, app_model=app_model, user=user, invoke_from=invoke_from, streaming=streaming
         )
 
     def legacy_generate_more_like_this(
         *,
+        external_retrieval: ExternalDatasetRetriever,
         session: Session,
         app_model: App,
         user: Account,
@@ -141,6 +151,7 @@ def _patch_generation(
         streaming: bool,
     ) -> GenerationResponse | Generator[Mapping[str, object] | str]:
         assert message_id == _MESSAGE_ID
+        assert external_retrieval is harness.external_retrieval
         return assert_context(
             session=session, app_model=app_model, user=user, invoke_from=invoke_from, streaming=streaming
         )

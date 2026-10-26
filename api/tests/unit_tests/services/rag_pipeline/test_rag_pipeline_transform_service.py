@@ -52,6 +52,7 @@ def _pipeline(*, pipeline_id: str = "p-new", tenant_id: str = "t1") -> Pipeline:
         tenant_id=tenant_id,
         name="Pipeline",
         description="",
+        workflow_id="wf-1",
         created_by="user-1",
         updated_by="user-1",
     )
@@ -326,7 +327,7 @@ def test_deal_document_data_notion(sqlite_session: Session) -> None:
     sqlite_session.add(doc)
     sqlite_session.commit()
 
-    service._deal_document_data(dataset, sqlite_session)
+    service._deal_document_data(dataset, workflow_id="wf-1", session=sqlite_session)
     sqlite_session.flush()
 
     assert doc.data_source_type == "online_document"
@@ -334,6 +335,8 @@ def test_deal_document_data_notion(sqlite_session: Session) -> None:
     log = sqlite_session.scalar(select(DocumentPipelineExecutionLog))
     assert log is not None
     assert log.document_id == doc.id
+    assert log.workflow_id == "wf-1"
+    assert log.original_document_id == doc.id
 
 
 @pytest.mark.parametrize(("provider", "node_id"), [("firecrawl", "1752565402678"), ("jinareader", "1752491761974")])
@@ -351,7 +354,7 @@ def test_deal_document_data_website(sqlite_session: Session, provider: str, node
     sqlite_session.add(doc)
     sqlite_session.commit()
 
-    service._deal_document_data(dataset, sqlite_session)
+    service._deal_document_data(dataset, workflow_id="wf-1", session=sqlite_session)
     sqlite_session.flush()
 
     assert doc.data_source_type == "website_crawl"
@@ -359,6 +362,8 @@ def test_deal_document_data_website(sqlite_session: Session, provider: str, node
     log = sqlite_session.scalar(select(DocumentPipelineExecutionLog))
     assert log is not None
     assert log.datasource_node_id == node_id
+    assert log.workflow_id == "wf-1"
+    assert log.original_document_id == doc.id
 
 
 # --- transform_dataset complex flow ---
@@ -487,7 +492,7 @@ def test_deal_document_data_upload_file_with_existing_file(sqlite_session: Sessi
     sqlite_session.add_all([document, _upload_file()])
     sqlite_session.commit()
 
-    service._deal_document_data(dataset, sqlite_session)
+    service._deal_document_data(dataset, workflow_id="wf-1", session=sqlite_session)
     sqlite_session.flush()
 
     assert document.data_source_type == "local_file"
@@ -495,6 +500,8 @@ def test_deal_document_data_upload_file_with_existing_file(sqlite_session: Sessi
     log = sqlite_session.scalar(select(DocumentPipelineExecutionLog))
     assert log is not None
     assert log.document_id == document.id
+    assert log.workflow_id == "wf-1"
+    assert log.original_document_id == document.id
 
 
 @pytest.mark.parametrize(
@@ -519,7 +526,7 @@ def test_deal_document_data_scopes_documents_and_upload_files_to_dataset_tenant(
     sqlite_session.add_all([document, _upload_file(tenant_id=upload_file_tenant_id)])
     sqlite_session.commit()
 
-    service._deal_document_data(dataset, sqlite_session)
+    service._deal_document_data(dataset, workflow_id="wf-1", session=sqlite_session)
     sqlite_session.flush()
 
     assert document.data_source_type == DataSourceType.UPLOAD_FILE

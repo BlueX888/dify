@@ -5,7 +5,19 @@ import uuid
 from unittest.mock import MagicMock, Mock, create_autospec, patch
 
 import pytest
+from sqlalchemy.orm import Session, sessionmaker
 
+import tasks.duplicate_document_indexing_task as task_module
+from core.rag.index_processor.constant.index_type import IndexStructureType
+from enums import DeploymentEdition
+from models.dataset import Dataset, Document
+from models.enums import DataSourceType, IndexingStatus
+from models.model import DocumentIndexingOutbox
+from repositories.knowledge.document_indexing_outbox_repository import create_document_indexing_intents
+from services.knowledge.entities.document_creation import DocumentIndexingJobs
+from services.knowledge.entities.resource_scope import DatasetRef
+from services.knowledge.indexing.adapters.cleanup import clean_document_for_reindex
+from services.knowledge.indexing.execution import DocumentIndexingService
 from tasks.duplicate_document_indexing_task import (
     _duplicate_document_indexing_task,
     _duplicate_document_indexing_task_with_tenant_queue,
@@ -13,6 +25,8 @@ from tasks.duplicate_document_indexing_task import (
     normal_duplicate_document_indexing_task,
     priority_duplicate_document_indexing_task,
 )
+from tests.unit_tests.config_override import config_overrides_context
+from tests.unit_tests.model_factories import make_dataset, make_document, make_tenant
 
 
 @pytest.fixture
@@ -49,14 +63,176 @@ class TestDuplicateDocumentIndexingTask:
         self, mock_core_func: MagicMock, dataset_id: str
     ) -> None:
         """Test duplicate_document_indexing_task with empty document_ids list."""
-        # Arrange
-        document_ids = []
+        document_ids: list[str] = []
 
-        # Act
         duplicate_document_indexing_task(dataset_id, document_ids)
 
-        # Assert
         mock_core_func.assert_called_once_with(dataset_id, document_ids)
+
+
+@config_overrides_context(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
+def test_core_groups_owned_documents_by_form_before_reindex(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = make_dataset(
+        dataset_id=str(uuid.uuid4()),
+        tenant_id=str(uuid.uuid4()),
+        data_source_type=DataSourceType.UPLOAD_FILE,
+    )
+    documents = [
+        make_document(
+            document_id=str(uuid.uuid4()),
+            tenant_id=dataset.tenant_id,
+            dataset_id=dataset.id,
+            doc_form=doc_form,
+        )
+        for doc_form in (IndexStructureType.PARAGRAPH_INDEX, IndexStructureType.QA_INDEX)
+    ]
+    for document in documents:
+        document.indexing_status = IndexingStatus.WAITING
+    sqlite_session.add_all([make_tenant(tenant_id=dataset.tenant_id), dataset, *documents])
+    sqlite_session.commit()
+    engine = sqlite_session.get_bind()
+    monkeypatch.setattr(task_module.session_factory, "create_session", lambda: Session(engine, expire_on_commit=False))
+    monkeypatch.setattr(
+        task_module.session_factory,
+        "get_session_maker",
+        lambda: sessionmaker(bind=engine, expire_on_commit=False),
+    )
+
+    with (
+        patch("tasks.duplicate_document_indexing_task.clean_document_for_reindex", autospec=True) as cleanup,
+        patch("tasks.duplicate_document_indexing_task.build_document_indexing_service") as indexing_service,
+    ):
+        _duplicate_document_indexing_task(dataset.id, [document.id for document in documents])
+        _duplicate_document_indexing_task(dataset.id, [document.id for document in documents])
+
+    assert cleanup.call_count == 2
+    calls_by_form = {call.kwargs["doc_form"]: call.kwargs for call in cleanup.call_args_list}
+    assert set(calls_by_form) == {IndexStructureType.PARAGRAPH_INDEX, IndexStructureType.QA_INDEX}
+    for document in documents:
+        assert calls_by_form[document.doc_form]["tenant_id"] == dataset.tenant_id
+        assert calls_by_form[document.doc_form]["dataset_id"] == dataset.id
+        assert calls_by_form[document.doc_form]["document_ids"] == [document.id]
+    indexing_service.return_value.run.assert_called_once()
+
+
+@config_overrides_context(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
+def test_core_does_not_start_reindex_when_cleanup_fails(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset = make_dataset(
+        dataset_id=str(uuid.uuid4()),
+        tenant_id=str(uuid.uuid4()),
+        data_source_type=DataSourceType.UPLOAD_FILE,
+    )
+    document = make_document(
+        document_id=str(uuid.uuid4()),
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+    )
+    document.indexing_status = IndexingStatus.WAITING
+    sqlite_session.add_all([dataset, document])
+    sqlite_session.commit()
+    engine = sqlite_session.get_bind()
+    monkeypatch.setattr(task_module.session_factory, "create_session", lambda: Session(engine, expire_on_commit=False))
+
+    with (
+        patch(
+            "tasks.duplicate_document_indexing_task.clean_document_for_reindex",
+            autospec=True,
+            side_effect=RuntimeError("cleanup failed"),
+        ),
+        patch("tasks.duplicate_document_indexing_task.build_document_indexing_service") as indexing_service,
+    ):
+        _duplicate_document_indexing_task(dataset.id, [document.id])
+
+    indexing_service.assert_not_called()
+    sqlite_session.expire_all()
+    persisted = sqlite_session.get(type(document), document.id)
+    assert persisted is not None
+    assert persisted.indexing_status == IndexingStatus.WAITING
+
+
+def _persist_duplicate_request(session: Session) -> tuple[Dataset, Document, str]:
+    dataset = make_dataset(
+        dataset_id=str(uuid.uuid4()),
+        tenant_id=str(uuid.uuid4()),
+        data_source_type=DataSourceType.UPLOAD_FILE,
+    )
+    document = make_document(
+        document_id=str(uuid.uuid4()),
+        tenant_id=dataset.tenant_id,
+        dataset_id=dataset.id,
+    )
+    document.indexing_status = IndexingStatus.WAITING
+    session.add_all([make_tenant(tenant_id=dataset.tenant_id), dataset, document])
+    session.flush()
+    (request_id,) = create_document_indexing_intents(
+        session,
+        DocumentIndexingJobs(DatasetRef(dataset.tenant_id, dataset.id), duplicated=(document.id,)),
+    )
+    session.commit()
+    return dataset, document, request_id
+
+
+@config_overrides_context(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
+def test_durable_duplicate_request_always_uses_claimed_clean_restart(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, document, request_id = _persist_duplicate_request(sqlite_session)
+    engine = sqlite_session.get_bind()
+    monkeypatch.setattr(task_module.session_factory, "create_session", lambda: Session(engine, expire_on_commit=False))
+    monkeypatch.setattr(
+        task_module.session_factory,
+        "get_session_maker",
+        lambda: sessionmaker(bind=engine, expire_on_commit=False),
+    )
+    runner = create_autospec(DocumentIndexingService, instance=True)
+    cleanup = create_autospec(clean_document_for_reindex)
+    monkeypatch.setattr(task_module, "build_document_indexing_service", lambda **_kwargs: runner)
+    monkeypatch.setattr(task_module, "clean_document_for_reindex", cleanup)
+
+    _duplicate_document_indexing_task(dataset.id, [document.id], indexing_request_id=request_id)
+
+    runner.restart_claimed.assert_called_once()
+    assert runner.restart_claimed.call_args.args[0] == DatasetRef(dataset.tenant_id, dataset.id).document(document.id)
+    assert runner.restart_claimed.call_args.kwargs["claim_id"]
+    runner.run.assert_not_called()
+    cleanup.assert_not_called()
+
+
+@config_overrides_context(DEPLOYMENT_EDITION=DeploymentEdition.COMMUNITY)
+def test_durable_duplicate_setup_failure_fails_claim_and_acknowledges_intent(
+    sqlite_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    dataset, document, request_id = _persist_duplicate_request(sqlite_session)
+    engine = sqlite_session.get_bind()
+    monkeypatch.setattr(task_module.session_factory, "create_session", lambda: Session(engine, expire_on_commit=False))
+    monkeypatch.setattr(
+        task_module.session_factory,
+        "get_session_maker",
+        lambda: sessionmaker(bind=engine, expire_on_commit=False),
+    )
+
+    def fail_to_build(**_kwargs: object) -> None:
+        raise RuntimeError("indexing service unavailable")
+
+    monkeypatch.setattr(task_module, "build_document_indexing_service", fail_to_build)
+
+    _duplicate_document_indexing_task(dataset.id, [document.id], indexing_request_id=request_id)
+
+    sqlite_session.expire_all()
+    persisted = sqlite_session.get_one(Document, document.id)
+    assert persisted.indexing_status == IndexingStatus.ERROR
+    assert persisted.error == "indexing service unavailable"
+    assert persisted.indexing_request_id is None
+    assert persisted.indexing_claim_id is None
+    assert sqlite_session.get(DocumentIndexingOutbox, request_id) is None
 
 
 class TestDuplicateDocumentIndexingTaskWithTenantQueue:
