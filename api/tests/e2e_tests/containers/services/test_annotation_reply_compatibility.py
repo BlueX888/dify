@@ -163,9 +163,9 @@ def test_legacy_producer_retains_failed_job_already_observed_by_another_request(
     with (
         memory_celery.connection_for_read() as connection,
         SimpleQueue(connection, memory_celery.conf.task_default_queue) as messages,
+        pytest.raises(Empty),
     ):
-        with pytest.raises(Empty):
-            messages.get(block=False)
+        messages.get(block=False)
 
     with flask_app_with_containers.test_request_context():
         g._login_user = account
